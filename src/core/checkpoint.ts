@@ -126,10 +126,15 @@ export class Checkpoints {
     const target = turn ?? Math.max(...all.map((m) => m.turn))
     const inTurn = all.filter((m) => m.turn === target)
 
-    // 同一路径只保留最早那份（= 轮次开始时的内容）
+    // 同一路径只保留最早那份（= 轮次开始时的内容）；同时记住这一轮**最后**一次写后的哈希，
+    // 否则一轮里连续改两次会被误判成「被外部改动」。
     const earliest = new Map<string, CheckpointEntry>()
+    const latestAfter = new Map<string, string>()
     for (const m of inTurn) {
-      for (const f of m.files) if (!earliest.has(f.path)) earliest.set(f.path, f)
+      for (const f of m.files) {
+        if (!earliest.has(f.path)) earliest.set(f.path, f)
+        if (f.afterSha) latestAfter.set(f.path, f.afterSha)
+      }
     }
 
     const restored: string[] = []
@@ -146,9 +151,11 @@ export class Checkpoints {
         skipped.push(path)
         continue
       }
-      if (!opts.force && entry.afterSha) {
+      const expectAfter = latestAfter.get(path) ?? entry.afterSha
+      if (!opts.force && expectAfter) {
         const current = await sha256File(path).catch(() => '')
-        if (current && current !== entry.afterSha) {
+        // 当前内容既不是「最后一次写完的状态」，也不是原本状态 → 真的被人改过
+        if (current && current !== expectAfter && current !== entry.beforeSha) {
           conflicts.push(path)
           continue
         }

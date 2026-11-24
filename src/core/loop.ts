@@ -144,6 +144,7 @@ export class Agent {
     // 1) 策略
     const gate = policy.gate(tool.permission, targets[0])
     let decision: Decision | undefined
+    let autoApproved = false
     if (gate === 'deny') {
       decision = 'denied'
       const reason =
@@ -184,6 +185,8 @@ export class Agent {
     if (gate === 'ask') {
       const reqId = `ap-${startedAt}-${call.id}`
       const reason = `${tool.name} 需要写权限`
+      // --yes / PL_APPROVAL=allow 时没经过人，审计要能区分
+      autoApproved = broker.policy !== 'ask'
       await session.append({ kind: 'approval/asked', reqId, tool: tool.name, reason })
       this.pendingApproval = reqId
       decision = await broker.decide({
@@ -193,7 +196,7 @@ export class Agent {
         detail: targets[0] ?? JSON.stringify(call.args).slice(0, 300),
       })
       this.pendingApproval = null
-      await session.append({ kind: 'approval/decided', reqId, decision })
+      await session.append({ kind: 'approval/decided', reqId, decision, auto: autoApproved || undefined })
       audit.recordApproval({ sessionId: session.id, reqId, tool: tool.name, reason, decision, at: Date.now() })
 
       if (decision !== 'allowed-once') {
@@ -266,6 +269,7 @@ export class Agent {
       tool: tool.name,
       argsJson: JSON.stringify(call.args),
       decision: decision ?? 'allowed',
+      auto: autoApproved,
       status: result.ok ? 'done' : 'failed',
       ok: result.ok,
       exitCode: result.exitCode,

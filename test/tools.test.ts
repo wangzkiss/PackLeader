@@ -61,6 +61,14 @@ test('fs.glob / fs.grep 能按模式定位', async () => {
   assert.match(grepped.content, /src\/a\.ts:2:/)
 })
 
+test('fs.glob 支持 {a,b} 大括号（模型常用写法）', async () => {
+  const { ctx, tools } = await ws()
+  await writeFile(join(ctx.root, 'package.json'), '{}', 'utf8')
+  const out = await tools.get('glob')!.run(ctx, { pattern: '**/*.{ts,json}' })
+  assert.match(out.content, /src\/a\.ts/)
+  assert.match(out.content, /package\.json/)
+})
+
 test('policy: 越界写被拒，read-only 一律拒写', async () => {
   const { root } = await ws()
   const guarded = new Policy(root, 'guarded')

@@ -20,7 +20,7 @@ function rel(root: string, abs: string): string {
   return relative(root, abs).split(sep).join('/') || '.'
 }
 
-function toRegExp(glob: string): RegExp {
+function globToRegex(glob: string): string {
   let out = ''
   for (let i = 0; i < glob.length; i++) {
     const c = glob[i]!
@@ -34,7 +34,20 @@ function toRegExp(glob: string): RegExp {
     else if ('\\^$.|+()[]{}'.includes(c)) out += `\\${c}`
     else out += c
   }
-  return new RegExp(`^${out}$`)
+  return out
+}
+
+/** 展开 `{js,json}` 这类大括号（模型很爱用），不支持嵌套 */
+function expandBraces(pattern: string): string[] {
+  const m = /\{([^{}]*)\}/.exec(pattern)
+  if (!m) return [pattern]
+  const parts = m[1]!.split(',')
+  return parts.flatMap((p) => expandBraces(pattern.slice(0, m.index) + p + pattern.slice(m.index + m[0].length)))
+}
+
+function toRegExp(glob: string): RegExp {
+  const alts = expandBraces(glob).map(globToRegex)
+  return new RegExp(`^(?:${alts.join('|')})$`)
 }
 
 async function* walk(root: string, depth = 0, signal?: AbortSignal): AsyncGenerator<string> {

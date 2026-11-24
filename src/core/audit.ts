@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
   id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, turn INTEGER, step INTEGER,
   call_id TEXT, tool TEXT NOT NULL, args_json TEXT NOT NULL, decision TEXT,
   status TEXT NOT NULL, ok INTEGER, exit_code INTEGER, error TEXT,
-  ms INTEGER, out_bytes INTEGER, truncated INTEGER DEFAULT 0,
+  ms INTEGER, out_bytes INTEGER, truncated INTEGER DEFAULT 0, auto INTEGER DEFAULT 0,
   started_at INTEGER, finished_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id, id);
@@ -51,6 +51,8 @@ export interface ToolCallRow {
   ms: number
   outBytes: number
   truncated?: boolean
+  /** true = 没经过人，由 --yes / PL_APPROVAL=allow 自动放行 */
+  auto?: boolean
   startedAt: number
   finishedAt: number
 }
@@ -88,6 +90,12 @@ export class Audit {
       const db = new DatabaseSync(path)
       db.exec('PRAGMA journal_mode=WAL;')
       db.exec(DDL)
+      // 老库补列（审计是投影，迁移失败也不影响主链路）
+      try {
+        db.exec('ALTER TABLE tool_calls ADD COLUMN auto INTEGER DEFAULT 0')
+      } catch {
+        /* 列已存在 */
+      }
       return new Audit(path, db)
     } catch {
       // 审计不可用不是致命错误：主链路照跑
@@ -129,8 +137,8 @@ export class Audit {
     this.db
       ?.prepare(
         `INSERT INTO tool_calls (session_id,turn,step,call_id,tool,args_json,decision,status,ok,
-           exit_code,error,ms,out_bytes,truncated,started_at,finished_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+           exit_code,error,ms,out_bytes,truncated,auto,started_at,finished_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         r.sessionId,
@@ -147,6 +155,7 @@ export class Audit {
         r.ms,
         r.outBytes,
         r.truncated ? 1 : 0,
+        r.auto ? 1 : 0,
         r.startedAt,
         r.finishedAt,
       )
@@ -243,31 +252,58 @@ export class Audit {
       const start = events.find((e) => e.kind === 'session/start') as Record<string, string> | undefined
       if (!start) continue
       const firstUser = events.find((e) => e.kind === 'user/message') as { text: string } | undefined
-      const upsert = (turn: number, step: number) => ({ turn, step })
-      let cur = upsert(0, 0)
+      // 从事件本身恢复参数与审批结论，避免重建后只剩「某工具跑过」
+      const argsByCall = new Map<string, string>()
       for (const e of events) {
-        if (e.kind === 'turn/start') cur = upsert(Number(e.turn), 0)
-        if (e.kind === 'step/start') cur = upsert(cur.turn, Number(e.step))
+        if (e.kind === 'tool/call') {
+          const call = e.call as { id?: string; args?: unknown } | undefined
+          if (call?.id) argsByCall.set(call.id, JSON.stringify(call.args ?? {}))
+        }
+      }
+      let cur = { turn: 0, step: 0 }
+      let pendingCall: string | undefined
+      let pendingDecision: string | undefined
+      let pendingAuto = false
+      for (const e of events) {
+        if (e.kind === 'turn/start') {
+          cur = { turn: Number(e.turn), step: 0 }
+          pendingCall = undefined
+        }
+        if (e.kind === 'step/start') cur = { turn: cur.turn, step: Number(e.step) }
+        if (e.kind === 'tool/call') {
+          pendingCall = String((e.call as { id?: string } | undefined)?.id ?? '')
+          pendingDecision = undefined
+          pendingAuto = false
+        }
+        if (e.kind === 'approval/decided') {
+          approvals++
+          pendingDecision = String(e.decision)
+          pendingAuto = e.auto === true
+        }
         if (e.kind === 'tool/result') {
           toolCalls++
+          const callId = String(e.callId)
+          const matched = callId === pendingCall
           this.recordToolCall({
             sessionId: id,
             turn: cur.turn,
             step: cur.step,
-            callId: String(e.callId),
+            callId,
             tool: String(e.name),
-            argsJson: '{}',
+            argsJson: argsByCall.get(callId) ?? '{}',
+            decision: matched ? pendingDecision : undefined,
             status: e.ok ? 'done' : 'failed',
             ok: Boolean(e.ok),
             exitCode: e.exitCode as number | undefined,
             ms: Number(e.ms ?? 0),
-            outBytes: String(e.content ?? '').length,
+            outBytes: Buffer.byteLength(String(e.content ?? ''), 'utf8'),
             truncated: Boolean(e.truncated),
+            auto: matched && pendingAuto,
             startedAt: Number(e.at),
             finishedAt: Number(e.at),
           })
+          pendingCall = undefined
         }
-        if (e.kind === 'approval/decided') approvals++
         if (e.kind === 'llm/usage') llmCalls++
       }
       const last = events[events.length - 1] as { at: number }

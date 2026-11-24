@@ -17,7 +17,7 @@ export type EventPayload =
   | { kind: 'assistant/message'; text: string; reasoning: string; toolCalls: ToolCall[]; ms: number; finish: string | null }
   | { kind: 'tool/call'; turn: number; step: number; call: ToolCall }
   | { kind: 'approval/asked'; reqId: string; tool: string; reason: string }
-  | { kind: 'approval/decided'; reqId: string; decision: Decision }
+  | { kind: 'approval/decided'; reqId: string; decision: Decision; auto?: boolean }
   | {
       kind: 'tool/result'
       callId: string

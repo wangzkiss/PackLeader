@@ -9,6 +9,8 @@
  *   pl sessions
  */
 
+import { existsSync } from 'node:fs'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { createInterface } from 'node:readline/promises'
@@ -21,6 +23,7 @@ import { Session } from './core/session.ts'
 import type { Mode } from './core/types.ts'
 import { OpenAiClient } from './llm/openai.ts'
 import { createDefaultTools } from './tools/index.ts'
+import { resolveShell, runShell } from './tools/shell.ts'
 import { TerminalApprover } from './tui/approval.ts'
 import { CliRenderer, bold, cyan, dim, gray, green, red, yellow } from './tui/render.ts'
 
@@ -30,7 +33,7 @@ const BOOL_FLAGS = new Set([
 ])
 
 interface Parsed {
-  command: 'run' | 'audit' | 'undo' | 'sessions' | 'help' | 'version'
+  command: 'run' | 'audit' | 'undo' | 'sessions' | 'help' | 'version' | 'doctor'
   flags: Record<string, string | boolean>
   positional: string[]
 }
@@ -57,7 +60,7 @@ function parse(argv: string[]): Parsed {
       }
     } else positional.push(a)
   }
-  const known = ['audit', 'undo', 'sessions', 'help', 'version']
+  const known = ['audit', 'undo', 'sessions', 'help', 'version', 'doctor']
   const head = positional[0]
   const command = (head && known.includes(head) ? positional.shift()! : 'run') as Parsed['command']
   return { command, flags, positional }
@@ -108,9 +111,10 @@ function help(): void {
 ${bold('用法')}
   pl [选项] "任务描述"        单次执行，输出结果后退出
   pl                         交互模式（/exit 退出，/undo 撤销，/sessions 列表）
-  pl audit [选项]            查看审计账本（工具调用 / 模型调用 / 审批）
+  pl audit [选项]            审计账本（工具调用 / 成本）；pl audit rebuild 从日志重建
   pl undo [--turn N]         撤销某一轮的所有文件改动
   pl sessions                列出历史会话
+  pl doctor                  自检（node / shell / 数据目录 / 端点 / 模型）
 
 ${bold('选项')}
   --cwd <dir>          工作目录（默认当前目录）
@@ -134,8 +138,83 @@ ${bold('示例')}
   pl audit -n 10 --cost
   pl undo --turn 3
 
-${dim('环境变量：PL_API_KEY / PL_BASE_URL / PL_MODEL / PL_MODE / PL_APPROVAL / PACKLEADER_HOME')}
+${dim('环境变量：PL_API_KEY / PL_BASE_URL / PL_MODEL / PL_MODE / PL_APPROVAL / PL_SHELL / PACKLEADER_HOME')}
 `)
+}
+
+async function cmdDoctor(cfg: Config, flags: Record<string, string | boolean>): Promise<void> {
+  const rows: Array<{ name: string; ok: boolean | 'skip'; detail: string }> = []
+  const mark = (ok: boolean | 'skip') => (ok === 'skip' ? yellow('–') : ok ? green('✓') : red('✗'))
+
+  const [maj = 0, min = 0] = process.versions.node.split('.').map(Number)
+  rows.push({
+    name: 'node',
+    ok: maj > 22 || (maj === 22 && min >= 18),
+    detail: `v${process.versions.node}（需要 ≥ 22.18：靠原生类型剥离直接跑 TS）`,
+  })
+
+  const shell = resolveShell()
+  const probe = await runShell('echo packleader-ok', { cwd: cfg.root, timeoutMs: 15_000 })
+  const shellOk = probe.stdout.includes('packleader-ok') && probe.exitCode === 0
+  rows.push({
+    name: 'shell',
+    ok: shellOk,
+    detail: shellOk
+      ? `${shell.label}  ${shell.file}${shell.legacy ? '  (无 && ，用 ;)' : ''}`
+      : `${shell.label}  ${shell.file} — ${probe.stderr.split('\n')[0] ?? '启动失败'}（可用 PL_SHELL 指定）`,
+  })
+
+  let dataOk = false
+  let dataDetail = cfg.dataDir
+  try {
+    await mkdir(cfg.dataDir, { recursive: true })
+    const file = join(cfg.dataDir, '.probe')
+    await writeFile(file, 'ok', 'utf8')
+    await rm(file, { force: true })
+    dataOk = true
+  } catch (e) {
+    dataDetail = `${cfg.dataDir} — ${(e as Error).message}`
+  }
+  rows.push({ name: 'data-dir', ok: dataOk, detail: dataDetail })
+
+  const rootOk = existsSync(cfg.root)
+  rows.push({ name: 'workspace', ok: rootOk, detail: `${cfg.root}${rootOk ? '' : '（不存在）'}` })
+
+  let modelOk: boolean | 'skip' = 'skip'
+  let endpointDetail = cfg.baseURL
+  try {
+    const res = await fetch(`${cfg.baseURL.replace(/\/+$/, '')}/models`, {
+      headers: cfg.apiKey ? { authorization: `Bearer ${cfg.apiKey}` } : {},
+      signal: AbortSignal.timeout(8000),
+    })
+    if (!res.ok) {
+      modelOk = false
+      endpointDetail = `${cfg.baseURL} → HTTP ${res.status}`
+    } else {
+      const json = (await res.json()) as { data?: Array<{ id?: string }> }
+      const ids = (json.data ?? []).map((d) => d.id).filter((x): x is string => Boolean(x))
+      modelOk = ids.includes(cfg.model)
+      endpointDetail = ids.includes(cfg.model)
+        ? `${cfg.baseURL} → ${ids.length} 个模型，包含 ${cfg.model}`
+        : `${cfg.baseURL} → ${ids.length} 个模型，但没有 ${cfg.model}（有 ${ids.slice(0, 5).join(', ')}）`
+    }
+  } catch (e) {
+    modelOk = false
+    endpointDetail = `${cfg.baseURL} 不可达：${(e as Error).message}`
+  }
+  rows.push({ name: 'model', ok: modelOk, detail: endpointDetail })
+  if (!cfg.apiKey) rows.push({ name: 'api-key', ok: false, detail: '未设置（PL_API_KEY / DEEPSEEK_API_KEY / --api-key）' })
+
+  process.stdout.write(`${bold('PackLeader doctor')}\n`)
+  for (const r of rows) {
+    process.stdout.write(`  ${mark(r.ok)} ${r.name.padEnd(10)} ${dim(r.detail)}\n`)
+  }
+  const failed = rows.filter((r) => r.ok === false).length
+  process.stdout.write(
+    failed ? `\n${red(`${failed} 项没通过`)}\n` : `\n${green('全部通过')}，可以开跑\n`,
+  )
+  if (failed) process.exitCode = 1
+  void flags
 }
 
 async function cmdSessions(cfg: Config): Promise<void> {
@@ -151,10 +230,19 @@ async function cmdSessions(cfg: Config): Promise<void> {
   }
 }
 
-async function cmdAudit(cfg: Config, flags: Record<string, string | boolean>): Promise<void> {
+async function cmdAudit(cfg: Config, flags: Record<string, string | boolean>, positional: string[]): Promise<void> {
   const audit = await Audit.open(join(cfg.dataDir, 'audit.sqlite'))
   const sessionId = str(flags, 'session')
   const limit = num(flags, 'n') ?? 20
+
+  if (positional[0] === 'rebuild') {
+    const r = await audit.rebuild(join(cfg.dataDir, 'sessions'))
+    process.stdout.write(
+      `${green('重建完成')}  ${r.sessions} 个会话 / ${r.toolCalls} 次工具调用 / ${r.llmCalls} 次模型调用 / ${r.approvals} 次审批\n`,
+    )
+    audit.close()
+    return
+  }
 
   if (flags.cost) {
     const c = audit.cost()
@@ -184,7 +272,8 @@ async function cmdAudit(cfg: Config, flags: Record<string, string | boolean>): P
     const ms = `${String(r.ms ?? 0)}ms`.padStart(8)
     const bytes = `${r.out_bytes ?? 0}B`.padStart(7)
     const dec = r.decision && String(r.decision) !== 'allowed' ? yellow(String(r.decision)) : ''
-    process.stdout.write(`  ${ok} ${gray(when)}  ${tool}${gray(ms)}${gray(bytes)} ${dec}\n`)
+    const auto = Number(r.auto) === 1 ? gray('auto') : ''
+    process.stdout.write(`  ${ok} ${gray(when)}  ${tool}${gray(ms)}${gray(bytes)} ${dec} ${auto}\n`)
   }
   audit.close()
 }
@@ -215,8 +304,9 @@ async function main(): Promise<void> {
 
   const cfg = resolveConfig(flags)
   if (command === 'sessions') return cmdSessions(cfg)
-  if (command === 'audit') return cmdAudit(cfg, flags)
+  if (command === 'audit') return cmdAudit(cfg, flags, positional)
   if (command === 'undo') return cmdUndo(cfg, flags)
+  if (command === 'doctor') return cmdDoctor(cfg, flags)
 
   if (!cfg.apiKey) {
     process.stderr.write(

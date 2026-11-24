@@ -1,0 +1,11 @@
+﻿export function add(a, b) {
+  return a + b
+}
+
+export function mul(a, b) {
+  return a * b
+}
+
+export function clamp(v, lo, hi) {
+  return Math.min(lo, Math.max(hi, v))
+}

@@ -54,6 +54,26 @@ test('checkpoint: 外部改动过的文件报冲突，--force 才覆盖', async 
   assert.equal(await readFile(file, 'utf8'), 'orig')
 })
 
+test('checkpoint: 同一轮连续改两次不算外部改动（假冲突回归）', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pl-ckpt-'))
+  const file = join(root, 'c.txt')
+  await writeFile(file, 'v0', 'utf8')
+  const ck = new Checkpoints(join(root, '.ckpt'))
+
+  const m1 = await ck.snapshot('s-5', { turn: 1, step: 1, callId: 'c1', cwd: root }, [file])
+  await writeFile(file, 'v1', 'utf8')
+  await ck.finalize('s-5', m1)
+
+  const m2 = await ck.snapshot('s-5', { turn: 1, step: 2, callId: 'c2', cwd: root }, [file])
+  await writeFile(file, 'v2', 'utf8')
+  await ck.finalize('s-5', m2)
+
+  const r = await ck.undo('s-5', 1)
+  assert.deepEqual(r.conflicts, [])
+  assert.deepEqual(r.restored, [file])
+  assert.equal(await readFile(file, 'utf8'), 'v0')
+})
+
 test('checkpoint: 超大文件被跳过而不是拖垮撤销', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pl-ckpt-'))
   const big = join(root, 'big.bin')

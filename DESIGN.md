@@ -1,8 +1,24 @@
-# dsh-lite：轻量单机 Agent 设计方案
+# PackLeader：轻量单机 Agent 设计方案
 
 > 目标形态：**A 档（单机 Agent）** —— 会读文件、会跑命令、会改代码，有审批、有审计、能撤销、能续跑。
-> 实现底座：`E:\Desktop\ai\deepseek-harness-master`（DeepSeek Harness `0.2.1-rc.2`，Cordis「一切皆插件」架构，MIT）。
-> 设计原则：**不写 agent loop**。DSH 已经把难的部分做完了，我们只做「裁剪 + 5 个小插件 + 一个 TUI」。
+> 设计底座参考：`E:\Desktop\ai\deepseek-harness-master`（DeepSeek Harness `0.2.1-rc.2`，Cordis「一切皆插件」架构，MIT）。
+> 设计原则：**不自己发明 agent 语义**——session / tool pipeline / approval seam 的形状直接对齐 DSH，能换实现，不换契约。
+
+---
+
+## 0. 实现状态（v0.1，2026-11-24）
+
+已落地为本目录的 **PackLeader v0.1**：2129 行源码 + 523 行测试，**20 个测试全绿**（含真实子进程的 CLI e2e）；`node scripts/demo.ts` 可离线跑通「读 → 改 → 审计 → 撤销」。
+
+**一处重要偏离**：运行时**没有直接依赖 DSH 的包**，而是按本文定义的 seam 形状自实现。原因：
+
+1. DSH 所有包用 `workspace:*` 互相引用，link 到外部工程解析不出来
+2. npm 上只发布到 `0.1.0-rc.6`，与本地源码 `0.2.1-rc.2` 的 seam 不兼容
+3. 仓库里有 7 个包（`compaction/basic`、`fs/local`、`sandbox/*`、`session/persistence-jsonl`、`session/projection`、`subprocess/local`）尚未构建
+
+**代价与收益**：多写约 400 行主循环，换来「零依赖、零构建、改一行立刻生效」——验证阶段这比复用更划算。**替换路径保留**：`src/core/types.ts` 与 `src/core/tools.ts` 的词汇就是 DSH 的 seam 形状，将来接 `dsh-agent-loop` 时只需替换 `src/core/loop.ts` 与 `src/llm/openai.ts`，session / audit / checkpoint / tools 原样保留。
+
+其余设计（三档权限、一次性审批、事件溯源、审计投影、写前快照、截断落盘）与下文一致；实现与设计的逐条对应见 [README.md](README.md)。
 
 ---
 

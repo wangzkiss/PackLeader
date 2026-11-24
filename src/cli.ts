@@ -9,12 +9,18 @@
  *   pl sessions
  */
 
+// audit 模块（node:sqlite）按需加载；顺手过滤掉它的实验性警告，否则每次启动都往 stderr 打一行
+process.removeAllListeners('warning')
+process.on('warning', (w) => {
+  if (w.name === 'ExperimentalWarning' && /SQLite/i.test(w.message)) return
+  console.warn(w.stack ?? `${w.name}: ${w.message}`)
+})
+
 import { existsSync } from 'node:fs'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { createInterface } from 'node:readline/promises'
-import { Audit } from './core/audit.ts'
 import { ApprovalBroker } from './core/approval.ts'
 import { Checkpoints } from './core/checkpoint.ts'
 import { Agent } from './core/loop.ts'
@@ -231,6 +237,7 @@ async function cmdSessions(cfg: Config): Promise<void> {
 }
 
 async function cmdAudit(cfg: Config, flags: Record<string, string | boolean>, positional: string[]): Promise<void> {
+  const { Audit } = await import('./core/audit.ts')
   const audit = await Audit.open(join(cfg.dataDir, 'audit.sqlite'))
   const sessionId = str(flags, 'session')
   const limit = num(flags, 'n') ?? 20
@@ -330,6 +337,7 @@ async function main(): Promise<void> {
     return rl.question(q)
   }
 
+  const { Audit } = await import('./core/audit.ts')
   const audit = await Audit.open(join(cfg.dataDir, 'audit.sqlite'))
   const checkpoints = new Checkpoints(join(cfg.dataDir, 'ckpt'))
   const tools = createDefaultTools({ root: cfg.root })

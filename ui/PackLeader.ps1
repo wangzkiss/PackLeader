@@ -168,6 +168,9 @@ $xaml = @'
                        VerticalAlignment="Center"/>
           </StackPanel>
           <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" HorizontalAlignment="Right" VerticalAlignment="Center">
+            <Button x:Name="SettingsBtn" Content="设置" Height="24" Padding="8,0" Cursor="Hand" FontSize="11"
+                    Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF" BorderThickness="1"
+                    Margin="0,0,10,0" ToolTip="填写模型端点地址和 API Key"/>
             <TextBlock Text="模型" Foreground="#6B7280" FontSize="10.5" VerticalAlignment="Center" Margin="0,0,6,0"/>
             <Border Background="#16181D" BorderBrush="#12FFFFFF" BorderThickness="1" CornerRadius="6" Padding="8,3">
               <TextBox x:Name="ModelBox" Width="132" Background="Transparent" Foreground="#CFD3D6" BorderThickness="0"
@@ -207,6 +210,44 @@ $xaml = @'
         </Border>
       </Grid>
     </Grid>
+
+    <!-- 设置面板：做成遮罩层而不是第二个窗口，省掉嵌套消息循环那堆坑 -->
+    <Grid x:Name="SettingsOverlay" Grid.ColumnSpan="2" Visibility="Collapsed" Background="#B8000000">
+      <Border Width="452" Background="#16181D" BorderBrush="#26FFFFFF" BorderThickness="1" CornerRadius="12"
+              HorizontalAlignment="Center" VerticalAlignment="Center" Padding="22,18,22,16">
+        <StackPanel>
+          <TextBlock Text="模型设置" Foreground="#F9FAFB" FontSize="14.5" FontWeight="SemiBold"/>
+          <TextBlock Text="填 OpenAI 兼容的端点地址和 Key，保存后立刻生效，并写进数据目录的 config.json。"
+                     Foreground="#7C838E" FontSize="11" Margin="0,5,0,16" TextWrapping="Wrap"/>
+
+          <TextBlock Text="端点地址" Foreground="#ADB2B8" FontSize="11" Margin="0,0,0,5"/>
+          <TextBox x:Name="CfgUrl" Height="30" Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF"
+                   BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center" FontSize="11.5"
+                   FontFamily="Cascadia Mono, Consolas"/>
+
+          <TextBlock Text="API Key" Foreground="#ADB2B8" FontSize="11" Margin="0,13,0,5"/>
+          <TextBox x:Name="CfgKey" Height="30" Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF"
+                   BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center" FontSize="11.5"
+                   FontFamily="Cascadia Mono, Consolas"/>
+          <TextBlock x:Name="CfgKeyHint" Text="" Foreground="#5B626D" FontSize="10.5" Margin="0,5,0,0" TextWrapping="Wrap"/>
+
+          <TextBlock Text="模型名" Foreground="#ADB2B8" FontSize="11" Margin="0,13,0,5"/>
+          <TextBox x:Name="CfgModel" Height="30" Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF"
+                   BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center" FontSize="11.5"
+                   FontFamily="Cascadia Mono, Consolas"/>
+
+          <TextBlock x:Name="CfgError" Text="" Foreground="#F87171" FontSize="11" Margin="0,10,0,0" TextWrapping="Wrap"/>
+
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
+            <Button x:Name="CfgCancel" Content="取消" Height="28" Padding="14,0" Cursor="Hand" FontSize="11.5"
+                    Background="Transparent" Foreground="#ADB2B8" BorderBrush="#1FFFFFFF" BorderThickness="1"
+                    Margin="0,0,8,0"/>
+            <Button x:Name="CfgSave" Content="保存" Height="28" Padding="18,0" Cursor="Hand" FontSize="11.5"
+                    FontWeight="SemiBold" Background="#2B5CFF" Foreground="White" BorderThickness="0"/>
+          </StackPanel>
+        </StackPanel>
+      </Border>
+    </Grid>
   </Grid>
 </Window>
 '@
@@ -234,6 +275,15 @@ $NewChatBtn = $window.FindName('NewChatBtn')
 $SessionList = $window.FindName('SessionList')
 $TitleText = $window.FindName('TitleText')
 $SubTitle = $window.FindName('SubTitle')
+$SettingsBtn = $window.FindName('SettingsBtn')
+$SettingsOverlay = $window.FindName('SettingsOverlay')
+$CfgUrl = $window.FindName('CfgUrl')
+$CfgKey = $window.FindName('CfgKey')
+$CfgKeyHint = $window.FindName('CfgKeyHint')
+$CfgModel = $window.FindName('CfgModel')
+$CfgError = $window.FindName('CfgError')
+$CfgCancel = $window.FindName('CfgCancel')
+$CfgSave = $window.FindName('CfgSave')
 
 # ---------------------------------------------------------------- 画东西的小工具
 function Brush([string]$hex) {
@@ -519,27 +569,69 @@ function Set-Sessions($items) {
     $row.Padding = '8,6'
     $row.Margin = '0,2,0,2'
     $row.Cursor = 'Hand'
-    $selected = ([string]$it.id -eq [string]$script:sessionId)
+    $sid = [string]$it.id
+    $stitle = [string]$it.title
+    $selected = ($sid -eq [string]$script:sessionId)
     $row.Background = $(if ($selected) { Brush '#20242E' } else { [System.Windows.Media.Brushes]::Transparent })
 
+    $grid = New-Object System.Windows.Controls.Grid
+    $c1 = New-Object System.Windows.Controls.ColumnDefinition
+    $c1.Width = New-Object System.Windows.GridLength 1, ([System.Windows.GridUnitType]::Star)
+    $c2 = New-Object System.Windows.Controls.ColumnDefinition
+    $c2.Width = [System.Windows.GridLength]::Auto
+    $grid.ColumnDefinitions.Add($c1)
+    $grid.ColumnDefinitions.Add($c2)
+
     $sp = New-Object System.Windows.Controls.StackPanel
-    $t = New-Text ([string]$it.title) 12 '#E6E8EE' 'Normal' 'Segoe UI' 2
+    $t = New-Text $stitle 12 '#E6E8EE' 'Normal' 'Segoe UI' 2
     $t.TextTrimming = 'CharacterEllipsis'
     $t.TextWrapping = 'NoWrap'
     $sp.Children.Add($t) | Out-Null
     $meta = New-Text "$($it.turns) 轮 · $(Format-Ago $it.updatedAt)" 10 '#6B7280' 'Normal' 'Segoe UI' 0
     $sp.Children.Add($meta) | Out-Null
-    $row.Child = $sp
+    [System.Windows.Controls.Grid]::SetColumn($sp, 0)
+    $grid.Children.Add($sp) | Out-Null
 
-    $id = [string]$it.id
+    # 删除按钮：平时藏着，鼠标移到这一行才露出来
+    $del = New-Object System.Windows.Controls.Button
+    $del.Content = '×'
+    $del.FontSize = 15
+    $del.Width = 22
+    $del.Height = 22
+    $del.Padding = '0'
+    $del.Cursor = 'Hand'
+    $del.Background = [System.Windows.Media.Brushes]::Transparent
+    $del.Foreground = (Brush '#6B7280')
+    $del.BorderThickness = '0'
+    $del.VerticalAlignment = 'Center'
+    $del.Visibility = 'Hidden'
+    $del.ToolTip = '删除这个会话'
+    [System.Windows.Controls.Grid]::SetColumn($del, 1)
+    $grid.Children.Add($del) | Out-Null
+
+    $del.Add_Click({
+      param($s, $ev)
+      $ev.Handled = $true
+      $r = [System.Windows.MessageBox]::Show("删除会话「$stitle」？`n`n会删掉它的会话日志和 checkpoint，不能恢复。", 'PackLeader', 'YesNo', 'Warning')
+      if ($r -eq [System.Windows.MessageBoxResult]::Yes) {
+        Send-Host @{ cmd = 'delete-session'; id = $sid }
+      }
+    }.GetNewClosure())
+    $del.Add_MouseEnter({ $this.Foreground = (Brush '#F87171') }.GetNewClosure())
+    $del.Add_MouseLeave({ $this.Foreground = (Brush '#6B7280') }.GetNewClosure())
+
+    $row.Child = $grid
+
     $row.Add_MouseLeftButtonUp({
-      Send-Host @{ cmd = 'load-session'; id = $id }
+      Send-Host @{ cmd = 'load-session'; id = $sid }
     }.GetNewClosure())
     $row.Add_MouseEnter({
       $this.Background = (Brush '#1B1F27')
+      $del.Visibility = 'Visible'
     }.GetNewClosure())
     $row.Add_MouseLeave({
-      if ($id -eq [string]$script:sessionId) { $this.Background = (Brush '#20242E') }
+      $del.Visibility = 'Hidden'
+      if ($sid -eq [string]$script:sessionId) { $this.Background = (Brush '#20242E') }
       else { $this.Background = [System.Windows.Media.Brushes]::Transparent }
     }.GetNewClosure())
 
@@ -688,6 +780,43 @@ $script:sessionId = ''
 $script:hostGone = $false
 $script:history = New-Object System.Collections.ArrayList
 $script:historyIdx = 0
+$script:cfgBaseURL = ''
+$script:cfgKeyMasked = ''
+$script:hasKey = $true
+
+# ---------------------------------------------------------------- 设置面板
+function Open-Settings {
+  $CfgUrl.Text = $(if ($script:cfgBaseURL) { $script:cfgBaseURL } else { '' })
+  $CfgKey.Text = ''
+  $CfgModel.Text = $script:modelName
+  if ($script:hasKey) {
+    $CfgKeyHint.Text = "已设置（$($script:cfgKeyMasked)）；留空表示保持不变。"
+  } else {
+    $CfgKeyHint.Text = '还没有设置 Key，填一个才能开始对话。'
+  }
+  $CfgError.Text = ''
+  $SettingsOverlay.Visibility = 'Visible'
+  $CfgUrl.Focus() | Out-Null
+  $CfgUrl.CaretIndex = $CfgUrl.Text.Length
+}
+
+function Close-Settings {
+  $SettingsOverlay.Visibility = 'Collapsed'
+  $InputBox.Focus() | Out-Null
+}
+
+function Save-Settings {
+  $url = $CfgUrl.Text.Trim()
+  $key = $CfgKey.Text.Trim()
+  $model = $CfgModel.Text.Trim()
+  if (-not $url) { $CfgError.Text = '端点地址不能为空（例：http://127.0.0.1:19790/v1）'; return }
+  if (-not $url.StartsWith('http')) { $CfgError.Text = '端点地址要以 http:// 或 https:// 开头'; return }
+  if (-not $key -and -not $script:hasKey) { $CfgError.Text = 'API Key 不能为空'; return }
+  $CfgError.Text = ''
+  $payload = @{ cmd = 'config'; baseURL = $url; model = $model }
+  if ($key) { $payload.apiKey = $key }
+  Send-Host $payload
+}
 
 $script:modeButtons = @{ 'read-only' = $ModeRead; 'guarded' = $ModeGuard; 'full' = $ModeFull }
 
@@ -736,11 +865,16 @@ function Handle-Event([string]$line) {
     'ready' {
       $script:sessionId = [string]$e.session
       $script:modelName = [string]$e.model
+      $script:cfgBaseURL = [string]$e.baseURL
+      $script:cfgKeyMasked = [string]$e.apiKeyMasked
+      $script:hasKey = [bool]$e.hasKey
       $WorkspaceLabel.Text = [string]$e.cwd
       $ModelBox.Text = [string]$e.model
       $TitleText.Text = $(if ($e.title -and $e.title -ne '(empty)') { [string]$e.title } else { '新对话' })
       $SubTitle.Text = [string]$e.mode
       Set-ModeVisual ([string]$e.mode)
+      # 第一次用（没 Key）：直接把设置面板弹出来，别让用户对着输入框发呆
+      if (-not $script:hasKey) { Open-Settings }
 
       if (-not $script:busy) {
         Clear-Transcript
@@ -824,7 +958,17 @@ function Handle-Event([string]$line) {
     'notice' { Add-SystemLine ([string]$e.text) '#9BA3B4' }
     'error' {
       Add-SystemLine ("错误：" + $e.message) '#F87171'
+      if ($e.needsSetup) { Open-Settings }
       if ($e.fatal) { Set-Busy $false }
+    }
+    'config' {
+      $script:cfgBaseURL = [string]$e.baseURL
+      $script:cfgKeyMasked = [string]$e.apiKeyMasked
+      $script:modelName = [string]$e.model
+      $script:hasKey = $true
+      $ModelBox.Text = [string]$e.model
+      Close-Settings
+      Add-SystemLine ("已切换模型：" + $e.model + " @ " + $e.baseURL) '#4ADE80'
     }
     'usage' {
       $p = [int]$e.prompt; $c = [int]$e.completion; $cr = [int]$e.cacheRead
@@ -863,6 +1007,25 @@ function Handle-Event([string]$line) {
 # ---------------------------------------------------------------- 交互
 $SendBtn.Add_Click({ Start-Turn $InputBox.Text })
 $StopBtn.Add_Click({ Send-Host @{ cmd = 'abort' } })
+
+# 设置面板
+$SettingsBtn.Add_Click({ Open-Settings })
+$CfgCancel.Add_Click({ Close-Settings })
+$CfgSave.Add_Click({ Save-Settings })
+foreach ($box in @($CfgUrl, $CfgKey, $CfgModel)) {
+  $box.Add_PreviewKeyDown({
+    param($s, $e)
+    if ($e.Key -eq [System.Windows.Input.Key]::Return) { $e.Handled = $true; Save-Settings }
+    elseif ($e.Key -eq [System.Windows.Input.Key]::Escape) { $e.Handled = $true; Close-Settings }
+  })
+}
+$window.Add_PreviewKeyDown({
+  param($s, $e)
+  if ($e.Key -eq [System.Windows.Input.Key]::Escape -and $SettingsOverlay.Visibility -eq 'Visible') {
+    $e.Handled = $true
+    Close-Settings
+  }
+})
 
 # 必须用 PreviewKeyDown（隧道）：TextBox 会自己吃掉方向键和回车并在冒泡阶段标记
 # Handled，挂在 KeyDown 上的处理器根本不会被调用。

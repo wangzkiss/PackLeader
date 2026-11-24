@@ -5,9 +5,10 @@
  *   stdin  ← 命令（每行一个 JSON）
  *   stdout → 事件（每行一个 JSON）
  *
- * 命令：task / approve / abort / mode / model / new-session / list-sessions / load-session / ping
+ * 命令：task / approve / abort / mode / model / config / cwd / new-session / delete-session /
+ *       list-sessions / load-session / ping
  * 事件：ready / turn-start / step / text / reasoning / assistant-end / tool-start / tool-end /
- *       approval / usage / turn-end / sessions / notice / error
+ *       approval / usage / turn-end / sessions / config / notice / error
  *
  * GUI 只做渲染，不碰 agent 逻辑；协议是纯 JSON 行，前端换成 WPF / 浏览器 / 终端都不用改核心。
  */
@@ -20,6 +21,7 @@ import { Checkpoints } from './core/checkpoint.ts'
 import { Agent, type Renderer } from './core/loop.ts'
 import { Policy } from './core/policy.ts'
 import { Session } from './core/session.ts'
+import { loadSettings, maskKey, saveSettings } from './core/settings.ts'
 import type { Decision, Mode, ToolCall } from './core/types.ts'
 import { OpenAiClient } from './llm/openai.ts'
 import { createDefaultTools } from './tools/index.ts'
@@ -129,10 +131,13 @@ export function summarizeCall(name: string, args: Record<string, unknown>): stri
 
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv.slice(2))
+  // 没有 key 也要开窗口：第一次用的人是先在界面上填端点/Key 的。
+  // 真正拦在 runTask 里（见下），而不是启动时直接死掉。
   if (!opts.apiKey) {
-    send({ type: 'error', message: '缺少 API key：设置 PL_API_KEY，或在启动参数里给 --api-key', fatal: true })
-    process.exitCode = 2
-    return
+    const saved = await loadSettings(opts.dataDir)
+    if (saved.apiKey) opts.apiKey = saved.apiKey
+    if (saved.baseURL) opts.baseURL = saved.baseURL
+    if (saved.model) opts.model = saved.model
   }
 
   const { Audit: AuditClass } = await import('./core/audit.ts')
@@ -201,6 +206,9 @@ async function main(): Promise<void> {
     cwd: opts.root,
     mode: policy.mode,
     model: llm.cfg.model,
+    baseURL: opts.baseURL,
+    apiKeyMasked: maskKey(opts.apiKey),
+    hasKey: Boolean(opts.apiKey),
     maxSteps: opts.maxSteps,
     events: session.events,
   })
@@ -230,6 +238,10 @@ async function main(): Promise<void> {
   const runTask = async (text: string): Promise<void> => {
     if (running) {
       send({ type: 'error', message: '上一轮还没结束（可先点停止）' })
+      return
+    }
+    if (!opts.apiKey) {
+      send({ type: 'error', message: '还没配置模型：点右上角的设置，填端点地址和 API Key', needsSetup: true })
       return
     }
     running = true
@@ -291,7 +303,39 @@ async function main(): Promise<void> {
         const m = String(cmd.model ?? '').trim()
         if (m) {
           llm.cfg.model = m
+          opts.model = m
+          // 界面里直接改模型名也要能留住，不然下次启动又变回去
+          void saveSettings(opts.dataDir, { model: m }).catch(() => {})
           send({ type: 'model', model: m })
+        }
+        break
+      }
+      case 'config': {
+        // 界面上填的端点 / Key：立刻生效（不用重启），并落盘给下次启动用
+        const baseURL = String(cmd.baseURL ?? '').trim()
+        const apiKey = String(cmd.apiKey ?? '').trim()
+        const model = String(cmd.model ?? '').trim()
+        if (baseURL) {
+          opts.baseURL = baseURL
+          llm.cfg.baseURL = baseURL
+        }
+        if (apiKey) {
+          opts.apiKey = apiKey
+          llm.cfg.apiKey = apiKey
+        }
+        if (model) {
+          opts.model = model
+          llm.cfg.model = model
+        }
+        if (!opts.apiKey) {
+          send({ type: 'error', message: 'API Key 不能为空' })
+          break
+        }
+        try {
+          await saveSettings(opts.dataDir, { baseURL: opts.baseURL, apiKey: opts.apiKey, model: llm.cfg.model })
+          send({ type: 'config', baseURL: opts.baseURL, model: llm.cfg.model, apiKeyMasked: maskKey(opts.apiKey), saved: true })
+        } catch (e) {
+          send({ type: 'error', message: `配置已生效，但没写进磁盘：${(e as Error).message}` })
         }
         break
       }
@@ -317,6 +361,26 @@ async function main(): Promise<void> {
         session = await Session.create(opts.dataDir, meta())
         agent = buildAgent()
         send(state())
+        break
+      }
+      case 'delete-session': {
+        if (running) {
+          send({ type: 'error', message: '请先等当前轮结束' })
+          break
+        }
+        const id = String(cmd.id ?? '')
+        try {
+          await Session.remove(opts.dataDir, id)
+          // 删掉的正好是当前会话：得换一个新的，否则 agent 还指着已删除的文件
+          if (id === session.id) {
+            session = await Session.create(opts.dataDir, meta())
+            agent = buildAgent()
+            send(state())
+          }
+          send({ type: 'sessions', items: await Session.list(opts.dataDir) })
+        } catch (e) {
+          send({ type: 'error', message: `删除会话失败：${(e as Error).message}` })
+        }
         break
       }
       case 'list-sessions': {

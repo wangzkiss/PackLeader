@@ -8,7 +8,7 @@
  * 审计库只是投影，随时可由这些 jsonl 重建（见 core/audit.ts rebuild）。
  */
 
-import { appendFile, mkdir, readFile, readdir, stat } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, readdir, rm, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type { EventInput, SessionEvent } from './events.ts'
 import type { LlmMessage } from './types.ts'
@@ -97,8 +97,18 @@ export class Session {
     return out.sort((a, b) => b.updatedAt - a.updatedAt)
   }
 
-  async append(payload: EventInput): Promise<SessionEvent> {
-    const event = { seq: this.seq + 1, at: Date.now(), ...payload } as SessionEvent
+  /**
+   * 删除会话：连同它的 checkpoint 一起删。
+   * 只删 checkpoints 会留下悬空引用（undo 指向已经不存在的会话），只删会话则留一堆垃圾。
+   */
+  static async remove(dataDir: string, id: string): Promise<void> {
+    // id 直接拼进路径，必须挡路径穿越
+    if (!/^s-[a-z0-9]+-[a-z0-9]+$/.test(id)) throw new Error(`非法会话 id：${id}`)
+    await rm(join(dataDir, 'sessions', id), { recursive: true, force: true })
+    await rm(join(dataDir, 'ckpt', id), { recursive: true, force: true })
+  }
+
+  async append(payload: EventInput): Promise<SessionEvent> {    const event = { seq: this.seq + 1, at: Date.now(), ...payload } as SessionEvent
     this.seq = event.seq
     this.events.push(event)
     await mkdir(dirname(this.file), { recursive: true })

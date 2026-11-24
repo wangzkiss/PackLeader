@@ -27,6 +27,7 @@ import { Checkpoints } from './core/checkpoint.ts'
 import { Agent } from './core/loop.ts'
 import { Policy } from './core/policy.ts'
 import { Session } from './core/session.ts'
+import { loadSettingsSync } from './core/settings.ts'
 import type { Mode } from './core/types.ts'
 import { OpenAiClient } from './llm/openai.ts'
 import { createDefaultTools } from './tools/index.ts'
@@ -97,6 +98,9 @@ interface Config {
 
 function resolveConfig(flags: Record<string, string | boolean>): Config {
   const dataDir = resolve(str(flags, 'data-dir') ?? process.env.PACKLEADER_HOME ?? join(homedir(), '.packleader'))
+  // 优先级：命令行 > 环境变量 > <data>/config.json > 内置默认。
+  // 界面里填的端点/Key 也写这个文件，所以装完之后不设任何环境变量也能用。
+  const saved = loadSettingsSync(dataDir)
   const mode = (str(flags, 'mode') ?? process.env.PL_MODE ?? 'guarded') as Mode
   if (!['read-only', 'guarded', 'full'].includes(mode)) throw new Error(`--mode 只能是 read-only / guarded / full，收到 ${mode}`)
   const approval = flags.deny ? 'deny' : flags.yes ? 'allow' : ((process.env.PL_APPROVAL as Config['approval']) ?? 'ask')
@@ -104,9 +108,20 @@ function resolveConfig(flags: Record<string, string | boolean>): Config {
     dataDir,
     root: resolve(str(flags, 'cwd') ?? process.cwd()),
     mode,
-    apiKey: str(flags, 'api-key') ?? process.env.PL_API_KEY ?? process.env.DEEPSEEK_API_KEY ?? process.env.OPENAI_API_KEY ?? '',
-    baseURL: str(flags, 'base-url') ?? process.env.PL_BASE_URL ?? process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com/v1',
-    model: str(flags, 'model') ?? process.env.PL_MODEL ?? 'deepseek-chat',
+    apiKey:
+      str(flags, 'api-key') ??
+      process.env.PL_API_KEY ??
+      process.env.DEEPSEEK_API_KEY ??
+      process.env.OPENAI_API_KEY ??
+      saved.apiKey ??
+      '',
+    baseURL:
+      str(flags, 'base-url') ??
+      process.env.PL_BASE_URL ??
+      process.env.DEEPSEEK_BASE_URL ??
+      saved.baseURL ??
+      'https://api.deepseek.com/v1',
+    model: str(flags, 'model') ?? process.env.PL_MODEL ?? saved.model ?? 'deepseek-chat',
     approval,
     maxSteps: num(flags, 'max-steps') ?? 40,
   }
@@ -122,6 +137,7 @@ ${bold('用法')}
   pl undo [--turn N]         撤销某一轮的所有文件改动
   pl sessions                列出历史会话
   pl doctor                  自检（node / shell / 数据目录 / 端点 / 模型）
+  pl gui                     打开桌面窗口（里面可以填端点/Key）
 
 ${bold('选项')}
   --cwd <dir>          工作目录（默认当前目录）
@@ -147,6 +163,7 @@ ${bold('示例')}
   pl undo --turn 3
 
 ${dim('环境变量：PL_API_KEY / PL_BASE_URL / PL_MODEL / PL_MODE / PL_APPROVAL / PL_SHELL / PACKLEADER_HOME')}
+${dim('配置文件：<数据目录>/config.json（界面里填的端点/Key 存在这里，环境变量优先级更高）')}
 `)
 }
 

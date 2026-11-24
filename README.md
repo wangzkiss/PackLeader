@@ -97,26 +97,31 @@ node src/cli.ts undo --turn 3
 
 ### 桌面窗口（`pl gui`）
 
-![PackLeader 窗口](docs/gui.png)
+![PackLeader 窗口](docs/screenshot.png)
 
 真 Windows 窗口（WPF），不是 Electron、也不是浏览器套壳：
 
 | 部分 | 文件 | 体积 |
 |---|---|---|
-| 窗口（WPF / .NET Framework 4.8，系统自带） | `ui/PackLeader.ps1` | 23 KB |
+| 窗口（WPF / .NET Framework 4.8，系统自带） | `ui/PackLeader.ps1` | 34 KB |
 | 引擎主机（NDJSON over stdio） | `src/host.ts` | 12 KB |
 
 **装完不到 1 MB**（不含 Node 本体，见下）。没有 web 服务、没有端口、没有浏览器、没有 150 MB 的 Chromium。
 
-窗口能做：流式回答、工具行（`⚙ read a.txt ✓ 12ms`）、审批卡片（允许一次 / 拒绝 / 看参数）、
-权限三档切换（只读 / 询问 / 完全）、换模型、换目录、新对话、停止、用量与缓存命中率。
+界面照 DeepSeek Harness 的样式做：左侧会话栏、无气泡消息流、细描边卡片、等宽字体显示工具调用。
+配色直接取自 DSH 自己的 CSS 变量（`#0f1115` 底 / `#f9fafb` 主文字 / 12% 白描边），
+字号取自它的主题插件（正文 14px、代码小 1px、行高 1.6）。
+
+窗口能做：左侧会话列表（点击切换）、流式回答、Markdown 渲染（粗体 / 行内代码 / 代码块 / 标题 / 列表）、
+工具行（`⚙ read src/host.ts ✓ 1ms`）、审批卡片（允许一次 / 拒绝 / 看参数）、权限三档、
+换模型、换目录、新对话、停止、本会话用量与缓存命中率、空状态示例问题。
 
 架构上一句话：**窗口只负责画，agent 只负责算**，中间是 JSON 行协议（`src/host.ts`），
 所以以后把引擎换成 Rust、或者把窗口换成别的，两边都不用动。
 
 依赖前提：机器上要有 **Node ≥ 22.18**。要"免装 Node 且仍然原生"，只能把引擎移植成 Rust/C#（见 [ROADMAP.md](ROADMAP.md) 的体积测算）。
 
-已知没做：历史会话选择器（现在只能 `--resume`）、diff 预览、Markdown 渲染、输入历史。
+已知没做：diff 预览、输入历史（↑↓）、代码块底色、窗口无边框自绘标题栏。
 
 ### 命令行交互模式
 

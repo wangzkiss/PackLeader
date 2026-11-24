@@ -59,9 +59,12 @@ const DEFAULT_MAX_OUTPUT = 64 * 1024
 export class Agent {
   private opts: AgentOptions
   private pendingApproval: string | null = null
+  /** 可逐轮设置：GUI 点「停止」时中断当前轮，不需要重建 Agent */
+  signal?: AbortSignal
 
   constructor(opts: AgentOptions) {
     this.opts = opts
+    this.signal = opts.signal
   }
 
   get session(): Session {
@@ -261,7 +264,7 @@ export class Agent {
           root: policy.root,
           spillDir: join(this.opts.dataDir, 'spill'),
           maxOutputBytes: this.opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT,
-          signal: this.opts.signal,
+          signal: this.signal,
           readFiles: new Set(),
         },
         call.args,
@@ -321,7 +324,7 @@ export class Agent {
 
     try {
       for (let step = 1; step <= maxSteps; step++) {
-        if (this.opts.signal?.aborted) {
+        if (this.signal?.aborted) {
           reason = 'cancelled'
           break
         }
@@ -333,7 +336,7 @@ export class Agent {
         const res = await llm.chat({
           messages,
           tools: tools.schemas(),
-          signal: this.opts.signal,
+          signal: this.signal,
           onText: (c) => renderer?.onText?.(c),
           onReasoning: (c) => renderer?.onReasoning?.(c),
         })
@@ -412,7 +415,7 @@ export class Agent {
           const wrap = await llm.chat({
             messages: wrapMessages,
             tools: [],
-            signal: this.opts.signal,
+            signal: this.signal,
             onText: (c) => renderer?.onText?.(c),
             onReasoning: (c) => renderer?.onReasoning?.(c),
           })
@@ -453,7 +456,7 @@ export class Agent {
         }
       }
     } catch (e) {
-      reason = this.opts.signal?.aborted ? 'cancelled' : 'error'
+      reason = this.signal?.aborted ? 'cancelled' : 'error'
       const message = (e as Error).message
       await session.append({ kind: 'turn/end', turn, reason, error: message })
       this.syncAudit()

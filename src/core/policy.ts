@@ -10,12 +10,21 @@ import type { Mode, Permission } from './types.ts'
 export type Gate = 'allow' | 'ask' | 'deny'
 
 export class Policy {
-  readonly root: string
-  readonly mode: Mode
+  /** 可运行期切换（GUI 里换 workspace / 改权限档位） */
+  root: string
+  mode: Mode
 
   constructor(root: string, mode: Mode) {
     this.root = resolve(root)
     this.mode = mode
+  }
+
+  setMode(mode: Mode): void {
+    this.mode = mode
+  }
+
+  setRoot(root: string): void {
+    this.root = resolve(root)
   }
 
   /** 相对路径按 workspace root 解析 */

@@ -86,6 +86,7 @@ node src/cli.ts undo --turn 3
 | `pl "任务"` | 单次执行，完成后退出 |
 | `pl` | 交互模式（`/exit` `/undo` `/sessions` `/help`） |
 | `pl --repl` | 强制交互模式（stdin 不是终端也行，便于脚本驱动） |
+| `pl gui` | 打开桌面窗口（原生 WPF 窗口，不是 Electron） |
 | `pl doctor` | 自检：node 版本 / shell 解析 / 数据目录可写 / 端点可达 / 模型存在 |
 | `pl audit [-n N] [--tool X] [--cost] [--json]` | 审计账本：工具调用 / 成本 |
 | `pl audit rebuild` | 从会话日志重建审计库（证明审计只是投影） |
@@ -94,7 +95,30 @@ node src/cli.ts undo --turn 3
 
 常用选项：`--cwd` `--mode` `--yes` `--deny` `--model` `--base-url` `--api-key` `--resume <id>` `--continue` `--data-dir` `--max-steps` `--json` `--repl` `--show-reasoning`
 
-### 交互模式长什么样
+### 桌面窗口（`pl gui`）
+
+![PackLeader 窗口](docs/gui.png)
+
+真 Windows 窗口（WPF），不是 Electron、也不是浏览器套壳：
+
+| 部分 | 文件 | 体积 |
+|---|---|---|
+| 窗口（WPF / .NET Framework 4.8，系统自带） | `ui/PackLeader.ps1` | 23 KB |
+| 引擎主机（NDJSON over stdio） | `src/host.ts` | 12 KB |
+
+**装完不到 1 MB**（不含 Node 本体，见下）。没有 web 服务、没有端口、没有浏览器、没有 150 MB 的 Chromium。
+
+窗口能做：流式回答、工具行（`⚙ read a.txt ✓ 12ms`）、审批卡片（允许一次 / 拒绝 / 看参数）、
+权限三档切换（只读 / 询问 / 完全）、换模型、换目录、新对话、停止、用量与缓存命中率。
+
+架构上一句话：**窗口只负责画，agent 只负责算**，中间是 JSON 行协议（`src/host.ts`），
+所以以后把引擎换成 Rust、或者把窗口换成别的，两边都不用动。
+
+依赖前提：机器上要有 **Node ≥ 22.18**。要"免装 Node 且仍然原生"，只能把引擎移植成 Rust/C#（见 [ROADMAP.md](ROADMAP.md) 的体积测算）。
+
+已知没做：历史会话选择器（现在只能 `--resume`）、diff 预览、Markdown 渲染、输入历史。
+
+### 命令行交互模式
 
 行式界面（不是全屏 TUI）：横幅 → `›` 提示符 → 流式回答 → 工具行 `⚙ write hello.txt / ✓ 12ms`；
 需要写权限时插入审批框，逐条问 `[y]/[n]/[d]`。

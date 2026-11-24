@@ -1,0 +1,14 @@
+{"seq":1,"at":1795535461954,"kind":"session/start","id":"s-mwuvgdaa-twdf","cwd":"C:\\Users\\2025\\AppData\\Local\\Temp\\pl-gui-demo","mode":"guarded","model":"deepseek-flash","baseURL":"http://127.0.0.1:19790/v1","startedAt":1795535461954}
+{"seq":2,"at":1795535462132,"kind":"turn/start","turn":1}
+{"seq":3,"at":1795535462132,"kind":"user/message","text":"��һ�� README.md��Ȼ����һ�仰˵�����Ŀ¼�Ǹ�ʲô��"}
+{"seq":4,"at":1795535462132,"kind":"step/start","turn":1,"step":1}
+{"seq":5,"at":1795535463629,"kind":"assistant/message","text":"","reasoning":"The user asks: read README.md, then say in one sentence what the project/directory is about. Encoding is garbled but likely \"读一下 README.md，然后用一句话说明这个目录是干什么的。\"\n\nLet me read README.md.","toolCalls":[{"id":"call_00_1b7fyjf49sea914x4lgjys8q","name":"read","args":{"path":"README.md"},"rawArguments":"{\"path\": \"README.md\"}"}],"ms":1496,"finish":"tool_calls"}
+{"seq":6,"at":1795535463630,"kind":"llm/usage","turn":1,"step":1,"prompt":1674,"completion":89,"cacheRead":0,"ms":1496,"model":"deepseek-flash"}
+{"seq":7,"at":1795535463632,"kind":"tool/call","turn":1,"step":1,"call":{"id":"call_00_1b7fyjf49sea914x4lgjys8q","name":"read","args":{"path":"README.md"},"rawArguments":"{\"path\": \"README.md\"}"}}
+{"seq":8,"at":1795535463634,"kind":"tool/result","callId":"call_00_1b7fyjf49sea914x4lgjys8q","name":"read","ok":true,"content":"README.md (共 3 行，本次 1-3)\n    1| ﻿# demo\n    2| 这是给 GUI 演示用的目录。\r\n    3| ","truncated":false,"ms":0}
+{"seq":9,"at":1795535463634,"kind":"step/end","turn":1,"step":1,"toolCalls":1}
+{"seq":10,"at":1795535463634,"kind":"step/start","turn":1,"step":2}
+{"seq":11,"at":1795535464995,"kind":"assistant/message","text":"README.md 只有 3 行，内容是：`# demo`，并说明“这是给 GUI 演示用的目录”。\n\n结论：这个目录是给 GUI 演示用的示例目录，里面只有一个 demo 用的 README。","reasoning":"","toolCalls":[],"ms":1360,"finish":"stop"}
+{"seq":12,"at":1795535464996,"kind":"llm/usage","turn":1,"step":2,"prompt":1764,"completion":49,"cacheRead":1664,"ms":1360,"model":"deepseek-flash"}
+{"seq":13,"at":1795535464997,"kind":"step/end","turn":1,"step":2,"toolCalls":0}
+{"seq":14,"at":1795535464997,"kind":"turn/end","turn":1,"reason":"done"}

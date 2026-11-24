@@ -17,9 +17,10 @@ process.on('warning', (w) => {
 })
 
 import { existsSync } from 'node:fs'
-import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
 import { join, resolve } from 'node:path'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { createInterface } from 'node:readline/promises'
 import { ApprovalBroker } from './core/approval.ts'
 import { Checkpoints } from './core/checkpoint.ts'
@@ -39,7 +40,7 @@ const BOOL_FLAGS = new Set([
 ])
 
 interface Parsed {
-  command: 'run' | 'audit' | 'undo' | 'sessions' | 'help' | 'version' | 'doctor'
+  command: 'run' | 'audit' | 'undo' | 'sessions' | 'help' | 'version' | 'doctor' | 'gui'
   flags: Record<string, string | boolean>
   positional: string[]
 }
@@ -66,7 +67,7 @@ function parse(argv: string[]): Parsed {
       }
     } else positional.push(a)
   }
-  const known = ['audit', 'undo', 'sessions', 'help', 'version', 'doctor']
+  const known = ['audit', 'undo', 'sessions', 'help', 'version', 'doctor', 'gui']
   const head = positional[0]
   const command = (head && known.includes(head) ? positional.shift()! : 'run') as Parsed['command']
   return { command, flags, positional }
@@ -147,6 +148,48 @@ ${bold('示例')}
 
 ${dim('环境变量：PL_API_KEY / PL_BASE_URL / PL_MODEL / PL_MODE / PL_APPROVAL / PL_SHELL / PACKLEADER_HOME')}
 `)
+}
+
+/** 桌面窗口：起一个 WPF 进程（PowerShell 自带，不引入 Electron），它再拉起 src/host.ts */
+async function cmdGui(cfg: Config): Promise<void> {
+  const repoRoot = join(import.meta.dirname, '..')
+  const ps1 = join(repoRoot, 'ui', 'PackLeader.ps1')
+  if (!existsSync(ps1)) {
+    process.stderr.write(`${red('找不到界面脚本')}：${ps1}\n`)
+    process.exitCode = 1
+    return
+  }
+  const ps = process.env.SystemRoot
+    ? join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    : 'powershell.exe'
+  if (!existsSync(ps)) {
+    process.stderr.write(`${red('找不到 Windows PowerShell')}：${ps}\n`)
+    process.exitCode = 1
+    return
+  }
+
+  // PowerShell 5.1 只把「带 BOM 的 UTF-8」当 UTF-8，否则中文全变乱码并破坏引号。
+  // 与其要求编辑器保存成 BOM，不如启动时生成一份带 BOM 的临时副本（源码编码再怎么变都不影响）。
+  const text = (await readFile(ps1, 'utf8')).replace(/^\uFEFF/, '')
+  const tempScript = join(tmpdir(), `packleader-ui-${process.pid}.ps1`)
+  await writeFile(tempScript, `\uFEFF${text}`, 'utf8')
+
+  const child = spawn(ps, ['-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', tempScript], {
+    env: {
+      ...process.env,
+      PL_GUI_ROOT: repoRoot,
+      PL_GUI_CWD: cfg.root,
+      PL_GUI_MODE: cfg.mode,
+      PL_GUI_DATA: cfg.dataDir,
+      PL_GUI_BASE_URL: cfg.baseURL,
+      PL_GUI_API_KEY: cfg.apiKey,
+      PL_GUI_MODEL: cfg.model,
+    },
+    stdio: 'inherit',
+  })
+  process.stdout.write(`${dim('已打开窗口；关闭窗口即退出。')}\n`)
+  await new Promise<void>((r) => child.on('close', () => r()))
+  await rm(tempScript, { force: true })
 }
 
 async function cmdDoctor(cfg: Config, flags: Record<string, string | boolean>): Promise<void> {
@@ -315,6 +358,7 @@ async function main(): Promise<void> {
   if (command === 'audit') return cmdAudit(cfg, flags, positional)
   if (command === 'undo') return cmdUndo(cfg, flags)
   if (command === 'doctor') return cmdDoctor(cfg, flags)
+  if (command === 'gui') return cmdGui(cfg)
 
   if (!cfg.apiKey) {
     process.stderr.write(

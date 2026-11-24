@@ -35,7 +35,7 @@ import { CliRenderer, bold, cyan, dim, gray, green, red, yellow } from './tui/re
 
 const VERSION = '0.1.0'
 const BOOL_FLAGS = new Set([
-  'yes', 'deny', 'json', 'continue', 'no-color', 'force', 'cost', 'help', 'version', 'show-reasoning',
+  'yes', 'deny', 'json', 'continue', 'no-color', 'force', 'cost', 'help', 'version', 'show-reasoning', 'repl',
 ])
 
 interface Parsed {
@@ -135,6 +135,7 @@ ${bold('选项')}
   --data-dir <dir>     数据目录（默认 ~/.packleader）
   --max-steps <n>      单轮最多几步（默认 40）
   --json               以 NDJSON 输出事件（给脚本/CI 用）
+  --repl               强制进入交互模式（stdin 不是终端时也可用，便于脚本驱动）
   --show-reasoning     打印模型的思考流
 
 ${bold('示例')}
@@ -331,10 +332,34 @@ async function main(): Promise<void> {
     onEvent: json ? (e) => process.stdout.write(`${JSON.stringify(e)}\n`) : undefined,
   })
 
+  // `--repl` / PL_REPL=1：即使 stdin 不是 TTY 也进交互模式（便于用管道驱动、写集成测试）
+  const forceRepl = flags.repl === true || process.env.PL_REPL === '1'
+  const interactive = forceRepl || Boolean(process.stdin.isTTY)
+
+  // 用「单一异步迭代器 + 自己排队」拿输入，而不是 rl.question：
+  //   - rl.question 只接住提问那一刻到达的行，管道里的其它行会被丢掉
+  //   - EOF 之后 rl.question 会抛 ERR_USE_AFTER_CLOSE，这里改成返回 null（正常退出）
   let rl: ReturnType<typeof createInterface> | undefined
-  const ask = async (q: string): Promise<string> => {
-    rl ??= createInterface({ input: process.stdin, output: process.stdout, terminal: Boolean(process.stdin.isTTY) })
-    return rl.question(q)
+  let lines: AsyncIterator<string> | undefined
+  const ask = async (q: string): Promise<string | null> => {
+    rl ??= createInterface({
+      input: process.stdin,
+      output: process.stdout,
+      terminal: Boolean(process.stdin.isTTY),
+      crlfDelay: Infinity,
+    })
+    lines ??= rl[Symbol.asyncIterator]()
+    if (process.stdin.isTTY) {
+      rl.setPrompt(q)
+      rl.prompt()
+    } else {
+      process.stdout.write(q)
+    }
+    const next = await lines.next()
+    if (next.done) return null
+    // 非 TTY 时用户输入不会被回显，补一个换行，免得提示和后续输出挤在一行
+    if (!process.stdin.isTTY) process.stdout.write('\n')
+    return next.value
   }
 
   const { Audit } = await import('./core/audit.ts')
@@ -344,7 +369,7 @@ async function main(): Promise<void> {
   const llm = new OpenAiClient({ baseURL: cfg.baseURL, apiKey: cfg.apiKey, model: cfg.model })
   const policy = new Policy(cfg.root, cfg.mode)
 
-  const wantsTty = !json && Boolean(process.stdin.isTTY)
+  const wantsTty = !json && interactive
   const approver = cfg.approval === 'ask' && wantsTty ? new TerminalApprover(ask) : undefined
   const broker = new ApprovalBroker(cfg.approval, approver)
 
@@ -381,8 +406,8 @@ async function main(): Promise<void> {
       await agent.runTurn(task)
       return
     }
-    if (!process.stdin.isTTY) {
-      // 管道输入：整段当作一个任务
+    if (!interactive) {
+      // 管道输入且没要求交互：整段当作一个任务
       const chunks: Buffer[] = []
       for await (const c of process.stdin) chunks.push(c as Buffer)
       const text = Buffer.concat(chunks).toString('utf8').trim()
@@ -396,8 +421,14 @@ async function main(): Promise<void> {
     }
 
     // 交互模式
+    const replPrompt = process.stdin.isTTY ? `\n${cyan('›')} ` : '' // 非 TTY 下不该出现空提示符
     for (;;) {
-      const line = (await ask(`\n${cyan('›')} `)).trim()
+      const raw = await ask(replPrompt)
+      if (raw === null) {
+        process.stdout.write(dim('\n（输入结束，退出）\n'))
+        break
+      }
+      const line = raw.trim()
       if (!line) continue
       if (line === '/exit' || line === '/quit') break
       if (line === '/help') {

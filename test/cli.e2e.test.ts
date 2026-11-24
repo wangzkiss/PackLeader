@@ -8,7 +8,11 @@ import { startFakeLlm } from './fake-llm.ts'
 
 const CLI = join(import.meta.dirname, '..', 'src', 'cli.ts')
 
-function runCli(args: string[], env: Record<string, string> = {}): Promise<{ code: number; out: string; err: string }> {
+function runCli(
+  args: string[],
+  env: Record<string, string> = {},
+  stdinText?: string,
+): Promise<{ code: number; out: string; err: string }> {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', CLI, ...args], {
       env: { ...process.env, NO_COLOR: '1', ...env },
@@ -19,6 +23,8 @@ function runCli(args: string[], env: Record<string, string> = {}): Promise<{ cod
     child.stdout.on('data', (b) => (out += b.toString('utf8')))
     child.stderr.on('data', (b) => (err += b.toString('utf8')))
     child.on('close', (code) => resolve({ code: code ?? -1, out, err }))
+    if (stdinText !== undefined) child.stdin.write(stdinText)
+    child.stdin.end()
   })
 }
 
@@ -57,6 +63,21 @@ test('cli: 没有 API Key 时退出码 2 并给出提示', async () => {
   })
   assert.equal(r.code, 2)
   assert.match(r.err, /缺少 API Key/)
+})
+
+test('cli: --repl 可被管道驱动（多命令按序执行，EOF 正常退出）', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'pl-cli-data-'))
+  const r = await runCli(
+    ['--repl', '--cwd', dataDir, '--data-dir', dataDir, '--api-key', 'sk-x', '--base-url', 'http://127.0.0.1:1/v1'],
+    {},
+    '/help\n/sessions\n',
+  )
+  assert.equal(r.code, 0, r.err)
+  assert.match(r.out, /\/exit/)
+  // 启动时就建了会话，所以这里列出的是"当前这个 0 轮的会话"
+  assert.match(r.out, /会话\s+\(/)
+  assert.match(r.out, /s-\S+\s+0 轮/)
+  assert.match(r.out, /输入结束，退出/)
 })
 
 test('cli: sessions 子命令能列出刚跑过的会话', async () => {

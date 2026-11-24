@@ -10,7 +10,8 @@ import type { Decision } from '../core/types.ts'
 import { bold, dim, gray, red, yellow } from './render.ts'
 
 export interface PromptFn {
-  (question: string): Promise<string>
+  /** 返回 null 表示输入已结束（EOF），按拒绝处理 */
+  (question: string): Promise<string | null>
 }
 
 export class TerminalApprover implements Approver {
@@ -37,7 +38,9 @@ export class TerminalApprover implements Approver {
     process.stdout.write(`${lines.join('\n')}\n`)
 
     for (;;) {
-      const a = (await this.ask_(`  [y] 允许一次   [n] 拒绝   [d] 看完整参数   ${gray('(默认拒绝)')} `)).trim().toLowerCase()
+      const raw = await this.ask_(`  [y] 允许一次   [n] 拒绝   [d] 看完整参数   ${gray('(默认拒绝)')} `)
+      if (raw === null) return 'denied' // 输入结束，按拒绝处理
+      const a = raw.trim().toLowerCase()
       if (a === 'y' || a === 'yes') return 'allowed-once'
       if (a === 'd') {
         process.stdout.write(`${gray(req.detail ?? '(无额外参数)')}\n`)

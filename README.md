@@ -85,13 +85,41 @@ node src/cli.ts undo --turn 3
 |---|---|
 | `pl "任务"` | 单次执行，完成后退出 |
 | `pl` | 交互模式（`/exit` `/undo` `/sessions` `/help`） |
+| `pl --repl` | 强制交互模式（stdin 不是终端也行，便于脚本驱动） |
 | `pl doctor` | 自检：node 版本 / shell 解析 / 数据目录可写 / 端点可达 / 模型存在 |
 | `pl audit [-n N] [--tool X] [--cost] [--json]` | 审计账本：工具调用 / 成本 |
 | `pl audit rebuild` | 从会话日志重建审计库（证明审计只是投影） |
 | `pl undo [--turn N] [--force]` | 撤销某一轮的全部文件改动 |
 | `pl sessions` | 列出历史会话 |
 
-常用选项：`--cwd` `--mode` `--yes` `--deny` `--model` `--base-url` `--api-key` `--resume <id>` `--continue` `--data-dir` `--max-steps` `--json` `--show-reasoning`
+常用选项：`--cwd` `--mode` `--yes` `--deny` `--model` `--base-url` `--api-key` `--resume <id>` `--continue` `--data-dir` `--max-steps` `--json` `--repl` `--show-reasoning`
+
+### 交互模式长什么样
+
+行式界面（不是全屏 TUI）：横幅 → `›` 提示符 → 流式回答 → 工具行 `⚙ write hello.txt / ✓ 12ms`；
+需要写权限时插入审批框，逐条问 `[y]/[n]/[d]`。
+
+```
+ PackLeader v0.1.0  ·  deepseek-flash  ·  guarded
+ cwd: D:\work\proj
+ session: s-mwuu35vh-3zj7
+
+› 帮我创建 hello.txt
+  ⚙ write hello.txt
+
+┌ 需要确认 ──────────────────────────────
+│ write  write 需要写权限
+│ D:\work\proj\hello.txt
+└────────────────────────────────────────
+  [y] 允许一次   [n] 拒绝   [d] 看完整参数   (默认拒绝) y
+    ✓ 1ms
+
+已创建 hello.txt。
+```
+
+想自己看一遍：`node scripts/demo-repl.ts`（假模型，秒级，含审批 → `/undo` → `/sessions`）。
+
+不复现全屏 TUI 是刻意的：`Renderer` 接口独立，以后想换 Ink 不用动 core。
 
 环境变量：`PL_API_KEY` `PL_BASE_URL` `PL_MODEL` `PL_MODE` `PL_APPROVAL` `PL_SHELL` `PACKLEADER_HOME`
 

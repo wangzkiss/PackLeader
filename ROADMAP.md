@@ -115,6 +115,11 @@
 - SEA 单文件：`node --experimental-sea-config` + 注入脚本，产出约 33 MB 的 `pl.exe`（测算见 DESIGN §12）
 - 验收：干净目录 `npm i -g` 后跑 `pl doctor` 全绿；SEA 产物在无 Node 的机器上能跑
 
+> **已提前完成（2026-11-25）**：`npm run dist` 产出 270 KB 的 `PackLeader-Setup.exe`
+> （自解压 + 快捷方式 + 卸载项，支持 `/S` 静默）和 70 KB 便携 zip，
+> 装完 484 KB。用 in-box 的 `csc.exe` 编译，不需要 NSIS/Inno/WiX。
+> 前置条件仍是系统 Node ≥ 22.18；要真正去掉这个前置，只剩「引擎移植成 Rust」这一条路。
+
 ---
 
 ### 不做（明确划界）

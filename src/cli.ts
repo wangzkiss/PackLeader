@@ -186,6 +186,8 @@ async function cmdGui(cfg: Config): Promise<void> {
       PL_GUI_MODEL: cfg.model,
     },
     stdio: 'inherit',
+    // 从启动器 exe（无控制台进程）拉起时会新开一个黑窗，这里压掉
+    windowsHide: true,
   })
   process.stdout.write(`${dim('已打开窗口；关闭窗口即退出。')}\n`)
   await new Promise<void>((r) => child.on('close', () => r()))

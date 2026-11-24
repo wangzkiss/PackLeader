@@ -15,7 +15,8 @@
     "start": "node --disable-warning=ExperimentalWarning src/cli.ts",
     "test": "node --disable-warning=ExperimentalWarning --test \"test/*.test.ts\"",
     "demo": "node --disable-warning=ExperimentalWarning scripts/demo.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "dist": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-dist.ps1"
   },
   "files": [
     "src",

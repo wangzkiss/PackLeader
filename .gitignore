@@ -2,4 +2,9 @@ node_modules/
 *.log
 .DS_Store
 .packleader/
+.pl-data/
 coverage/
+
+# 构建产物：用 scripts/build-dist.ps1 生成，不进版本库
+dist/
+build/packleader.ico

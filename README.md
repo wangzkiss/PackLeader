@@ -10,7 +10,7 @@ node scripts/demo.ts       # 离线 demo，不需要 API Key
 ```
 
 - 设计方案：[DESIGN.md](DESIGN.md)（架构、包裁剪、体积测算、里程碑）
-- 当前状态：**M0–M5 已完成**，32 个测试全绿，**已在真实模型 + 5.5 GB 真实仓库上验证**（见下节）
+- 当前状态：**M0–M5 已完成**，36 个测试全绿，**已在真实模型 + 5.5 GB 真实仓库上验证**（见下节）
 
 ---
 
@@ -126,6 +126,47 @@ node src/cli.ts undo --turn 3
 依赖前提：机器上要有 **Node ≥ 22.18**。要"免装 Node 且仍然原生"，只能把引擎移植成 Rust/C#（见 [ROADMAP.md](ROADMAP.md) 的体积测算）。
 
 已知没做：diff 预览、窗口无边框自绘标题栏、代码块横向滚动与复制按钮。
+
+---
+
+## 安装包（exe）
+
+`npm run dist` 产出两个东西，都在 `dist/`：
+
+| 产物 | 大小 | 说明 |
+|---|---|---|
+| `PackLeader-Setup-0.1.0.exe` | **270 KB** | 安装包：自解压 + 开始菜单/桌面快捷方式 + 注册卸载项，带安装界面，支持 `/S` 静默 |
+| `PackLeader-0.1.0-portable.zip` | 70 KB | 便携版：解压即用，`PackLeader.exe` 双击开窗口 |
+
+装完占 **484 KB**（23 个文件），不含 Node 运行时。
+
+```powershell
+npm run dist                                   # 构建
+dist\PackLeader-Setup-0.1.0.exe                # 图形安装
+dist\PackLeader-Setup-0.1.0.exe /S             # 静默安装
+dist\PackLeader-Setup-0.1.0.exe --uninstall /S # 静默卸载（或开始菜单里的卸载项）
+```
+
+装到 `%LOCALAPPDATA%\Programs\PackLeader`，注册到「应用和功能」，
+从开始菜单点开就是 `docs/installed.png` 里的窗口（深色标题栏，工作目录会记住上次用的）。
+
+**启动链路**：`PackLeader.exe`（48 KB 原生启动器，C# 编译）→ 找到系统 Node → `node src/cli.ts gui` → WPF 窗口。
+启动器不是壳：它会检查 Node 版本（低于 22.18 直接给中文提示而不是抛栈），抽取子进程输出防管道写满卡死，
+并且在没有 `--cwd` 时用上次的工作目录。
+
+**为什么安装包只有 270 KB**：不含运行时，复用系统的 Node。把这 30 MB 换来的只是"免装 Node"：
+
+| 方案 | 安装包 | 前提 |
+|---|---|---|
+| 启动器 + 系统 Node（当前） | **270 KB** | 需 Node ≥ 22.18 |
+| Node SEA 单文件 | 30–33 MB | 无 |
+| Rust/Tauri 重写引擎 | 9–12 MB | 无 |
+
+要走到第三行，得把引擎从 TypeScript 移植成 Rust——这是 [ROADMAP.md](ROADMAP.md) 里 P5 的事，不是打包能解决的。
+
+构建脚本 `scripts/build-dist.ps1` 只用系统自带的东西：`csc.exe`（.NET Framework 4.8）编译启动器和安装包，
+图标是脚本现画的（蓝色圆角方块 + 白色 P），负载用自定义容器嵌进安装包，所以不需要 NSIS / Inno / WiX。
+
 
 ### 命令行交互模式
 

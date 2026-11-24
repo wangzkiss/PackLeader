@@ -602,6 +602,12 @@ $psi.Arguments = ($hostArgs | ForEach-Object {
 $proc = [System.Diagnostics.Process]::Start($psi)
 Log "host 已启动 pid=$($proc.Id)"
 
+# 深色标题栏：WPF 自己的 chrome 是白色的，只能调 DWM
+Add-Type -Namespace PL -Name Dwm -MemberDefinition @'
+[DllImport("dwmapi.dll")]
+public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+'@
+
 # 为什么需要这个东西：PowerShell 的脚本事件处理器（Add_OutputDataReceived）在
 # ShowDialog() 阻塞期间不会被调度（runspace 被占着），子进程的输出永远读不到。
 # 所以用一段 C# 起后台线程读行，UI 线程只从队列里取。
@@ -841,7 +847,15 @@ function Handle-Event([string]$line) {
     'sessions' { Set-Sessions $e.items }
     'mode' { Set-ModeVisual ([string]$e.mode); $SubTitle.Text = [string]$e.mode }
     'model' { $script:modelName = [string]$e.model; $ModelBox.Text = [string]$e.model }
-    'cwd' { $WorkspaceLabel.Text = [string]$e.cwd }
+    'cwd' {
+      $WorkspaceLabel.Text = [string]$e.cwd
+      # 记住上次用的目录：下次双击启动直接从这里开始，不用每次都换
+      try {
+        $stateDir = Join-Path $env:LOCALAPPDATA 'PackLeader'
+        New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $stateDir 'last-cwd.txt'), [string]$e.cwd, (New-Object System.Text.UTF8Encoding $false))
+      } catch { }
+    }
     'stderr' { Log ("host stderr: " + $e.message) }
   }
 }
@@ -915,9 +929,18 @@ $PickFolderBtn.Add_Click({
 # ---------------------------------------------------------------- 定时器：抽事件 + 流式渲染
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromMilliseconds(50)
+$script:tickCount = 0
 $timer.Add_Tick({
   try {
     if (-not $script:tickSeen) { $script:tickSeen = $true; Log 'Tick 首次触发' }
+    # 启动器（PackLeader.exe）没了就自己退出：覆盖安装时它会被安装器关掉，
+    # 不跟着退就会留下孤儿窗口，看起来像"装了两个"。
+    $script:tickCount++
+    if (($script:tickCount % 40) -eq 0 -and $env:PL_GUI_PARENT_PID) {
+      $alive = $false
+      try { $alive = -not (Get-Process -Id ([int]$env:PL_GUI_PARENT_PID) -ErrorAction Stop).HasExited } catch { $alive = $false }
+      if (-not $alive) { Log '启动器已退出，关闭窗口'; $window.Close(); return }
+    }
     for ($i = 0; $i -lt 300; $i++) {
       $l = $pumpOut.Take()
       if ($null -eq $l) { break }
@@ -945,6 +968,14 @@ $timer.Add_Tick({
 
 $window.Add_Loaded({
   Log '窗口 Loaded'
+  # 深色标题栏：WPF 默认给的是白色系统 chrome，和深色底不搭。
+  # DWMWA_USE_IMMERSIVE_DARK_MODE = 20（Win10 2004+），更早的版本用 19。
+  try {
+    $h = (New-Object System.Windows.Interop.WindowInteropHelper $window).Handle
+    $on = 1
+    [void][PL.Dwm]::DwmSetWindowAttribute($h, 20, [ref]$on, 4)
+    [void][PL.Dwm]::DwmSetWindowAttribute($h, 19, [ref]$on, 4)
+  } catch { Log ("深色标题栏失败: " + ($_ | Out-String)) }
   $WorkspaceLabel.Text = $Cwd
   $ModelBox.Text = $Model
   Set-ModeVisual $Mode

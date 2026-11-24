@@ -277,10 +277,15 @@ function Add-AssistantMessage {
   $sp = Add-Container 16
   $head = New-Text $script:modelName 10.5 '#7C838E' 'Normal' 'Segoe UI' 4
   $sp.Children.Add($head) | Out-Null
+  # 正文宿主：流式时里面只有一个 TextBlock，回答结束时整体重绘成
+  # 「段落 + 代码块卡片」的结构，所以 流式和最终渲染要分开
+  $body = New-Object System.Windows.Controls.StackPanel
+  $sp.Children.Add($body) | Out-Null
   $tb = New-Text '' 14 '#E6E8EE' 'Normal' 'Segoe UI' 0
   $tb.LineHeight = 23
   $tb.LineStackingStrategy = 'BlockLineHeight'
-  $sp.Children.Add($tb) | Out-Null
+  $body.Children.Add($tb) | Out-Null
+  $script:assistantBody = $body
   return $tb
 }
 
@@ -340,21 +345,12 @@ function New-Run([string]$t, [string]$color, [bool]$bold, [bool]$mono) {
   return $r
 }
 
-function Set-RichText($tb, [string]$text) {
-  $tb.Text = ''
-  $tb.Inlines.Clear()
-  $lines = ($text -replace "`r`n", "`n") -split "`n"
-  $inCode = $false
+function Add-InlineLines($tb, $lines) {
   $first = $true
   foreach ($raw in $lines) {
     $line = [string]$raw
-    if ($line -match '^\s*```') { $inCode = -not $inCode; continue }
     if (-not $first) { $tb.Inlines.Add((New-Object System.Windows.Documents.LineBreak)) | Out-Null }
     $first = $false
-    if ($inCode) {
-      $tb.Inlines.Add((New-Run $line '#A5B4C4' $false $true)) | Out-Null
-      continue
-    }
     if ($line -match '^(#{1,6})\s+(.*)$') {
       $tb.Inlines.Add((New-Run $Matches[2] '#F9FAFB' $true $false)) | Out-Null
       continue
@@ -367,6 +363,65 @@ function Set-RichText($tb, [string]$text) {
       elseif ($p -match '^`(.+)`$') { $tb.Inlines.Add((New-Run $Matches[1] '#9FC7FF' $false $true)) | Out-Null }
       else { $tb.Inlines.Add((New-Run $p '#E6E8EE' $false $false)) | Out-Null }
     }
+  }
+}
+
+# 代码块做成一张卡片：深底 + 细描边 + 语言标签，和 DSH 里的样子一致
+function New-CodeBlock([string]$code, [string]$lang) {
+  $outer = New-Object System.Windows.Controls.Border
+  $outer.Background = (Brush '#0A0C10')
+  $outer.BorderBrush = (Brush '#1FFFFFFF')
+  $outer.BorderThickness = '1'
+  $outer.CornerRadius = '8'
+  $outer.Padding = '12,8,12,10'
+  $outer.Margin = '0,4,0,10'
+
+  $sp = New-Object System.Windows.Controls.StackPanel
+  if ($lang) {
+    $sp.Children.Add((New-Text $lang 10 '#5B626D' 'Normal' 'Segoe UI' 6)) | Out-Null
+  }
+  $tb = New-Text $code 12.5 '#C9D6E4' 'Normal' 'Cascadia Mono, Consolas' 0
+  $tb.LineHeight = 19
+  $tb.LineStackingStrategy = 'BlockLineHeight'
+  $sp.Children.Add($tb) | Out-Null
+
+  $outer.Child = $sp
+  return $outer
+}
+
+# 把整段回答重绘成「段落 + 代码块卡片」。流式阶段仍然是纯文本，结束时再格式化。
+function Render-Markdown($hostPanel, [string]$text) {
+  $hostPanel.Children.Clear()
+  $lines = ($text -replace "`r`n", "`n") -split "`n"
+  $i = 0
+  $n = $lines.Count
+  while ($i -lt $n) {
+    if ($lines[$i] -match '^\s*```\s*([^`]*)$') {
+      $lang = $Matches[1].Trim()
+      $buf = New-Object System.Text.StringBuilder
+      $i++
+      while ($i -lt $n -and $lines[$i] -notmatch '^\s*```') {
+        if ($buf.Length -gt 0) { $buf.Append("`n") | Out-Null }
+        $buf.Append([string]$lines[$i]) | Out-Null
+        $i++
+      }
+      $i++
+      $hostPanel.Children.Add((New-CodeBlock $buf.ToString() $lang)) | Out-Null
+      continue
+    }
+    $chunk = New-Object System.Collections.ArrayList
+    while ($i -lt $n -and $lines[$i] -notmatch '^\s*```') {
+      [void]$chunk.Add([string]$lines[$i])
+      $i++
+    }
+    while ($chunk.Count -gt 0 -and -not ([string]$chunk[0]).Trim()) { $chunk.RemoveAt(0) }
+    while ($chunk.Count -gt 0 -and -not ([string]$chunk[$chunk.Count - 1]).Trim()) { $chunk.RemoveAt($chunk.Count - 1) }
+    if ($chunk.Count -eq 0) { continue }
+    $tb = New-Text '' 14 '#E6E8EE' 'Normal' 'Segoe UI' 8
+    $tb.LineHeight = 23
+    $tb.LineStackingStrategy = 'BlockLineHeight'
+    Add-InlineLines $tb $chunk
+    $hostPanel.Children.Add($tb) | Out-Null
   }
 }
 
@@ -618,12 +673,15 @@ function Send-Host($obj) {
 # ---------------------------------------------------------------- 状态
 $script:busy = $false
 $script:currentAssistant = $null
+$script:assistantBody = $null
 $script:pendingText = New-Object System.Text.StringBuilder
 $script:toolRows = @{}
 $script:tickSeen = $false
 $script:modelName = $Model
 $script:sessionId = ''
 $script:hostGone = $false
+$script:history = New-Object System.Collections.ArrayList
+$script:historyIdx = 0
 
 $script:modeButtons = @{ 'read-only' = $ModeRead; 'guarded' = $ModeGuard; 'full' = $ModeFull }
 
@@ -650,6 +708,12 @@ function Set-Busy([bool]$on) {
 
 function Start-Turn([string]$text) {
   if ($script:busy -or -not $text.Trim()) { return }
+  # 输入历史：连续重复的不重复记，指针归到末尾
+  $trimmed = $text.Trim()
+  if ($script:history.Count -eq 0 -or [string]$script:history[$script:history.Count - 1] -ne $trimmed) {
+    [void]$script:history.Add($trimmed)
+  }
+  $script:historyIdx = $script:history.Count
   Add-UserMessage $text
   $InputBox.Text = ''
   $script:currentAssistant = $null
@@ -680,7 +744,7 @@ function Handle-Event([string]$line) {
           elseif ($ev.kind -eq 'assistant/message') {
             if ($ev.text) {
               if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
-              Set-RichText $script:currentAssistant ([string]$ev.text)
+              Render-Markdown $script:assistantBody ([string]$ev.text)
               $script:currentAssistant = $null
             }
           }
@@ -719,11 +783,11 @@ function Handle-Event([string]$line) {
     'assistant-end' {
       if ($e.text -and ([string]$e.text).Trim()) {
         if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
-        Set-RichText $script:currentAssistant ([string]$e.text)
-      } elseif ($script:currentAssistant) {
+        Render-Markdown $script:assistantBody ([string]$e.text)
+      } elseif ($script:currentAssistant -and $script:assistantBody) {
         # 只有工具调用、没有文字：把这个空块删掉
-        $parent = $script:currentAssistant.Parent
-        if ($parent) { $Transcript.Children.Remove($parent) | Out-Null }
+        $container = $script:assistantBody.Parent
+        if ($container) { $Transcript.Children.Remove($container) | Out-Null }
       }
       $script:pendingText.Clear() | Out-Null
       $script:currentAssistant = $null
@@ -786,15 +850,36 @@ function Handle-Event([string]$line) {
 $SendBtn.Add_Click({ Start-Turn $InputBox.Text })
 $StopBtn.Add_Click({ Send-Host @{ cmd = 'abort' } })
 
-$InputBox.Add_KeyDown({
+# 必须用 PreviewKeyDown（隧道）：TextBox 会自己吃掉方向键和回车并在冒泡阶段标记
+# Handled，挂在 KeyDown 上的处理器根本不会被调用。
+$InputBox.Add_PreviewKeyDown({
   param($s, $e)
-  if ($e.Key -eq [System.Windows.Input.Key]::Return -and -not ($e.KeyboardDevice.Modifiers -band [System.Windows.Input.ModifierKeys]::Shift)) {
+  $mods = $e.KeyboardDevice.Modifiers
+  if ($e.Key -eq [System.Windows.Input.Key]::Return -and -not ($mods -band [System.Windows.Input.ModifierKeys]::Shift)) {
     $e.Handled = $true
     Start-Turn $InputBox.Text
+    return
+  }
+  # 输入历史：单行内容时 ↑↓ 翻历史（多行时不抢键，留给光标移动）
+  if ($mods -ne [System.Windows.Input.ModifierKeys]::None) { return }
+  $multi = $InputBox.Text.Contains("`n")
+  if ($e.Key -eq [System.Windows.Input.Key]::Up -and -not $multi) {
+    if ($script:history.Count -eq 0) { return }
+    $e.Handled = $true
+    if ($script:historyIdx -gt 0) { $script:historyIdx-- }
+    $InputBox.Text = [string]$script:history[$script:historyIdx]
+    $InputBox.CaretIndex = $InputBox.Text.Length
+  }
+  elseif ($e.Key -eq [System.Windows.Input.Key]::Down -and -not $multi) {
+    if ($script:history.Count -eq 0) { return }
+    $e.Handled = $true
+    if ($script:historyIdx -lt $script:history.Count) { $script:historyIdx++ }
+    $InputBox.Text = $(if ($script:historyIdx -lt $script:history.Count) { [string]$script:history[$script:historyIdx] } else { '' })
+    $InputBox.CaretIndex = $InputBox.Text.Length
   }
 })
 
-$ModelBox.Add_KeyDown({
+$ModelBox.Add_PreviewKeyDown({
   param($s, $e)
   if ($e.Key -eq [System.Windows.Input.Key]::Return) {
     $e.Handled = $true

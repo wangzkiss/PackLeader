@@ -144,6 +144,25 @@ test('e2e: ask 但没有审批通道 → unavailable（fail-closed）', async ()
   }
 })
 
+test('e2e: 模型编出不存在的工具，也进审计（unknown-tool）', async () => {
+  const s = await setup(
+    [{ toolCalls: [{ name: 'delete_everything', args: { path: '/' } }] }, { text: '没有这个工具' }],
+    { mode: 'guarded', approval: 'allow' },
+  )
+  try {
+    const r = await s.agent.runTurn('删库')
+    assert.equal(r.reason, 'done')
+    const row = s.audit.queryToolCalls({ limit: 1 })[0]!
+    assert.equal(row.tool, 'delete_everything')
+    assert.equal(row.decision, 'unknown-tool')
+    assert.equal(row.status, 'failed')
+    const toolMsg = s.session.deriveMessages().find((m) => m.role === 'tool')!
+    assert.match(toolMsg.content, /没有名为 delete_everything 的工具/)
+  } finally {
+    await s.close()
+  }
+})
+
 test('e2e: 两轮编辑后 undo 回到第一轮内容', async () => {
   const s = await setup(
     [

@@ -128,7 +128,25 @@ export class Agent {
 
     const tool = tools.get(call.name)
     if (!tool) {
-      const result: ToolResult = { ok: false, content: `没有名为 ${call.name} 的工具`, ms: 0 }
+      // 模型编了个不存在的工具也要留痕：这是提示词/工具描述该修的信号
+      const error = `没有名为 ${call.name} 的工具`
+      audit.recordToolCall({
+        sessionId: session.id,
+        turn,
+        step,
+        callId: call.id,
+        tool: call.name,
+        argsJson: JSON.stringify(call.args).slice(0, 2000),
+        decision: 'unknown-tool',
+        status: 'failed',
+        ok: false,
+        error,
+        ms: 0,
+        outBytes: 0,
+        startedAt,
+        finishedAt: Date.now(),
+      })
+      const result: ToolResult = { ok: false, content: error, ms: 0 }
       renderer?.onToolEnd?.(call, result)
       return { result }
     }

@@ -82,6 +82,9 @@ export class Agent {
       '2. 不要凭记忆猜文件内容，用 read；不要猜路径，用 glob/grep。',
       '3. 命令输出很长时自己挑重点，不要把整段贴回用户。',
       '4. 任务完成后给结论和验证方式，不要罗列过程。',
+      `5. 预算意识：单轮最多 ${this.opts.maxSteps ?? DEFAULT_MAX_STEPS} 步，到上限会被强制收尾。` +
+        '证据够了就回答，不要为了“更全面”无限探索。',
+      '6. 大文件别整篇翻：先用 grep 定位行号，再 read 带 offset/limit 精确取几段。同一个文件反复分页读通常说明该换搜索词了。',
       '',
       '可用工具：',
       tools.describe(),
@@ -393,7 +396,61 @@ export class Agent {
         }
         await session.append({ kind: 'step/end', turn, step, toolCalls: res.toolCalls.length })
 
-        if (step === maxSteps) reason = 'max-steps'
+        if (step === maxSteps) {
+          reason = 'max-steps'
+          renderer?.onNotice?.(`已达单轮步数上限（${maxSteps}），让模型基于现有信息收尾`)
+          // 收尾：不给工具，逼它把已经看到的东西整理成答案（生产 agent 的常见做法）
+          const wrapMessages: LlmMessage[] = [
+            ...this.messages(),
+            {
+              role: 'user',
+              content:
+                `[系统] 本轮步数已达上限（${maxSteps}），不能再调用工具。` +
+                '请直接基于上面已获得的信息给出最终回答；信息不足的地方明确说明缺什么、下一步该查哪。',
+            },
+          ]
+          const wrap = await llm.chat({
+            messages: wrapMessages,
+            tools: [],
+            signal: this.opts.signal,
+            onText: (c) => renderer?.onText?.(c),
+            onReasoning: (c) => renderer?.onReasoning?.(c),
+          })
+          await session.append({
+            kind: 'assistant/message',
+            text: wrap.text,
+            reasoning: wrap.reasoning,
+            toolCalls: [],
+            ms: wrap.ms,
+            finish: wrap.finish,
+          })
+          await session.append({
+            kind: 'llm/usage',
+            turn,
+            step: step + 1,
+            prompt: wrap.usage.prompt,
+            completion: wrap.usage.completion,
+            cacheRead: wrap.usage.cacheRead,
+            ms: wrap.ms,
+            model: llm.cfg.model,
+          })
+          audit.recordLlmCall({
+            sessionId: session.id,
+            turn,
+            step: step + 1,
+            model: llm.cfg.model,
+            msgs: wrapMessages.length,
+            toolsN: 0,
+            prompt: wrap.usage.prompt,
+            completion: wrap.usage.completion,
+            cacheRead: wrap.usage.cacheRead,
+            ms: wrap.ms,
+            finish: wrap.finish,
+            at: Date.now(),
+          })
+          renderer?.onAssistantEnd?.(wrap.text)
+          if (wrap.text) finalText = wrap.text
+        }
       }
     } catch (e) {
       reason = this.opts.signal?.aborted ? 'cancelled' : 'error'

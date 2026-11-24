@@ -163,6 +163,31 @@ test('e2e: 模型编出不存在的工具，也进审计（unknown-tool）', asy
   }
 })
 
+test('e2e: 到步数上限会强制收尾（不给工具，逼出答案）', async () => {
+  const s = await setup(
+    [
+      { toolCalls: [{ name: 'read', args: { path: 'a.txt' } }] },
+      { toolCalls: [{ name: 'read', args: { path: 'a.txt' } }] },
+      { text: '基于已读到的内容，结论是……' },
+    ],
+    { mode: 'read-only', approval: 'allow' },
+  )
+  try {
+    const agent = s.agent
+    // @ts-expect-error 测试里直接调窄 maxSteps
+    agent.opts.maxSteps = 2
+    const r = await agent.runTurn('读一下 a.txt')
+    assert.equal(r.reason, 'max-steps')
+    assert.match(r.text, /结论/)
+    // 收尾那次请求不带工具
+    const last = s.llmServer.requests.at(-1)!
+    assert.equal(last.tools, undefined)
+    assert.ok(last.messages.at(-1).content.includes('步数已达上限'))
+  } finally {
+    await s.close()
+  }
+})
+
 test('e2e: 两轮编辑后 undo 回到第一轮内容', async () => {
   const s = await setup(
     [

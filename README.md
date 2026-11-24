@@ -10,29 +10,46 @@ node scripts/demo.ts       # 离线 demo，不需要 API Key
 ```
 
 - 设计方案：[DESIGN.md](DESIGN.md)（架构、包裁剪、体积测算、里程碑）
-- 当前状态：**M0–M5 已完成**，27 个测试全绿，**已在真实模型端点跑通完整任务**（见下节）
+- 当前状态：**M0–M5 已完成**，32 个测试全绿，**已在真实模型 + 5.5 GB 真实仓库上验证**（见下节）
 
 ---
 
 ## 在真实模型上验证过
 
-2026-11-24，接 `http://127.0.0.1:19790/v1`（`deepseek-flash`，推理型）跑真实任务：
+2026-11-24，接 `http://127.0.0.1:19790/v1`（`deepseek-flash`，推理型）跑了四组真实任务。
+
+### A. 改代码（小仓库，guarded）
 
 | 轮次 | 任务 | 结果 |
 |---|---|---|
-| 1 | 修一个 Node 项目的两处 bug | 8 步完成，测试由 5/2 失败变为 5/5 通过 |
-| 2 | `--continue` 跨进程续聊，「再确认一次」 | 成功重放历史（含工具调用/结果），独立复跑测试 |
-| 3 | `pl undo` 撤销第 1 轮 | 代码回退到 bug 版本，测试重新失败 3 个 |
+| 1 | 修一个 Node 项目的两处 bug | 8 步完成，测试由 2/5 失败变为 5/5 通过 |
+| 2 | `--continue` 跨进程续聊「再确认一次」 | 从 JSONL 正确重放工具历史，独立复跑测试 |
+| 3 | `pl undo` 撤销第 1 轮 | 代码退回 bug 版本，测试重新失败 3 个 |
+| 4 | `--mode read-only` 让它审自己的代码 | 找出 4 处调用点，**并指出一处漏掉的审计路径**（已修） |
 
-真实跑一轮抓到并修掉了三个问题（单测发现不了的那类）：
+### B. 读懂大仓库（DSH monorepo，5.5 GB / 14.7 万文件 / 52 个 package，read-only）
 
-1. **`shell` 工具硬编码 `pwsh.exe`** —— 这台机器只有 Windows PowerShell 5.1，直接 `ENOENT`。
-   现在按 `PL_SHELL` → PATH 里的 pwsh → `Program Files\PowerShell\7` → PATH 里的 powershell → `%SystemRoot%\System32\WindowsPowerShell\v1.0` 依次解析，
-   并在工具描述里告诉模型「5.1 不支持 `&&`」。
-2. **`glob` 不支持 `{js,json}`** —— 模型第一反应就是用大括号，之前静默返回空。
-3. **一轮内连续改两次同一文件，`undo` 误报冲突** —— 冲突检测拿的是第一次编辑后的哈希，现改为比对**最后一次**写入后的哈希。
+问题：「一次工具调用从模型发起 `tool_call` 到结果回到模型，中间经过哪些环节？给文件:行号。」
 
-账单（`pl audit --cost`）：15 次模型调用，prompt 34633，completion 2670，**cache_read 27904（约 80% 命中缓存）**。
+它给出的答案覆盖 `agent-loop`（编排/并行池/屏障）→ `tools`（pre-execute → ask/审批 → guard → execute → post-execute → result）→ `session`（事件落库与 `deriveMessages`）→ `llm`（`BlockAssembler` 装配 tool-call 块），共 25 个环节、带行号。
+
+**我抽查了 4 处引用，全部准确**：`tool-calls.ts:168` 是 `appendToolCall`、`:269` 是 `appendToolResult`、`tools/src/index.ts:1497` 是 `prepareScheduledExecution`、`surface.ts:144` 是 `case 'tool/result'`。不是编的。
+
+代价：20 步、33 次工具调用、21 次模型请求；工具耗时合计 **4.6 秒**，模型耗时 56 秒；prompt 累计 426k（单次最大 38k），**缓存命中 82%**。
+
+### C. 这一轮跑出来的问题（单测发现不了的那类）
+
+| 问题 | 表现 | 修法 |
+|---|---|---|
+| `shell` 硬编码 `pwsh.exe` | 这台机器只有 PowerShell 5.1，工具直接 `ENOENT`，连 `echo` 都跑不了 | 按 `PL_SHELL` → PATH 的 pwsh → `Program Files\PowerShell\7` → powershell → `System32\WindowsPowerShell\v1.0` 解析；描述里提示 5.1 不支持 `&&` |
+| `glob` 不支持 `{js,json}` | 模型第一反应就是大括号，之前静默返回空 | 加括号展开 |
+| 一轮内改同一文件两次 → `undo` 假冲突 | 冲突检测拿的是第一次编辑后的哈希 | 改比对**最后一次**写入后的哈希 |
+| `grep` 没有 `path` 参数 | 模型反复传 `path=packages/...`（ripgrep 惯例），只能退化成全库搜索 | `grep`/`glob` 补 `path`；`grep` 遇到「把路径当 pattern」还给纠正提示 |
+| `grep` 在大仓库 **12.5 秒** | 扫了 3.1 万文件，其中 3.18 万是 `apps/desktop/.desktop-build`、1.75 万是 `.map` | 跳过构建目录与资源扩展名 + 并行读 + 时间预算：**12.5s → 1.0s（12×）** |
+| `read` 一次吐 89 KB 又被截断 | 白读一次，模型得再分页 | 按 48 KB 预算切块，末尾给 `offset=N 继续` |
+| 20 步用完却不给答案 | 穷尽步数后直接停，用户拿到 0 结果 | **到上限强制收尾**：不给工具、追加「基于现有信息作答」的指令再请求一次 |
+
+最后一条是这次最关键的修复：没有它，B 那轮跑完只有 33 条工具日志、没有任何输出。
 
 ---
 
@@ -132,10 +149,11 @@ node src/cli.ts undo --turn 3
 
 | 项 | 说明 |
 |---|---|
+| **上下文压缩** | 长任务里单次 prompt 会涨到 70k+；还没有摘要/裁剪策略，这是接更大仓库前该做的 |
 | 全屏 TUI（Ink） | 当前是行式输出，`Renderer` 接口不变即可替换 |
 | 会话选择器 | `--resume` 要手敲 id，交互模式还没有列表选择 |
-| 内置 ripgrep | 现在用 Node 遍历，大仓库不如 `rg` 快 |
-| 并行工具调用 | 目前逐条串行执行，安全但慢 |
+| 内置 ripgrep | 现在是遍历 + 并行读（23k 文件约 1s），仍不如 `rg` 快 |
+| 并行工具调用 | 模型一次给多个调用时仍是串行执行（DSH 那边有屏障/并行池，值得抄） |
 | SEA 单文件分发 | 体积测算见 DESIGN.md §12（约 33 MB） |
 
 ---
@@ -169,13 +187,16 @@ src/
 npm test     # 或 node --disable-warning=ExperimentalWarning --test "test/*.test.ts"
 ```
 
-27 个测试，覆盖：
+32 个测试，覆盖：
 
 - 会话恢复（含损坏半行、截断结果的说明文本）
-- 文件工具与路径越界、`{a,b}` 大括号 glob
+- 文件工具与路径越界、`{a,b}` 大括号 glob、`path` 限定范围
+- 资源文件默认跳过、大文件按字节预算分页
 - 快照 / 撤销 / 外部改动冲突 / 一轮内多次编辑 / 超大文件跳过
 - 审批三种结局（放行、拒绝、无通道 fail-closed）、`read-only` 下 `--yes` 仍拒
+- 未知工具也进审计（`unknown-tool`）
 - 真实两轮工具调用、`--continue` 历史重放所需的消息形状
+- **到步数上限强制收尾**（断言收尾请求不带 tools）
 - shell 解析 / 执行 / 退出码 / 超时杀进程
 - 删库后从 jsonl 重建审计（参数、审批结论、auto 标记）
 - 真实子进程的 CLI e2e（NDJSON 事件、退出码、sessions 列表）

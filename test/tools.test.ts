@@ -69,6 +69,47 @@ test('fs.glob 支持 {a,b} 大括号（模型常用写法）', async () => {
   assert.match(out.content, /package\.json/)
 })
 
+test('fs.grep 默认跳过资源文件，给 include 才搜', async () => {
+  const { ctx, tools } = await ws()
+  await writeFile(join(ctx.root, 'a.js.map'), '{"sources":["needs_review"]}', 'utf8')
+  await writeFile(join(ctx.root, 'logo.svg'), '<svg>needs_review</svg>', 'utf8')
+
+  const skipped = await tools.get('grep')!.run(ctx, { pattern: 'needs_review' })
+  assert.match(skipped.content, /没有匹配/)
+
+  const included = await tools.get('grep')!.run(ctx, { pattern: 'needs_review', include: '*.map' })
+  assert.match(included.content, /a\.js\.map:1:/)
+})
+
+test('grep/glob 支持 path 限定范围（模型默认写法）', async () => {
+  const { ctx, tools } = await ws()
+  await mkdir(join(ctx.root, 'src/sub'), { recursive: true })
+  await writeFile(join(ctx.root, 'src/sub/x.ts'), '// needle\n', 'utf8')
+  await writeFile(join(ctx.root, 'other.ts'), '// needle\n', 'utf8')
+
+  const grepped = await tools.get('grep')!.run(ctx, { pattern: 'needle', path: 'src' })
+  assert.match(grepped.content, /src\/sub\/x\.ts:1:/)
+  assert.ok(!grepped.content.includes('other.ts'), '不该搜到范围外的文件')
+
+  const globbed = await tools.get('glob')!.run(ctx, { pattern: '**/*.ts', path: 'src' })
+  assert.match(globbed.content, /src\/sub\/x\.ts/)
+  assert.ok(!globbed.content.includes('other.ts'))
+})
+
+test('read: 大文件按字节预算切块，并给出续读 offset', async () => {
+  const { ctx, tools } = await ws()
+  const big = Array.from({ length: 5000 }, (_, i) => `line ${i + 1} ${'x'.repeat(40)}`).join('\n')
+  await writeFile(join(ctx.root, 'big.txt'), big, 'utf8')
+
+  const out = await tools.get('read')!.run(ctx, { path: 'big.txt' })
+  assert.match(out.content, /还有 \d+ 行，用 offset=\d+ 继续/)
+  assert.ok(Buffer.byteLength(out.content, 'utf8') < 50 * 1024, '单次输出不应超过预算')
+
+  const next = Number(/offset=(\d+)/.exec(out.content)![1])
+  const more = await tools.get('read')!.run(ctx, { path: 'big.txt', offset: next })
+  assert.match(more.content, new RegExp(`^\\s*${next}\\|`, 'm'))
+})
+
 test('policy: 越界写被拒，read-only 一律拒写', async () => {
   const { root } = await ws()
   const guarded = new Policy(root, 'guarded')

@@ -150,6 +150,15 @@ dist\PackLeader-Setup-0.1.0.exe --uninstall /S # 静默卸载（或开始菜单�
 装到 `%LOCALAPPDATA%\Programs\PackLeader`，注册到「应用和功能」，
 从开始菜单点开就是 `docs/installed.png` 里的窗口（深色标题栏，工作目录会记住上次用的）。
 
+![安装程序](docs/setup.png)
+
+![装好的窗口](docs/installed.png)
+
+安装包会做的事：**先关掉正在运行的旧实例**（否则覆盖安装会 `IOException`）、
+文件被占用时改名再写、写 `HKCU` 卸载项、建开始菜单/桌面快捷方式。
+卸载会同步删掉除自己以外的全部文件，只有自己在退出后才删——
+延迟整目录 `rd /s` 会和「卸载后立刻重装」抢文件（实测会把刚装进去的删掉，只剩一个 exe）。
+
 **启动链路**：`PackLeader.exe`（48 KB 原生启动器，C# 编译）→ 找到系统 Node → `node src/cli.ts gui` → WPF 窗口。
 启动器不是壳：它会检查 Node 版本（低于 22.18 直接给中文提示而不是抛栈），抽取子进程输出防管道写满卡死，
 并且在没有 `--cwd` 时用上次的工作目录。

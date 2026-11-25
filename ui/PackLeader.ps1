@@ -466,6 +466,78 @@ function Add-ToolRow([string]$name, [string]$summary) {
   return $status
 }
 
+# ---------------------------------------------------------------- 思考链
+# host 一直在发 reasoning 事件，但界面以前没有分支，思考过程被直接丢掉了。
+# 这里画成 DSH 那样的可折叠块：流式时展开显示，出正文/调工具后自动收起成一行摘要。
+$script:reasonNode = $null
+
+function Update-ReasoningHeader($n) {
+  if (-not $n) { return }
+  $arrow = $(if ($n.Open) { '▾' } else { '▸' })
+  if ($n.Done) {
+    # 历史会话里没有耗时字段，别显示 "· 0s" 这种假数据
+    $tail = $(if ($n.Secs -ge 0.1) { " · $([math]::Round($n.Secs, 1))s" } else { '' })
+    $n.Head.Text = "$arrow 思考 · $($n.Chars) 字$tail"
+  } else {
+    $n.Head.Text = "$arrow 思考中… $($n.Chars) 字"
+  }
+}
+
+function Toggle-Reasoning($n) {
+  if (-not $n) { return }
+  $n.Open = -not $n.Open
+  $n.Body.Visibility = $(if ($n.Open) { 'Visible' } else { 'Collapsed' })
+  Update-ReasoningHeader $n
+}
+
+function Add-ReasoningBlock {
+  $outer = New-Object System.Windows.Controls.Border
+  $outer.Background = (Brush '#0E1116')
+  $outer.BorderBrush = (Brush '#0FFFFFFF')
+  $outer.BorderThickness = '1'
+  $outer.CornerRadius = '6'
+  $outer.Padding = '10,6,10,7'
+  $outer.Margin = '0,0,0,6'
+  $outer.HorizontalAlignment = 'Left'
+  $outer.MaxWidth = 780
+
+  $stack = New-Object System.Windows.Controls.StackPanel
+  $head = New-Text '▾ 思考中…' 10.5 '#7C838E' 'Normal' 'Segoe UI' 0
+  $head.Cursor = 'Hand'
+  $head.ToolTip = '点一下收起 / 展开思考过程'
+  $stack.Children.Add($head) | Out-Null
+
+  $body = New-Text '' 12 '#878F9C' 'Normal' 'Segoe UI' 0
+  $body.TextWrapping = 'Wrap'
+  $body.LineHeight = 19
+  $body.LineStackingStrategy = 'BlockLineHeight'
+  $body.Margin = '0,4,0,0'
+  $stack.Children.Add($body) | Out-Null
+
+  $outer.Child = $stack
+  $Transcript.Children.Add($outer) | Out-Null
+
+  $node = New-Object PSObject -Property @{
+    Head = $head; Body = $body; Border = $outer
+    Chars = 0; T0 = (Get-Date); Open = $true; Done = $false; Secs = 0
+  }
+  $head.Add_MouseLeftButtonUp({ Toggle-Reasoning $node }.GetNewClosure())
+  $script:reasonNode = $node
+  return $node
+}
+
+function Complete-Reasoning {
+  $n = $script:reasonNode
+  if (-not $n -or $n.Done) { return }
+  $n.Done = $true
+  $n.Secs = ((Get-Date) - $n.T0).TotalSeconds
+  $n.Open = $false
+  $n.Body.Visibility = 'Collapsed'
+  Update-ReasoningHeader $n
+  # 只解绑"当前"，节点本身还在界面上（点标题仍能展开），toggle 用的是闭包里的 $node
+  $script:reasonNode = $null
+}
+
 function Add-VerifyRow([string]$label, [int]$round) {
   $outer = New-Object System.Windows.Controls.Border
   $outer.Background = (Brush '#12141A')
@@ -770,6 +842,7 @@ function Clear-Transcript {
   $Transcript.Children.Clear()
   $script:currentAssistant = $null
   $script:pendingText.Clear() | Out-Null
+  $script:reasonNode = $null
   $script:toolRows = @{}
 $script:verifyRows = @{}
 }
@@ -1135,6 +1208,14 @@ function Handle-Event([string]$line) {
         foreach ($ev in $e.events) {
           if ($ev.kind -eq 'user/message') { Add-UserMessage ([string]$ev.text) $ev.files; $hasUser = $true }
           elseif ($ev.kind -eq 'assistant/message') {
+            # 历史里的思考过程也要能看，默认收起成一行摘要
+            if ($ev.reasoning) {
+              $rn = Add-ReasoningBlock
+              $rn.Body.Text = [string]$ev.reasoning
+              $rn.Chars = ([string]$ev.reasoning).Length
+              $rn.Secs = [math]::Round(([double]$ev.ms) / 1000.0, 1)
+              Complete-Reasoning
+            }
             if ($ev.text) {
               if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
               Render-Markdown $script:assistantBody ([string]$ev.text)
@@ -1143,9 +1224,9 @@ function Handle-Event([string]$line) {
           }
           elseif ($ev.kind -eq 'tool/call') {
             $sum = ''
-            if ($ev.args) { $sum = ($ev.args | ConvertTo-Json -Compress -Depth 4) }
-            $st = Add-ToolRow ([string]$ev.name) $sum
-            $script:toolRows[[string]$ev.id] = $st
+            if ($ev.call.args) { $sum = ($ev.call.args | ConvertTo-Json -Compress -Depth 4) }
+            $st = Add-ToolRow ([string]$ev.call.name) $sum
+            $script:toolRows[[string]$ev.call.id] = $st
           }
           elseif ($ev.kind -eq 'tool/result') {
             $st = $script:toolRows[[string]$ev.callId]
@@ -1169,11 +1250,22 @@ function Handle-Event([string]$line) {
       }
       Send-Host @{ cmd = 'list-sessions' }
     }
+    'reasoning' {
+      if (-not $script:reasonNode) { Add-ReasoningBlock | Out-Null }
+      $rn = $script:reasonNode
+      $d = [string]$e.delta
+      $rn.Body.Text = $rn.Body.Text + $d
+      $rn.Chars = $rn.Chars + $d.Length
+      Update-ReasoningHeader $rn
+      $Scroller.ScrollToEnd()
+    }
     'text' {
+      Complete-Reasoning
       if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
       $script:pendingText.Append([string]$e.delta) | Out-Null
     }
     'assistant-end' {
+      Complete-Reasoning
       if ($e.text -and ([string]$e.text).Trim()) {
         if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
         Render-Markdown $script:assistantBody ([string]$e.text)
@@ -1186,6 +1278,7 @@ function Handle-Event([string]$line) {
       $script:currentAssistant = $null
     }
     'tool-start' {
+      Complete-Reasoning
       $script:currentAssistant = $null
       $st = Add-ToolRow ([string]$e.name) ([string]$e.summary)
       $script:toolRows[[string]$e.id] = $st
@@ -1290,6 +1383,7 @@ function Handle-Event([string]$line) {
       $UsageText.Text = "$($e.calls) 次 · 缓存 $pct%"
     }
     'turn-end' {
+      Complete-Reasoning
       if ($script:pendingText.Length -gt 0 -and $script:currentAssistant) {
         $script:currentAssistant.Text += $script:pendingText.ToString()
         $script:pendingText.Clear() | Out-Null

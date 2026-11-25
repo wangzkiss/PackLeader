@@ -30,6 +30,25 @@ $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 try { $OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
+# 任务栏图标为什么必须设 AUMID：
+# 窗口是 powershell.exe 起的，进程没有自己的 AppUserModelID 时，任务栏把它并进
+# 「Windows PowerShell」那个分组，按钮图标取自 powershell.exe 的 exe 图标，
+# 窗口级图标（Window.Icon / WM_SETICON）全被忽略——任务栏上永远是 PowerShell 的白蓝图标。
+# 给进程一个独立的 AUMID，任务栏才会单独分组并按窗口图标绘制。
+# 必须在创建任何窗口之前调用；窗口建好后再设就不生效了。
+$script:appUserModelId = 'PackLeader.Desktop'
+try {
+  if (-not ('PL.ShellNative' -as [type])) {
+    Add-Type -Namespace PL -Name ShellNative -MemberDefinition @'
+[DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern int SetCurrentProcessExplicitAppUserModelID(string id);
+'@
+  }
+  $script:aumidHr = [PL.ShellNative]::SetCurrentProcessExplicitAppUserModelID($script:appUserModelId)
+} catch {
+  # 设不上就退回旧行为（任务栏会显示 PowerShell 的图标），但不能因此打断启动
+  $script:aumidHr = -1
+}
+
 $script:guiLog = Join-Path $env:TEMP 'packleader-ui.log'
 # 启动早期就得能落盘：trap 里不能再依赖 Log（它自己可能就是没生效的那个）
 $script:boot = {
@@ -37,7 +56,7 @@ $script:boot = {
   try { [System.IO.File]::AppendAllText($script:guiLog, ("{0:HH:mm:ss.fff} {1}`r`n" -f (Get-Date), $m), (New-Object System.Text.UTF8Encoding $false)) } catch { }
 }
 [System.IO.File]::WriteAllText($script:guiLog, "", (New-Object System.Text.UTF8Encoding $false))
-& $script:boot "boot ps=$($PSVersionTable.PSVersion)"
+& $script:boot "boot ps=$($PSVersionTable.PSVersion) aumid=$($script:appUserModelId) hr=$($script:aumidHr)"
 function Log([string]$m) { & $script:boot $m }
 trap { if ($script:boot) { & $script:boot ("异常: " + ($_ | Out-String)) } else { try { [System.IO.File]::AppendAllText((Join-Path $env:TEMP 'packleader-ui.log'), ("early: " + ($_ | Out-String)), (New-Object System.Text.UTF8Encoding $false)) } catch { } }; throw }
 
@@ -236,6 +255,15 @@ $xaml = @'
       <Grid Grid.Row="2" Margin="24,0,24,14">
         <Border Background="#16181D" BorderBrush="#1FFFFFFF" BorderThickness="1" CornerRadius="12" Padding="14,10,12,8">
           <StackPanel>
+            <!-- 读秒条：这一轮在跑时显示「思考中 · 用时 12 秒」，空闲时收起 -->
+            <Border x:Name="ThinkRow" Visibility="Collapsed" HorizontalAlignment="Left" Margin="0,0,0,8"
+                    Background="#141821" BorderBrush="#1FFFFFFF" BorderThickness="1" CornerRadius="6" Padding="8,3">
+              <StackPanel Orientation="Horizontal">
+                <TextBlock Text="✦" Foreground="#8FA6FF" FontSize="10.5" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                <TextBlock x:Name="ThinkText" Text="思考中 · 用时 0 秒" Foreground="#8FA6FF" FontSize="11.5"
+                           FontFamily="Cascadia Mono, Consolas" VerticalAlignment="Center"/>
+              </StackPanel>
+            </Border>
             <WrapPanel x:Name="AttachList" Orientation="Horizontal" Margin="0,0,0,7" Visibility="Collapsed"/>
           <TextBox x:Name="Input" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="46" MaxHeight="160"
                      Background="Transparent" Foreground="#F9FAFB" BorderThickness="0"
@@ -245,6 +273,10 @@ $xaml = @'
               <Button x:Name="AttachBtn" DockPanel.Dock="Left" Content="+ 附件" Height="26" Padding="9,0"
                       Cursor="Hand" FontSize="11.5" Margin="0,0,10,0"
                       Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF" BorderThickness="1"/>
+              <Button x:Name="InsertConvBtn" DockPanel.Dock="Left" Content="插入对话" Height="26" Padding="9,0"
+                      Cursor="Hand" FontSize="11" Margin="0,0,10,0"
+                      Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF" BorderThickness="1"
+                      ToolTip="引用本会话之前的消息：发送时把那段原文一起带给模型"/>
               <Button x:Name="PickFolderBtn" DockPanel.Dock="Left" Content="目录" Height="26" Padding="9,0"
                       Cursor="Hand" FontSize="11" Margin="0,0,10,0" MaxWidth="240"
                       Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF" BorderThickness="1"
@@ -322,6 +354,19 @@ $xaml = @'
                    BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center" FontSize="11.5"
                    FontFamily="Cascadia Mono, Consolas"/>
           <TextBlock Text="改完文件后自动跑它，失败会把输出回灌给模型让它自己修。留空＝自动识别（npm test / cargo test / go test / pytest）。"
+                     Foreground="#5B626D" FontSize="10.5" Margin="0,5,0,0" TextWrapping="Wrap"/>
+
+          <!-- 工具调用日志：每次调用往这里追加一行，复杂任务卡在哪一步就看它 -->
+          <TextBlock Text="工具调用日志" Foreground="#ADB2B8" FontSize="11" Margin="0,13,0,5"/>
+          <DockPanel>
+            <Button x:Name="CfgOpenLogs" DockPanel.Dock="Right" Content="打开目录" Height="30" Padding="12,0" Cursor="Hand"
+                    FontSize="11.5" Margin="8,0,0,0" Background="Transparent" Foreground="#8AB4FF"
+                    BorderBrush="#4D8AB4FF" BorderThickness="1"/>
+            <TextBox x:Name="CfgLogsDir" IsReadOnly="True" Height="30" Background="#0F1115" Foreground="#ADB2B8"
+                     BorderBrush="#1FFFFFFF" BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center"
+                     FontSize="10.5" FontFamily="Cascadia Mono, Consolas" ToolTip="日志文件：tool-calls-YYYY-MM-DD.jsonl"/>
+          </DockPanel>
+          <TextBlock Text="每次调用工具追加一行 jsonl（轮次/步号/工具/参数/审批/成败/耗时），排查复杂任务卡在哪一步就看它。"
                      Foreground="#5B626D" FontSize="10.5" Margin="0,5,0,0" TextWrapping="Wrap"/>
 
           <TextBlock x:Name="CfgError" Text="" Foreground="#F87171" FontSize="11" Margin="0,10,0,0" TextWrapping="Wrap"/>
@@ -406,27 +451,140 @@ $xaml = @'
 
 $window = [Windows.Markup.XamlReader]::Parse($xaml)
 Log 'XAML 解析成功'
-# 标题栏默认图标是 powershell.exe 带的白蓝色图标，换成和左栏一致的 P 徽标（WPF 没法把标题栏图标留空，只能换掉）
+# 图标：默认是 powershell.exe 的白蓝图标，换成左栏那个 P 徽标。
+# 坑：WPF 的 Window.Icon 只吃「一张图」，系统需要 16/20/24/32px 时自己去缩这张图，
+# 缩出来的 16px 就是一个白团——任务栏上看到的就是那团白。
+# 所以这里按系统实际要的每个尺寸各画一张（几何笔画，不用字体渲染），
+# 再用 WM_SETICON 把小图标（标题栏/任务栏）和大图标（Alt+Tab）分别交给窗口。
+$script:iconHandles = @()
 try {
-  $icoXaml = '<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Width="64" Height="64"><Border CornerRadius="16" Background="#2B5CFF"><TextBlock Text="P" Foreground="White" FontSize="38" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center"/></Border></Grid>'
-  $icoEl = [System.Windows.Markup.XamlReader]::Parse($icoXaml)
-  $icoEl.Measure([System.Windows.Size]::new(64, 64))
-  $icoEl.Arrange([System.Windows.Rect]::new(0, 0, 64, 64))
-  $rtb = [System.Windows.Media.Imaging.RenderTargetBitmap]::new(64, 64, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
-  $rtb.Render($icoEl)
-  $enc = [System.Windows.Media.Imaging.PngBitmapEncoder]::new()
-  $enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($rtb))
-  $icoPath = Join-Path $env:TEMP 'packleader-icon.png'
-  $fsIco = [System.IO.File]::Create($icoPath)
-  $enc.Save($fsIco)
-  $fsIco.Close()
-  $bi = [System.Windows.Media.Imaging.BitmapImage]::new()
-  $bi.BeginInit()
-  $bi.CacheOption = 'OnLoad'
-  $bi.UriSource = [Uri]$icoPath
-  $bi.EndInit()
-  $window.Icon = $bi
-  Log '标题栏图标已换成 P 徽标'
+  Add-Type -Namespace PL -Name IconNative -MemberDefinition @'
+[DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+[DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr hIcon);
+[DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+[DllImport("user32.dll", EntryPoint = "SetClassLongPtr")] public static extern IntPtr SetClassLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hAfter, int x, int y, int cx, int cy, uint flags);
+'@
+
+  # 画一张 $Size×$Size 的 P 徽标（和 scripts/make-icon.ps1 同一套比例）
+  function New-LogoBitmap([int]$Size) {
+    $visual = New-Object System.Windows.Media.DrawingVisual
+    $dc = $visual.RenderOpen()
+    try {
+      $pad = [math]::Max(1.0, $Size * 0.03)
+      $rad = [math]::Max(2.0, $Size * 0.22)
+      $rect = New-Object System.Windows.Rect $pad, $pad, ($Size - 2 * $pad), ($Size - 2 * $pad)
+      $brush = New-Object System.Windows.Media.LinearGradientBrush
+      $brush.StartPoint = New-Object System.Windows.Point 0, 0
+      $brush.EndPoint = New-Object System.Windows.Point 0, 1
+      $brush.GradientStops.Add((New-Object System.Windows.Media.GradientStop ([System.Windows.Media.Color]::FromRgb(43, 92, 255), 0)))
+      $brush.GradientStops.Add((New-Object System.Windows.Media.GradientStop ([System.Windows.Media.Color]::FromRgb(22, 48, 170), 1)))
+      $dc.DrawGeometry($brush, $null, (New-Object System.Windows.Media.RectangleGeometry $rect, $rad, $rad))
+
+      # 白 P：竖笔 + 右侧圆环（内圆偏右下，左边自然并进竖笔）
+      $white = [System.Windows.Media.Brushes]::White
+      $stroke = [math]::Max(1.0, $Size * 0.135)
+      $stemX = $Size * 0.28
+      $top = $Size * 0.20
+      $bottom = $Size * 0.80
+      $bowl = [math]::Max(4.0, $Size * 0.46)
+      $dc.DrawRectangle($white, $null, (New-Object System.Windows.Rect $stemX, $top, $stroke, ($bottom - $top)))
+      $inner = $bowl - 2 * $stroke
+      if ($inner -ge 1) {
+        $cx = $stemX + $bowl / 2
+        $cy = $top + $bowl / 2
+        $outerGeo = New-Object System.Windows.Media.EllipseGeometry (New-Object System.Windows.Point $cx, $cy), ($bowl / 2), ($bowl / 2)
+        $holeGeo = New-Object System.Windows.Media.EllipseGeometry (New-Object System.Windows.Point ($cx + $stroke / 2), ($cy + $stroke / 2)), ($inner / 2), ($inner / 2)
+        $ring = New-Object System.Windows.Media.CombinedGeometry ([System.Windows.Media.GeometryCombineMode]::Exclude), $outerGeo, $holeGeo
+        $dc.DrawGeometry($white, $null, $ring)
+      } else {
+        $dc.DrawEllipse($white, $null, (New-Object System.Windows.Point ($stemX + $bowl / 2), ($top + $bowl / 2)), ($bowl / 2), ($bowl / 2))
+      }
+    } finally { $dc.Close() }
+    $rtb = New-Object System.Windows.Media.Imaging.RenderTargetBitmap $Size, $Size, 96, 96, ([System.Windows.Media.PixelFormats]::Pbgra32)
+    $rtb.Render($visual)
+    return $rtb
+  }
+
+  # BitmapSource -> HICON（走一趟 PNG 内存流，System.Drawing 负责生成句柄）
+  function New-HiconFromBitmap($bitmapSource) {
+    $enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
+    $enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($bitmapSource))
+    $ms = New-Object System.IO.MemoryStream
+    try {
+      $enc.Save($ms)
+      $ms.Position = 0
+      $bmp = New-Object System.Drawing.Bitmap $ms
+      try { return $bmp.GetHicon() } finally { $bmp.Dispose() }
+    } finally { $ms.Dispose() }
+  }
+
+  $dpi = 1.0
+  try { $dpi = [System.Windows.Media.VisualTreeHelper]::GetDpi($window).DpiScaleX } catch { }
+  if ($dpi -le 0) { $dpi = 1.0 }
+  $smallPx = [int][math]::Round(16 * $dpi)
+  $bigPx = [int][math]::Round(32 * $dpi)
+
+  # 优先用仓库里那张 packleader.ico（多帧，含 16/32/256）；找不到才退回现画。
+  # 注意：cli.ts 会把本脚本复制到 %TEMP% 再跑，$PSScriptRoot 是临时目录，
+  # 图标真实位置要从 cli.ts 传的 PL_GUI_ROOT（仓库根）取。
+  $icoPath = ''
+  if ($env:PL_GUI_ROOT) { $icoPath = Join-Path $env:PL_GUI_ROOT 'ui\packleader.ico' }
+  if (-not $icoPath -or -not (Test-Path $icoPath)) { $icoPath = Join-Path $PSScriptRoot 'packleader.ico' }
+  if (-not (Test-Path $icoPath)) { $icoPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'packleader.ico' }
+  $script:iconKind = 'drawn'
+  if (Test-Path $icoPath) {
+    Add-Type -AssemblyName System.Drawing
+    $icoSmall = New-Object System.Drawing.Icon $icoPath, $smallPx, $smallPx
+    $icoBig = New-Object System.Drawing.Icon $icoPath, $bigPx, $bigPx
+    $icoHuge = New-Object System.Drawing.Icon $icoPath, 256, 256
+    # Icon 对象自己持有 HICON：交出去后不要再 DestroyIcon（Dispose 会自己收）
+    $script:iconObjects = @($icoSmall, $icoBig, $icoHuge)
+    $script:iconSmall = $icoSmall.Handle
+    $script:iconBig = $icoBig.Handle
+    $script:iconKind = 'ico'
+    # 坑：Int32Rect 的宽高必须与图标帧真实尺寸一致。这张 ico 里最大帧是 128，
+    # 硬写 256 会抛 "Value does not fall within the expected range"，整个图标设置就此被跳过。
+    # Int32Rect.Empty = 按实际帧尺寸取。
+    $window.Icon = [System.Windows.Interop.Imaging]::CreateBitmapSourceFromHIcon(
+      $icoHuge.Handle,
+      [System.Windows.Int32Rect]::Empty,
+      [System.Windows.Media.Imaging.BitmapSizeOptions]::FromEmptyOptions())
+  } else {
+    # Window.Icon 给最大的那张（Alt+Tab / 任务视图 / 资源管理器缩略图都用它）
+    $window.Icon = New-LogoBitmap 256
+    # 句柄先建好（Loaded 里只发消息，不再分配资源，重复触发也不会泄漏）
+    $smallIcon = New-HiconFromBitmap (New-LogoBitmap $smallPx)
+    $bigIcon = New-HiconFromBitmap (New-LogoBitmap $bigPx)
+    $script:iconHandles = @($smallIcon, $bigIcon)
+    $script:iconSmall = $smallIcon
+    $script:iconBig = $bigIcon
+  }
+
+  # 坑：只能用函数，不能用闭包。PS 5.1 里 add_Loaded({...}) 的回调执行时看不到脚本级变量，
+  # 原来写成 & $applyWindowIcons 的话句柄全是 $null，图标根本没设上去（任务栏还是 powershell 的白蓝图标）。
+  function Set-WindowIcons {
+    if (-not $window) { return }
+    # 坑：WPF 的 Window 没有 Handle 属性（$window.Handle 恒为 $null，传给 SendMessage 直接抛错），
+    # 真句柄只能走 WindowInteropHelper；而且窗口创建前拿到的就是 0，所以要在 Loaded 里再调一次。
+    $h = [IntPtr]::Zero
+    try { $h = (New-Object System.Windows.Interop.WindowInteropHelper $window).Handle } catch { }
+    if (-not $h -or $h -eq [IntPtr]::Zero) { return }
+    if (-not $script:iconSmall -or -not $script:iconBig) { return }
+    # ICON_SMALL=0（标题栏）、ICON_SMALL2=2（任务栏按钮）、ICON_BIG=1（Alt+Tab）
+    [void][PL.IconNative]::SendMessage($h, 0x0080, [IntPtr]0, $script:iconSmall)
+    [void][PL.IconNative]::SendMessage($h, 0x0080, [IntPtr]2, $script:iconSmall)
+    [void][PL.IconNative]::SendMessage($h, 0x0080, [IntPtr]1, $script:iconBig)
+    # 类图标也换掉：任务栏在没有窗口级图标时会回落到它
+    [void][PL.IconNative]::SetClassLongPtr($h, -14, $script:iconBig)
+    [void][PL.IconNative]::SetClassLongPtr($h, -34, $script:iconSmall)
+    # 通知系统刷新（不然任务栏会继续用缓存的旧图标）
+    [void][PL.IconNative]::SetWindowPos($h, [IntPtr]::Zero, 0, 0, 0, 0, 0x0027)
+  }
+  & Set-WindowIcons
+  $window.add_Loaded({ Set-WindowIcons })
+  if ($script:iconKind -eq 'ico') { Log "窗口图标用 $icoPath（small=${smallPx} big=${bigPx} 帧=$($icoBig.Width)/$($icoHuge.Width)）" }
+  else { Log "窗口图标按尺寸绘制（small=${smallPx}px big=${bigPx}px dpi=$dpi）" }
 } catch {
   Log ('设置窗口图标失败: ' + $_.Exception.Message)
 }
@@ -441,6 +599,8 @@ $InputBox = $window.FindName('Input')
 $SendBtn = $window.FindName('SendBtn')
 $StopBtn = $window.FindName('StopBtn')
 $UsageText = $window.FindName('UsageText')
+$ThinkRow = $window.FindName('ThinkRow')
+$ThinkText = $window.FindName('ThinkText')
 $PickFolderBtn = $window.FindName('PickFolderBtn')
 $ModeRead = $window.FindName('ModeRead')
 $ModeGuard = $window.FindName('ModeGuard')
@@ -462,9 +622,12 @@ $CfgCancel = $window.FindName('CfgCancel')
 $CfgSave = $window.FindName('CfgSave')
 $CfgFetch = $window.FindName('CfgFetch')
 $CfgVision = $window.FindName('CfgVision')
+$CfgLogsDir = $window.FindName('CfgLogsDir')
+$CfgOpenLogs = $window.FindName('CfgOpenLogs')
 $ModelChips = $window.FindName('ModelChips')
 $ModelHint = $window.FindName('ModelHint')
 $AttachBtn = $window.FindName('AttachBtn')
+$InsertConvBtn = $window.FindName('InsertConvBtn')
 $AttachList = $window.FindName('AttachList')
 $ImagePreview = $window.FindName('ImagePreview')
 $PreviewImage = $window.FindName('PreviewImage')
@@ -591,7 +754,7 @@ function New-CopyMenu([object]$box) {
   $cm.Items.Add($ma) | Out-Null
   return $cm
 }
-function Add-UserMessage([string]$text, [object]$files = $null) {
+function Add-UserMessage([string]$text, [object]$files = $null, [object]$quotes = $null) {
   $sp = Add-Container 20
   $label = New-Text '你' 10.5 '#6B7280' 'Normal' 'Segoe UI' 4
   $sp.Children.Add($label) | Out-Null
@@ -641,8 +804,32 @@ function Add-UserMessage([string]$text, [object]$files = $null) {
     }
     $sp.Children.Add($wrap) | Out-Null
   }
+  # 引用了之前的消息：在气泡里留一行标记，不然发出去的内容和屏幕上看对不上
+  $qs = @($quotes)
+  if ($qs.Count -gt 0) {
+    $qw = New-Object System.Windows.Controls.WrapPanel
+    $qw.Orientation = 'Horizontal'
+    $qw.Margin = '0,6,0,0'
+    foreach ($q in $qs) {
+      $who = $(if ($q.role -eq 'user') { '你' } else { '模型' })
+      $snip = ([string]$q.text) -replace "\s+", ' '
+      if ($snip.Length -gt 40) { $snip = $snip.Substring(0, 40) + '…' }
+      if (-not $snip) { $snip = '(空)' }
+      $qb = New-Object System.Windows.Controls.Border
+      $qb.Background = (Brush '#1B2433')
+      $qb.BorderBrush = (Brush '#3D6CFF')
+      $qb.BorderThickness = '1'
+      $qb.CornerRadius = '6'
+      $qb.Padding = '6,3,8,3'
+      $qb.Margin = '0,0,6,6'
+      $qb.Child = (New-Text "引用 · $who：$snip" 10 '#8AB4FF' 'Normal' 'Segoe UI' 0)
+      $qw.Children.Add($qb) | Out-Null
+    }
+    $sp.Children.Add($qw) | Out-Null
+  }
   $sp.ContextMenu = (New-CopyMenu (@{ text = "你：$text" }))
   Append-CopyLog "你：$text"
+  [void]$script:msgLog.Add(@{ role = 'user'; text = $text })
   $script:currentAssistant = $null
 }
 
@@ -932,6 +1119,15 @@ function Update-ReasoningHeader($n) {
   $n.Sum.Text = $s
   $n.Sum.Visibility = $(if ($n.Open) { 'Collapsed' } else { 'Visible' })
   $n.Body.Visibility = $(if ($n.Open) { 'Visible' } else { 'Collapsed' })
+}
+
+# 读秒时每 0.25s 都要刷一次头部：只动时间那一格，
+# 不重算摘要（正文一直在长，每 250ms 压一遍整个思考链太浪费）
+function Update-ReasoningTime($n) {
+  if (-not $n -or $n.Done) { return }
+  $n.Secs = ((Get-Date) - $n.T0).TotalSeconds
+  $tail = $(if ($n.Secs -ge 0.1) { "$([math]::Round($n.Secs, 1))s " } else { '' })
+  $n.Time.Text = $tail + $(if ($n.Open) { '▾' } else { '▸' })
 }
 
 function Toggle-Reasoning($n) {
@@ -1646,6 +1842,9 @@ function Clear-Transcript {
   $script:assistantBox = $null
   $script:copyLog.Clear() | Out-Null
   $script:memoryCards = New-Object System.Collections.ArrayList
+  $script:msgLog = New-Object System.Collections.ArrayList
+  $script:quoteRefs = New-Object System.Collections.ArrayList
+  if ($AttachList) { Update-AttachList }
 $script:verifyRows = @{}
 }
 
@@ -1795,6 +1994,7 @@ $script:cfgBaseURL = ''
 $script:cfgKeyMasked = ''
 $script:verifyCmd = ''
 $script:visionOn = $false
+$script:logsDir = ''
 $script:hasKey = $true
 
 # ---------------------------------------------------------------- 确认框
@@ -1877,6 +2077,11 @@ $InputOverlay.Add_MouseLeftButtonUp({
 
 # ---------------------------------------------------------------- 附件
 $script:attachFiles = New-Object System.Collections.ArrayList
+# 本会话的消息记录：给「插入对话」用，引用的就是这里的一条
+$script:msgLog = New-Object System.Collections.ArrayList
+# 输入框上方挂着的引用（@{ idx; role; text }），发送时把 text 一起带给模型
+$script:quoteRefs = New-Object System.Collections.ArrayList
+$script:quotePopup = $null
 
 function Format-FileSize([double]$n) {
   if ($n -lt 1024) { return "$([int]$n) B" }
@@ -2038,6 +2243,7 @@ $ModeRead.Template = (New-FlatTemplate)
 $ModeGuard.Template = (New-FlatTemplate)
 $ModeFull.Template = (New-FlatTemplate)
 $AttachBtn.Template = (New-FlatTemplate)
+$InsertConvBtn.Template = (New-FlatTemplate)
 $PickFolderBtn.Template = (New-FlatTemplate)
 $StopBtn.Template = (New-FlatTemplate)
 $NewChatBtn.Template = (New-FlatTemplate)
@@ -2045,6 +2251,7 @@ $SettingsBtn.Template = (New-FlatTemplate)
 $SendBtn.Template = (New-SendTemplate)
 # 设置面板、确认框、预览、输入浮层里的按钮也要同一套，不然一悬停就冒浅色块
 $CfgFetch.Template = (New-FlatTemplate)
+$CfgOpenLogs.Template = (New-FlatTemplate)
 $CfgCancel.Template = (New-FlatTemplate)
 $ConfirmNo.Template = (New-FlatTemplate)
 $InputNo.Template = (New-FlatTemplate)
@@ -2139,6 +2346,63 @@ function Show-ModelMenu([object]$anchor) {
   $pop.IsOpen = $true
 }
 
+# ---------------------------------------------------------------- 插入对话
+# 把本会话之前的某条消息作为引用挂到输入框上方；发送时那段原文拼在问题前面带给模型。
+# 用 Popup 自绘（系统菜单是白底），行和模型菜单同一套 MenuRow。
+function Show-QuotePicker([object]$anchor) {
+  if ($script:quotePopup) { $script:quotePopup.IsOpen = $false }
+  $box = New-Object System.Windows.Controls.Border
+  $box.Background = (Brush '#1B1F27')
+  $box.BorderBrush = (Brush '#33FFFFFF')
+  $box.BorderThickness = '1'
+  $box.CornerRadius = '8'
+  $box.Padding = '4'
+  $box.MinWidth = 380
+  $box.MaxWidth = 620
+  $col = New-Object System.Windows.Controls.StackPanel
+  $n = $script:msgLog.Count
+  if ($n -eq 0) {
+    $col.Children.Add((New-MenuRow '这个会话还没有消息可以引用' '')) | Out-Null
+  } else {
+    $from = [Math]::Max(0, $n - 40)
+    for ($i = $n - 1; $i -ge $from; $i--) {
+      $m = $script:msgLog[$i]
+      $who = $(if ($m.role -eq 'user') { '你' } else { '模型' })
+      $snip = ([string]$m.text) -replace "\s+", ' '
+      if ($snip.Length -gt 56) { $snip = $snip.Substring(0, 56) + '…' }
+      if (-not $snip) { $snip = '(只有附件)' }
+      $row = New-MenuRow "$who · $snip" ''
+      $row.FontFamily = 'Segoe UI'
+      $row.Tag = $i
+      $row.Add_Click({
+        param($s, $e)
+        if ($script:quotePopup) { $script:quotePopup.IsOpen = $false }
+        $ix = [int]$s.Tag
+        foreach ($q in $script:quoteRefs) { if ($q.idx -eq $ix) { return } }
+        $mm = $script:msgLog[$ix]
+        if (-not $mm) { return }
+        [void]$script:quoteRefs.Add(@{ idx = $ix; role = [string]$mm.role; text = [string]$mm.text })
+        Update-AttachList
+      })
+      $col.Children.Add($row) | Out-Null
+    }
+  }
+  $sc = New-Object System.Windows.Controls.ScrollViewer
+  $sc.MaxHeight = 320
+  $sc.VerticalScrollBarVisibility = 'Auto'
+  $sc.Content = $col
+  $box.Child = $sc
+  $pop = New-Object System.Windows.Controls.Primitives.Popup
+  $pop.PlacementTarget = $anchor
+  $pop.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Top
+  $pop.VerticalOffset = -6
+  $pop.StaysOpen = $false
+  $pop.AllowsTransparency = $true
+  $pop.Child = $box
+  $script:quotePopup = $pop
+  $pop.IsOpen = $true
+}
+
 # 扩展名判断图片：和 src/core/attach.ts 里的 IMAGE_EXT 对齐
 function Test-ImagePath([string]$path) {
   $ext = [System.IO.Path]::GetExtension($path).ToLowerInvariant()
@@ -2193,11 +2457,65 @@ function New-ImageThumb([string]$path, [double]$h = 40) {
 
 function Update-AttachList {
   $AttachList.Children.Clear()
-  if ($script:attachFiles.Count -eq 0) {
+  $hasQuote = ($script:quoteRefs.Count -gt 0)
+  if ($script:attachFiles.Count -eq 0 -and -not $hasQuote) {
     $AttachList.Visibility = 'Collapsed'
     return
   }
   $AttachList.Visibility = 'Visible'
+  # 引用卡排在附件前面：一眼能看出这条消息带了哪几段旧对话
+  foreach ($r in @($script:quoteRefs)) {
+    $qb = New-Object System.Windows.Controls.Border
+    $qb.Background = (Brush '#1B2433')
+    $qb.BorderBrush = (Brush '#3D6CFF')
+    $qb.BorderThickness = '1'
+    $qb.CornerRadius = '6'
+    $qb.Padding = '6,4,5,4'
+    $qb.Margin = '0,0,6,6'
+    $qsp = New-Object System.Windows.Controls.StackPanel
+    $qsp.Orientation = 'Horizontal'
+    $qtxt = New-Object System.Windows.Controls.StackPanel
+    $qtxt.VerticalAlignment = 'Center'
+    $whoTb = New-Text ("引用 · " + $(if ($r.role -eq 'user') { '你' } else { '模型' })) 9.5 '#8AB4FF' 'SemiBold' 'Segoe UI' 1
+    $qtxt.Children.Add($whoTb) | Out-Null
+    $snip = ([string]$r.text) -replace "\s+", ' '
+    if ($snip.Length -gt 40) { $snip = $snip.Substring(0, 40) + '…' }
+    if (-not $snip) { $snip = '(空)' }
+    $sTb = New-Text $snip 10.5 '#CFD3D6' 'Normal' 'Segoe UI' 0
+    $sTb.MaxWidth = 220
+    $sTb.TextTrimming = 'CharacterEllipsis'
+    $sTb.TextWrapping = 'NoWrap'
+    $qtxt.Children.Add($sTb) | Out-Null
+    $qsp.Children.Add($qtxt) | Out-Null
+    $qx = New-Object System.Windows.Controls.Button
+    # 去掉引用用垃圾桶图标，和附件移除一致
+    $qx.Content = [string][char]0xE74D
+    $qx.FontFamily = (New-Object System.Windows.Media.FontFamily('Segoe MDL2 Assets'))
+    $qx.Width = 16
+    $qx.Height = 16
+    $qx.Margin = '6,0,0,0'
+    $qx.FontSize = 10.5
+    $qx.Cursor = 'Hand'
+    $qx.BorderThickness = '0'
+    $qx.Template = (New-FlatTemplate)
+    $qx.Background = [System.Windows.Media.Brushes]::Transparent
+    $qx.Foreground = (Brush '#7C838E')
+    $qx.VerticalAlignment = 'Center'
+    $qx.ToolTip = '取消引用'
+    $qx.Tag = $r
+    $qx.Add_Click({
+      param($s, $e)
+      # 按对象本身删：同一条消息可能先删后加，按 idx 比对会误删新挂的那条
+      $t = $s.Tag
+      for ($i = $script:quoteRefs.Count - 1; $i -ge 0; $i--) {
+        if ([object]::ReferenceEquals($script:quoteRefs[$i], $t)) { $script:quoteRefs.RemoveAt($i) }
+      }
+      Update-AttachList
+    })
+    $qsp.Children.Add($qx) | Out-Null
+    $qb.Child = $qsp
+    $AttachList.Children.Add($qb) | Out-Null
+  }
   foreach ($f in @($script:attachFiles)) {
     $size = 0
     try { $size = (Get-Item -LiteralPath $f -ErrorAction Stop).Length } catch { }
@@ -2271,6 +2589,12 @@ $AttachBtn.Add_Click({
   $dlg.Title = '选择要发给模型的文件'
   $dlg.Filter = '所有文件 (*.*)|*.*'
   if ($dlg.ShowDialog()) { Add-Attachments $dlg.FileNames }
+})
+
+# 插入对话：从本会话已经发过/收到的消息里挑一条，作为引用挂到输入框上方
+$InsertConvBtn.Add_Click({
+  param($s, $e)
+  Show-QuotePicker $s
 })
 
 # 粘贴：Clipboard 里是图片或文件时收成附件。
@@ -2383,6 +2707,7 @@ function Open-Settings {
   $CfgKey.Text = ''
   $CfgModel.Text = $script:modelName
   $CfgVerify.Text = $script:verifyCmd
+  $CfgLogsDir.Text = $script:logsDir
   $CfgVision.IsChecked = [bool]$script:visionOn
   $ModelChips.Children.Clear()
   $ModelChips.Visibility = 'Collapsed'
@@ -2434,32 +2759,88 @@ function Set-ModeVisual([string]$m) {
   }
 }
 
+# ---------------------------------------------------------------- 读秒
+# 这一轮开始的时间戳；0 表示没在跑（读秒条收起）
+$script:thinkT0 = 0
+# 当前阶段文案（思考中 / 回答中 / 执行 xxx / 验证中），由 Handle-Event 更新
+$script:thinkVerb = ''
+
+function Format-Elapsed([double]$secs) {
+  # 一分钟内报秒，往上报到分；都取整，读秒时数字才不会乱跳
+  # 紧凑写法（和「用时 2分39秒」一致），省得读秒条随数字变宽而抖动
+  $s = [int][math]::Floor($secs)
+  if ($s -lt 60) { return "$s 秒" }
+  $m = [int][math]::Floor($s / 60)
+  $rest = $s % 60
+  if ($m -lt 60) { return "$($m)分$('{0:00}' -f $rest)秒" }
+  return "$([int][math]::Floor($m / 60))小时$('{0:00}' -f ($m % 60))分"
+}
+
+function Update-ThinkRow([string]$verb) {
+  if (-not $script:thinkT0) { return }
+  $secs = ((Get-Date) - $script:thinkT0).TotalSeconds
+  $ThinkText.Text = $(if ($verb) { $verb } else { '思考中' }) + ' · 用时 ' + (Format-Elapsed $secs) + '…'
+}
+
+# 切阶段（思考中 / 回答中 / 执行 xxx / 验证中）时立刻刷新一次，别等下一个 tick
+function Set-ThinkVerb([string]$verb) {
+  $script:thinkVerb = $verb
+  Update-ThinkRow $verb
+}
+
 function Set-Busy([bool]$on) {
   $script:busy = $on
   $SendBtn.IsEnabled = -not $on
   $SendBtn.Visibility = $(if ($on) { 'Collapsed' } else { 'Visible' })
   $StopBtn.IsEnabled = $on
   $StopBtn.Visibility = $(if ($on) { 'Visible' } else { 'Collapsed' })
+  if ($on) {
+    # 从发出这一刻开始算，别等第一个事件回来才跳（模型排队时那几秒最容易让人以为卡住）
+    $script:thinkT0 = (Get-Date)
+    $script:thinkVerb = '思考中'
+    $ThinkRow.Visibility = 'Visible'
+    Update-ThinkRow $script:thinkVerb
+  } else {
+    $script:thinkT0 = 0
+    $script:thinkVerb = ''
+    $ThinkText.Text = ''
+    $ThinkRow.Visibility = 'Collapsed'
+  }
 }
 
 function Start-Turn([string]$text) {
   $files = @($script:attachFiles)
-  if ($script:busy -or (-not $text.Trim() -and $files.Count -eq 0)) { return }
+  $quotes = @($script:quoteRefs)
+  if ($script:busy -or (-not $text.Trim() -and $files.Count -eq 0 -and $quotes.Count -eq 0)) { return }
   # 输入历史：连续重复的不重复记，指针归到末尾
   $trimmed = $text.Trim()
   if ($trimmed -and ($script:history.Count -eq 0 -or [string]$script:history[$script:history.Count - 1] -ne $trimmed)) {
     [void]$script:history.Add($trimmed)
   }
   $script:historyIdx = $script:history.Count
-  Add-UserMessage $text $files
+  # 引用拼在最前面：模型看到的是「引用原文 + 这次的话」，屏幕上是原文 + 一行引用标记
+  $sendText = $text
+  if ($quotes.Count -gt 0) {
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($q in $quotes) {
+      $who = $(if ($q.role -eq 'user') { '用户' } else { '模型' })
+      [void]$sb.AppendLine("[引用对话 · $who]")
+      [void]$sb.AppendLine([string]$q.text)
+      [void]$sb.AppendLine()
+    }
+    if ($text.Trim()) { [void]$sb.Append($text) }
+    $sendText = $sb.ToString().TrimEnd()
+  }
+  Add-UserMessage $text $files $quotes
   $InputBox.Text = ''
   $script:attachFiles.Clear()
+  $script:quoteRefs.Clear()
   Update-AttachList
   $script:currentAssistant = $null
   $script:pendingText.Clear() | Out-Null
   Set-Busy $true
-  if ($files.Count) { Send-Host @{ cmd = 'task'; text = $text; files = $files } }
-  else { Send-Host @{ cmd = 'task'; text = $text } }
+  if ($files.Count) { Send-Host @{ cmd = 'task'; text = $sendText; files = $files } }
+  else { Send-Host @{ cmd = 'task'; text = $sendText } }
   $Scroller.ScrollToEnd()
 }
 
@@ -2474,6 +2855,7 @@ function Handle-Event([string]$line) {
       $script:cfgKeyMasked = [string]$e.apiKeyMasked
       $script:verifyCmd = [string]$e.verify
       $script:visionOn = [bool]$e.vision
+      $script:logsDir = [string]$e.logsDir
       $script:hasKey = [bool]$e.hasKey
       Update-CwdPill ([string]$e.cwd)
       Update-ModelPill ([string]$e.model)
@@ -2500,6 +2882,7 @@ function Handle-Event([string]$line) {
               if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
               Render-Markdown $script:assistantBody ([string]$ev.text)
               $script:currentAssistant = $null
+              [void]$script:msgLog.Add(@{ role = 'assistant'; text = [string]$ev.text })
             }
           }
           elseif ($ev.kind -eq 'tool/call') {
@@ -2540,6 +2923,7 @@ function Handle-Event([string]$line) {
     'reasoning' {
       Close-ToolGroup
       if (-not $script:reasonNode) { Add-ReasoningBlock | Out-Null }
+      Set-ThinkVerb '思考中'
       $rn = $script:reasonNode
       $d = [string]$e.delta
       $rn.Body.Text = $rn.Body.Text + $d
@@ -2549,6 +2933,7 @@ function Handle-Event([string]$line) {
     'text' {
       Close-ToolGroup
       Complete-Reasoning
+      Set-ThinkVerb '回答中'
       if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
       $script:pendingText.Append([string]$e.delta) | Out-Null
       if ($script:assistantBox) { $script:assistantBox.text = $script:pendingText.ToString() }
@@ -2565,18 +2950,23 @@ function Handle-Event([string]$line) {
         if ($container) { $Transcript.Children.Remove($container) | Out-Null }
       }
       if ($script:assistantBox) { $script:assistantBox.text = [string]$e.text }
-      if ($e.text) { Append-CopyLog ([string]$e.text) }
+      if ($e.text) {
+        Append-CopyLog ([string]$e.text)
+        [void]$script:msgLog.Add(@{ role = 'assistant'; text = [string]$e.text })
+      }
       $script:pendingText.Clear() | Out-Null
       $script:currentAssistant = $null
     }
     'tool-start' {
       Complete-Reasoning
+      Set-ThinkVerb ('执行 ' + [string]$e.name)
       $script:currentAssistant = $null
       $st = Add-ToolLine ([string]$e.name) ([string]$e.summary)
       $script:toolRows[[string]$e.id] = $st
       $Scroller.ScrollToEnd()
     }
     'tool-end' {
+      Set-ThinkVerb '思考中'
       if ($e.ok) {
         Set-ToolLineDone ([string]$e.id) "✓  $($e.ms)ms" $true
       } else {
@@ -2589,6 +2979,7 @@ function Handle-Event([string]$line) {
     }
     'verify-start' {
       Close-ToolGroup
+      Set-ThinkVerb '验证中'
       $script:currentAssistant = $null
       $r = Add-VerifyRow ([string]$e.label) ([int]$e.round)
       $script:verifyRows[[string]$e.round] = $r
@@ -2636,6 +3027,7 @@ function Handle-Event([string]$line) {
       $script:cfgKeyMasked = [string]$e.apiKeyMasked
       if ($null -ne $e.verify) { $script:verifyCmd = [string]$e.verify }
       if ($null -ne $e.vision) { $script:visionOn = [bool]$e.vision }
+      if ($e.logsDir) { $script:logsDir = [string]$e.logsDir }
       $script:modelName = [string]$e.model
       $script:hasKey = $true
       Update-ModelPill ([string]$e.model)
@@ -2719,6 +3111,13 @@ $StopBtn.Add_Click({ Send-Host @{ cmd = 'abort' } })
 
 # 设置面板
 $SettingsBtn.Add_Click({ Open-Settings })
+
+# 打开日志目录：资源管理器直接定位过去，方便复杂任务卡住时按日志复盘
+$CfgOpenLogs.Add_Click({
+  $dir = $script:logsDir
+  if (-not $dir) { return }
+  try { Start-Process explorer.exe -ArgumentList ('"' + $dir + '"') } catch { }
+})
 
 # 拉取模型：用对话框里当前填的地址和 Key（Key 留空就让 host 用已保存的那个）
 $CfgFetch.Add_Click({
@@ -2854,6 +3253,15 @@ $timer.Add_Tick({
       $script:currentAssistant.Text += $script:pendingText.ToString()
       $script:pendingText.Clear() | Out-Null
       $Scroller.ScrollToEnd()
+    }
+    # 读秒：每 5 个 tick（约 0.25s）刷新一次就够了，数字只到秒
+    if ($script:busy -and $script:thinkT0) {
+      $script:tickCount2 = ([int]$script:tickCount2) + 1
+      if (($script:tickCount2 % 5) -eq 0) {
+        Update-ThinkRow $script:thinkVerb
+        # 流式中的思考块头部也一起跳，别一直停在 0.0s
+        Update-ReasoningTime $script:reasonNode
+      }
     }
     if ($pumpOut.Finished -and -not $script:hostGone) {
       $script:hostGone = $true

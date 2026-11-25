@@ -125,7 +125,9 @@ $xaml = @'
   <Grid x:Name="RootGrid">
     <Grid.ColumnDefinitions>
       <!-- 列 0 = 左侧栏（宽度可拖）；列 1 = 分隔条；列 2 = 右侧对话区 -->
-      <ColumnDefinition Width="252" MinWidth="180"/>
+      <!-- 起始宽度给到 MinWidth，真实宽度由 Loaded 里的 Restore-SideWidth 决定。
+           写死 Width="252" 时窗口一宽，拖到 252 附近就拖不动了（GridSplitter 不动 Auto/固定列） -->
+      <ColumnDefinition Width="180" MinWidth="180"/>
       <ColumnDefinition Width="6"/>
       <ColumnDefinition Width="*" MinWidth="420"/>
     </Grid.ColumnDefinitions>
@@ -176,7 +178,7 @@ $xaml = @'
         </Button>
 
         <!-- 会话列表 -->
-        <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" Padding="8,4,8,8">
+        <ScrollViewer Grid.Row="2" x:Name="SideScroll" VerticalScrollBarVisibility="Auto" Padding="8,4,8,8">
           <StackPanel>
             <TextBlock Text="最近" Foreground="#6B7280" FontSize="10.5" Margin="8,6,0,6"/>
             <StackPanel x:Name="SessionList"/>
@@ -434,6 +436,7 @@ $ConfirmYes = $window.FindName('ConfirmYes')
 $ConfirmNo = $window.FindName('ConfirmNo')
 $SideSplitter = $window.FindName('SideSplitter')
 $SideCol = $window.FindName('RootGrid').ColumnDefinitions[0]
+$SideScroll = $window.FindName('SideScroll')
 
 # ---------------------------------------------------------------- 画东西的小工具
 function Brush([string]$hex) {
@@ -868,11 +871,15 @@ function Format-Ago($ms) {
 }
 
 function Set-Sessions($items) {
+  # 记一份标题：左栏宽度上限按「最长的那个标题能不能完整显示」来定
+  $script:sideTitles = @()
+  if ($items) { $script:sideTitles = @($items | ForEach-Object { [string]$_.title }) }
   $SessionList.Children.Clear()
   if (-not $items -or $items.Count -eq 0) {
     $empty = New-Text '还没有会话' 11 '#5B626D' 'Normal' 'Segoe UI' 0
     $empty.Margin = '8,4,0,0'
     $SessionList.Children.Add($empty) | Out-Null
+    Update-SideFit
     return
   }
   foreach ($it in $items) {
@@ -958,6 +965,8 @@ function Set-Sessions($items) {
 
     $SessionList.Children.Add($row) | Out-Null
   }
+  # 标题变了：重新量一次左栏该有多宽（撑不下就放宽上限，全都装得下就收紧）
+  Update-SideFit
 }
 
 function Clear-Transcript {
@@ -2033,12 +2042,45 @@ $timer.Add_Tick({
 $script:layoutFile = Join-Path $DataDir 'ui-layout.json'
 $script:sideDefault = 252
 $script:sideMin = 180
+# 最近一次 Set-Sessions 收到的标题；以及据此量出的「标题全放得下」所需宽度（0 = 还没量过）
+# 缓存起来是为了让窗口缩放时的 SizeChanged 不做重复测量
+$script:sideTitles = @()
+$script:sideFitWidth = 0
+# 行内除标题之外的固定开销：左栏 ScrollViewer Padding 8+8、行 Border Padding 8+8、
+# 删除按钮 22、列表滚动条 10，再留 8 的余量，免得「刚好装下」时标题贴着删除按钮
+$script:sideChrome = 64
+
+# 用 TextBlock.Measure 量文字宽度：中英文混排比按字符数估算准得多，
+# 而且走的是和实际显示完全相同的排版流程
+function Measure-TextWidth([string]$text, [double]$size = 12) {
+  if (-not $text) { return 0 }
+  $tb = New-Object System.Windows.Controls.TextBlock
+  $tb.Text = $text
+  $tb.FontSize = $size
+  $tb.FontFamily = (New-Object System.Windows.Media.FontFamily('Segoe UI'))
+  $tb.Measure([System.Windows.Size]::new([double]::PositiveInfinity, [double]::PositiveInfinity))
+  return $tb.DesiredSize.Width
+}
+
+function Get-SideFitWidth {
+  # 最长标题的像素宽度 + 行内固定开销 = 标题能完整显示所需的最小左栏宽度
+  $text = 0
+  foreach ($t in @($script:sideTitles)) {
+    $w = Measure-TextWidth ([string]$t) 12
+    if ($w -gt $text) { $text = $w }
+  }
+  if ($text -le 0) { return 0 }
+  return [math]::Ceiling($text + $script:sideChrome)
+}
 
 function Get-SideMax {
+  # 左栏硬上限 = min(窗口给得出多少, 标题全显示所需)；不小于 MinWidth
   $w = $window.ActualWidth
   if ($w -le 0) { $w = $window.Width }
   # 右边给对话区留 420（它的 MinWidth）+ 6（分隔条）
-  return [math]::Max($script:sideMin + 1, $w - 426)
+  $cap = [math]::Max($script:sideMin + 1, $w - 426)
+  if ($script:sideFitWidth -gt 0) { $cap = [math]::Min($cap, $script:sideFitWidth) }
+  return [math]::Max($script:sideMin, $cap)
 }
 
 function Set-SideWidth([double]$w) {
@@ -2046,6 +2088,90 @@ function Set-SideWidth([double]$w) {
   $max = Get-SideMax
   if ($w -gt $max) { $w = $max }
   $SideCol.Width = (New-Object System.Windows.GridLength $w)
+}
+
+# 把上限落到列上：MaxWidth 管「拖动时不能越过」，另外把已经超出的宽度收回来
+function Sync-SideCap {
+  if ($script:sideFitWidth -le 0) { $script:sideFitWidth = Get-SideFitWidth }
+  if ($script:sideFitWidth -le 0) { return }
+  $cap = Get-SideMax
+  $SideCol.MaxWidth = $cap
+  if ($SideCol.ActualWidth -gt $cap + 0.5) { Set-SideWidth $cap }
+}
+
+# 标题变了（Set-Sessions）才重量；没变化就直接返回，免得每次刷新会话列表都动布局
+function Update-SideFit {
+  $fit = Get-SideFitWidth
+  if ($fit -le 0) { return }
+  if ([math]::Abs($fit - $script:sideFitWidth) -lt 1) { return }
+  $script:sideFitWidth = $fit
+  Sync-SideCap
+}
+
+# 拖动结束后把列还原成按比例（"*"）：GridSplitter 拖完会把列写成固定像素，
+# 之后窗口变宽左栏不再让位。改成 "*" 后窗口变宽它会自己长，长到 MaxWidth 就停。
+function Recall-SideWidth {
+  Sync-SideCap
+  $cur = $SideCol.ActualWidth
+  if ($cur -le 0) { return }
+  $SideCol.Width = (New-Object System.Windows.GridLength 1, ([System.Windows.GridUnitType]::Star))
+}
+
+function Sync-SideCap {
+  # 把「内容上限」落到列上：MaxWidth 管拖动时 GridSplitter 不会越过，
+  # 同时兜一下当前位置（标题变短/窗口变窄后已经超了的话就收回来）
+  $fit = Get-SideFitWidth
+  if ($fit -le 0) { return }
+  $script:sideFitWidth = $fit
+  $cap = Get-SideMax
+  $SideCol.MaxWidth = $cap
+  if ($SideCol.ActualWidth -gt $cap + 0.5) { Set-SideWidth $cap }
+  elseif ($SideCol.ActualWidth -lt $script:sideMin - 0.5) { Set-SideWidth $script:sideMin }
+}
+
+function Update-SideFit {
+  # 标题变了（Set-Sessions）就重新量；量出来没变化就什么都不做，免得每次刷新会话列表都动布局
+  $fit = Get-SideFitWidth
+  if ($fit -le 0) { return }
+  if ([math]::Abs($fit - $script:sideFitWidth) -lt 1) { return }
+  Sync-SideCap
+}
+
+function Recall-SideWidth {
+  # 拖动结束后把列还原成「按比例」而不是固定像素：
+  # GridSplitter 拖完会把列写成固定 GridLength，窗口再变宽左栏不会跟着让位。
+  # "*" 列在窗口变宽时会自动长，正好让上限继续生效（长到 MaxWidth 就停）。
+  if ($script:sideFitWidth -le 0) { return }
+  $cap = Get-SideMax
+  $SideCol.MaxWidth = $cap
+  $cur = $SideCol.ActualWidth
+  if ($cur -le 0) { return }
+  if ($cur -gt $cap) { Set-SideWidth $cap; return }
+  $SideCol.Width = (New-Object System.Windows.GridLength 1, ([System.Windows.GridUnitType]::Star))
+}
+
+function Get-SideMax {
+  $w = $window.ActualWidth
+  if ($w -le 0) { $w = $window.Width }
+  # 右边给对话区留 420（它的 MinWidth）+ 6（分隔条）
+  $cap = [math]::Max($script:sideMin + 1, $w - 426)
+  # 内容硬上限：标题全都显示得下之后就不该再往外拉
+  if ($script:sideFitWidth -gt 0) {
+    $cap = [math]::Max($script:sideMin, [math]::Min($cap, $script:sideFitWidth))
+  }
+  return $cap
+}
+
+function Set-SideWidth([double]$w) {
+  if ($w -lt $script:sideMin) { $w = $script:sideMin }
+  $max = Get-SideMax
+  if ($w -gt $max) { $w = $max }
+  $SideCol.Width = (New-Object System.Windows.GridLength $w)
+}
+
+# 窗口或内容变化后重新算一遍：列宽夹到 [MinWidth, 内容上限]
+function Sync-SideMax {
+  Sync-SideCap
 }
 
 function Save-SideWidth {
@@ -2092,17 +2218,28 @@ $window.Add_Loaded({
   $SubTitle.Text = $Mode
   Clear-Transcript
   Restore-SideWidth
+  # 列表建好、布局落定后再量一次：标题宽度决定左栏能拉到多宽
+  try { $window.Dispatcher.Invoke([action]{ Update-SideFit }, [System.Windows.Threading.DispatcherPriority]::Background) } catch { }
   $timer.Start()
   $InputBox.Focus() | Out-Null
   # 自测入口：设置 PL_GUI_TASK 会自动发第一条任务（也方便截图验证）
   if ($env:PL_GUI_TASK) { Start-Turn $env:PL_GUI_TASK }
 })
 
-# 分隔条：拖完记住宽度；双击复位到默认
-$SideSplitter.Add_DragCompleted({ Save-SideWidth })
+# 分隔条：拖动结束后把上限落到列上并记住宽度；双击复位到默认
+$SideSplitter.Add_DragCompleted({
+  Sync-SideCap
+  Recall-SideWidth
+  Save-SideWidth
+})
 $SideSplitter.Add_MouseDoubleClick({
   Set-SideWidth $script:sideDefault
   Save-SideWidth
+})
+
+# 窗口变宽/变窄：右栏 MinWidth 与内容上限都可能变，重新夹一次
+$window.Add_SizeChanged({
+  try { Sync-SideCap } catch { }
 })
 
 $window.Add_Closing({

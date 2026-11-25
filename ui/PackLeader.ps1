@@ -277,10 +277,10 @@ $xaml = @'
               <Button x:Name="AttachBtn" DockPanel.Dock="Left" Content="+ 附件" Height="26" Padding="9,0"
                       Cursor="Hand" FontSize="11.5" Margin="0,0,10,0"
                       Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF" BorderThickness="1"/>
-              <Button x:Name="InsertConvBtn" DockPanel.Dock="Left" Content="插入对话" Height="26" Padding="9,0"
+              <Button x:Name="InsertConvBtn" DockPanel.Dock="Left" Content="插话" Height="26" Padding="9,0"
                       Cursor="Hand" FontSize="11" Margin="0,0,10,0"
                       Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF" BorderThickness="1"
-                      ToolTip="引用本会话之前的消息：发送时把那段原文一起带给模型"/>
+                      ToolTip="正在跑的时候，把输入框里的话直接插进这一步（模型下一步就看到）；没在跑时等同发送"/>
               <Button x:Name="PickFolderBtn" DockPanel.Dock="Left" Content="目录" Height="26" Padding="9,0"
                       Cursor="Hand" FontSize="11" Margin="0,0,10,0" MaxWidth="240"
                       Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF" BorderThickness="1"
@@ -758,7 +758,7 @@ function New-CopyMenu([object]$box) {
   $cm.Items.Add($ma) | Out-Null
   return $cm
 }
-function Add-UserMessage([string]$text, [object]$files = $null, [object]$quotes = $null) {
+function Add-UserMessage([string]$text, [object]$files = $null) {
   $sp = Add-Container 20
   $label = New-Text '你' 10.5 '#6B7280' 'Normal' 'Segoe UI' 4
   $sp.Children.Add($label) | Out-Null
@@ -808,32 +808,8 @@ function Add-UserMessage([string]$text, [object]$files = $null, [object]$quotes 
     }
     $sp.Children.Add($wrap) | Out-Null
   }
-  # 引用了之前的消息：在气泡里留一行标记，不然发出去的内容和屏幕上看对不上
-  $qs = @($quotes)
-  if ($qs.Count -gt 0) {
-    $qw = New-Object System.Windows.Controls.WrapPanel
-    $qw.Orientation = 'Horizontal'
-    $qw.Margin = '0,6,0,0'
-    foreach ($q in $qs) {
-      $who = $(if ($q.role -eq 'user') { '你' } else { '模型' })
-      $snip = ([string]$q.text) -replace "\s+", ' '
-      if ($snip.Length -gt 40) { $snip = $snip.Substring(0, 40) + '…' }
-      if (-not $snip) { $snip = '(空)' }
-      $qb = New-Object System.Windows.Controls.Border
-      $qb.Background = (Brush '#1B2433')
-      $qb.BorderBrush = (Brush '#3D6CFF')
-      $qb.BorderThickness = '1'
-      $qb.CornerRadius = '6'
-      $qb.Padding = '6,3,8,3'
-      $qb.Margin = '0,0,6,6'
-      $qb.Child = (New-Text "引用 · $who：$snip" 10 '#8AB4FF' 'Normal' 'Segoe UI' 0)
-      $qw.Children.Add($qb) | Out-Null
-    }
-    $sp.Children.Add($qw) | Out-Null
-  }
   $sp.ContextMenu = (New-CopyMenu (@{ text = "你：$text" }))
   Append-CopyLog "你：$text"
-  [void]$script:msgLog.Add(@{ role = 'user'; text = $text })
   $script:currentAssistant = $null
 }
 
@@ -1994,8 +1970,6 @@ function Clear-Transcript {
   $script:assistantBox = $null
   $script:copyLog.Clear() | Out-Null
   $script:memoryCards = New-Object System.Collections.ArrayList
-  $script:msgLog = New-Object System.Collections.ArrayList
-  $script:quoteRefs = New-Object System.Collections.ArrayList
   if ($AttachList) { Update-AttachList }
 $script:verifyRows = @{}
 }
@@ -2231,12 +2205,6 @@ $InputOverlay.Add_MouseLeftButtonUp({
 
 # ---------------------------------------------------------------- 附件
 $script:attachFiles = New-Object System.Collections.ArrayList
-# 本会话的消息记录：给「插入对话」用，引用的就是这里的一条
-$script:msgLog = New-Object System.Collections.ArrayList
-# 输入框上方挂着的引用（@{ idx; role; text }），发送时把 text 一起带给模型
-$script:quoteRefs = New-Object System.Collections.ArrayList
-$script:quotePopup = $null
-
 function Format-FileSize([double]$n) {
   if ($n -lt 1024) { return "$([int]$n) B" }
   if ($n -lt 1048576) { return "$([math]::Round($n / 1024)) KB" }
@@ -2500,62 +2468,6 @@ function Show-ModelMenu([object]$anchor) {
   $pop.IsOpen = $true
 }
 
-# ---------------------------------------------------------------- 插入对话
-# 把本会话之前的某条消息作为引用挂到输入框上方；发送时那段原文拼在问题前面带给模型。
-# 用 Popup 自绘（系统菜单是白底），行和模型菜单同一套 MenuRow。
-function Show-QuotePicker([object]$anchor) {
-  if ($script:quotePopup) { $script:quotePopup.IsOpen = $false }
-  $box = New-Object System.Windows.Controls.Border
-  $box.Background = (Brush '#1B1F27')
-  $box.BorderBrush = (Brush '#33FFFFFF')
-  $box.BorderThickness = '1'
-  $box.CornerRadius = '8'
-  $box.Padding = '4'
-  $box.MinWidth = 380
-  $box.MaxWidth = 620
-  $col = New-Object System.Windows.Controls.StackPanel
-  $n = $script:msgLog.Count
-  if ($n -eq 0) {
-    $col.Children.Add((New-MenuRow '这个会话还没有消息可以引用' '')) | Out-Null
-  } else {
-    $from = [Math]::Max(0, $n - 40)
-    for ($i = $n - 1; $i -ge $from; $i--) {
-      $m = $script:msgLog[$i]
-      $who = $(if ($m.role -eq 'user') { '你' } else { '模型' })
-      $snip = ([string]$m.text) -replace "\s+", ' '
-      if ($snip.Length -gt 56) { $snip = $snip.Substring(0, 56) + '…' }
-      if (-not $snip) { $snip = '(只有附件)' }
-      $row = New-MenuRow "$who · $snip" ''
-      $row.FontFamily = 'Segoe UI'
-      $row.Tag = $i
-      $row.Add_Click({
-        param($s, $e)
-        if ($script:quotePopup) { $script:quotePopup.IsOpen = $false }
-        $ix = [int]$s.Tag
-        foreach ($q in $script:quoteRefs) { if ($q.idx -eq $ix) { return } }
-        $mm = $script:msgLog[$ix]
-        if (-not $mm) { return }
-        [void]$script:quoteRefs.Add(@{ idx = $ix; role = [string]$mm.role; text = [string]$mm.text })
-        Update-AttachList
-      })
-      $col.Children.Add($row) | Out-Null
-    }
-  }
-  $sc = New-Object System.Windows.Controls.ScrollViewer
-  $sc.MaxHeight = 320
-  $sc.VerticalScrollBarVisibility = 'Auto'
-  $sc.Content = $col
-  $box.Child = $sc
-  $pop = New-Object System.Windows.Controls.Primitives.Popup
-  $pop.PlacementTarget = $anchor
-  $pop.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Top
-  $pop.VerticalOffset = -6
-  $pop.StaysOpen = $false
-  $pop.AllowsTransparency = $true
-  $pop.Child = $box
-  $script:quotePopup = $pop
-  $pop.IsOpen = $true
-}
 
 # 扩展名判断图片：和 src/core/attach.ts 里的 IMAGE_EXT 对齐
 function Test-ImagePath([string]$path) {
@@ -2611,65 +2523,11 @@ function New-ImageThumb([string]$path, [double]$h = 40) {
 
 function Update-AttachList {
   $AttachList.Children.Clear()
-  $hasQuote = ($script:quoteRefs.Count -gt 0)
-  if ($script:attachFiles.Count -eq 0 -and -not $hasQuote) {
+  if ($script:attachFiles.Count -eq 0) {
     $AttachList.Visibility = 'Collapsed'
     return
   }
   $AttachList.Visibility = 'Visible'
-  # 引用卡排在附件前面：一眼能看出这条消息带了哪几段旧对话
-  foreach ($r in @($script:quoteRefs)) {
-    $qb = New-Object System.Windows.Controls.Border
-    $qb.Background = (Brush '#1B2433')
-    $qb.BorderBrush = (Brush '#3D6CFF')
-    $qb.BorderThickness = '1'
-    $qb.CornerRadius = '6'
-    $qb.Padding = '6,4,5,4'
-    $qb.Margin = '0,0,6,6'
-    $qsp = New-Object System.Windows.Controls.StackPanel
-    $qsp.Orientation = 'Horizontal'
-    $qtxt = New-Object System.Windows.Controls.StackPanel
-    $qtxt.VerticalAlignment = 'Center'
-    $whoTb = New-Text ("引用 · " + $(if ($r.role -eq 'user') { '你' } else { '模型' })) 9.5 '#8AB4FF' 'SemiBold' 'Segoe UI' 1
-    $qtxt.Children.Add($whoTb) | Out-Null
-    $snip = ([string]$r.text) -replace "\s+", ' '
-    if ($snip.Length -gt 40) { $snip = $snip.Substring(0, 40) + '…' }
-    if (-not $snip) { $snip = '(空)' }
-    $sTb = New-Text $snip 10.5 '#CFD3D6' 'Normal' 'Segoe UI' 0
-    $sTb.MaxWidth = 220
-    $sTb.TextTrimming = 'CharacterEllipsis'
-    $sTb.TextWrapping = 'NoWrap'
-    $qtxt.Children.Add($sTb) | Out-Null
-    $qsp.Children.Add($qtxt) | Out-Null
-    $qx = New-Object System.Windows.Controls.Button
-    # 去掉引用用垃圾桶图标，和附件移除一致
-    $qx.Content = [string][char]0xE74D
-    $qx.FontFamily = (New-Object System.Windows.Media.FontFamily('Segoe MDL2 Assets'))
-    $qx.Width = 16
-    $qx.Height = 16
-    $qx.Margin = '6,0,0,0'
-    $qx.FontSize = 10.5
-    $qx.Cursor = 'Hand'
-    $qx.BorderThickness = '0'
-    $qx.Template = (New-FlatTemplate)
-    $qx.Background = [System.Windows.Media.Brushes]::Transparent
-    $qx.Foreground = (Brush '#7C838E')
-    $qx.VerticalAlignment = 'Center'
-    $qx.ToolTip = '取消引用'
-    $qx.Tag = $r
-    $qx.Add_Click({
-      param($s, $e)
-      # 按对象本身删：同一条消息可能先删后加，按 idx 比对会误删新挂的那条
-      $t = $s.Tag
-      for ($i = $script:quoteRefs.Count - 1; $i -ge 0; $i--) {
-        if ([object]::ReferenceEquals($script:quoteRefs[$i], $t)) { $script:quoteRefs.RemoveAt($i) }
-      }
-      Update-AttachList
-    })
-    $qsp.Children.Add($qx) | Out-Null
-    $qb.Child = $qsp
-    $AttachList.Children.Add($qb) | Out-Null
-  }
   foreach ($f in @($script:attachFiles)) {
     $size = 0
     try { $size = (Get-Item -LiteralPath $f -ErrorAction Stop).Length } catch { }
@@ -2745,10 +2603,16 @@ $AttachBtn.Add_Click({
   if ($dlg.ShowDialog()) { Add-Attachments $dlg.FileNames }
 })
 
-# 插入对话：从本会话已经发过/收到的消息里挑一条，作为引用挂到输入框上方
+# 插话：和 Kite 一样直接插队——不弹历史选择，把输入框里的话塞进正在跑的这一步
 $InsertConvBtn.Add_Click({
   param($s, $e)
-  Show-QuotePicker $s
+  $t = $InputBox.Text
+  if (-not $t.Trim()) {
+    Add-SystemLine '先在输入框里写下要插的话，再点「插话」' '#9BA3B4'
+    $InputBox.Focus() | Out-Null
+    return
+  }
+  Start-Turn $t
 })
 
 # 粘贴：Clipboard 里是图片或文件时收成附件。
@@ -2944,8 +2808,10 @@ function Set-ThinkVerb([string]$verb) {
 
 function Set-Busy([bool]$on) {
   $script:busy = $on
-  $SendBtn.IsEnabled = -not $on
-  $SendBtn.Visibility = $(if ($on) { 'Collapsed' } else { 'Visible' })
+  # 跑着的时候不隐藏发送键：点它就是插话（插队），旁边另有「停止」
+  $SendBtn.IsEnabled = $true
+  $SendBtn.Visibility = 'Visible'
+  $SendBtn.Content = $(if ($on) { '插话' } else { '发送' })
   $StopBtn.IsEnabled = $on
   $StopBtn.Visibility = $(if ($on) { 'Visible' } else { 'Collapsed' })
   if ($on) {
@@ -2964,37 +2830,34 @@ function Set-Busy([bool]$on) {
 
 function Start-Turn([string]$text) {
   $files = @($script:attachFiles)
-  $quotes = @($script:quoteRefs)
-  if ($script:busy -or (-not $text.Trim() -and $files.Count -eq 0 -and $quotes.Count -eq 0)) { return }
+  if (-not $text.Trim() -and $files.Count -eq 0) { return }
   # 输入历史：连续重复的不重复记，指针归到末尾
   $trimmed = $text.Trim()
   if ($trimmed -and ($script:history.Count -eq 0 -or [string]$script:history[$script:history.Count - 1] -ne $trimmed)) {
     [void]$script:history.Add($trimmed)
   }
   $script:historyIdx = $script:history.Count
-  # 引用拼在最前面：模型看到的是「引用原文 + 这次的话」，屏幕上是原文 + 一行引用标记
-  $sendText = $text
-  if ($quotes.Count -gt 0) {
-    $sb = New-Object System.Text.StringBuilder
-    foreach ($q in $quotes) {
-      $who = $(if ($q.role -eq 'user') { '用户' } else { '模型' })
-      [void]$sb.AppendLine("[引用对话 · $who]")
-      [void]$sb.AppendLine([string]$q.text)
-      [void]$sb.AppendLine()
-    }
-    if ($text.Trim()) { [void]$sb.Append($text) }
-    $sendText = $sb.ToString().TrimEnd()
+
+  # 插队：正在跑的时候不另起一轮，只把这句话塞进当前会话，模型下一步就能看到。
+  # 附件没法插队（入库附件是挂在轮次上的），先说清楚再发文字。
+  if ($script:busy) {
+    if ($files.Count -gt 0) { Add-SystemLine '插话只能带文字：附件等这一轮结束再发' '#9BA3B4' }
+    Send-Host @{ cmd = 'insert'; text = $text }
+    Add-UserMessage $text
+    $InputBox.Text = ''
+    $Scroller.ScrollToEnd()
+    return
   }
-  Add-UserMessage $text $files $quotes
+
+  Add-UserMessage $text $files
   $InputBox.Text = ''
   $script:attachFiles.Clear()
-  $script:quoteRefs.Clear()
   Update-AttachList
   $script:currentAssistant = $null
   $script:pendingText.Clear() | Out-Null
   Set-Busy $true
-  if ($files.Count) { Send-Host @{ cmd = 'task'; text = $sendText; files = $files } }
-  else { Send-Host @{ cmd = 'task'; text = $sendText } }
+  if ($files.Count) { Send-Host @{ cmd = 'task'; text = $text; files = $files } }
+  else { Send-Host @{ cmd = 'task'; text = $text } }
   $Scroller.ScrollToEnd()
 }
 
@@ -3003,6 +2866,9 @@ function Handle-Event([string]$line) {
   try { $e = $line | ConvertFrom-Json } catch { return }
   switch ($e.type) {
     'ready' {
+      # 切会话时 host 已经把上一轮停干净了：这里跟着复位，否则下面的「busy 就不重建」会跳过清屏，
+      # 界面上留着上一个会话的内容、底部还显示「停止」
+      if ($script:busy) { Set-Busy $false }
       $script:sessionId = [string]$e.session
       $script:modelName = [string]$e.model
       $script:cfgBaseURL = [string]$e.baseURL
@@ -3036,7 +2902,6 @@ function Handle-Event([string]$line) {
               if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
               Render-Markdown $script:assistantBody ([string]$ev.text)
               $script:currentAssistant = $null
-              [void]$script:msgLog.Add(@{ role = 'assistant'; text = [string]$ev.text })
             }
           }
           elseif ($ev.kind -eq 'tool/call') {
@@ -3106,7 +2971,6 @@ function Handle-Event([string]$line) {
       if ($script:assistantBox) { $script:assistantBox.text = [string]$e.text }
       if ($e.text) {
         Append-CopyLog ([string]$e.text)
-        [void]$script:msgLog.Add(@{ role = 'assistant'; text = [string]$e.text })
       }
       $script:pendingText.Clear() | Out-Null
       $script:currentAssistant = $null

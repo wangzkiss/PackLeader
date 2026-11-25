@@ -357,6 +357,31 @@ async function main(): Promise<void> {
     }
   }
 
+  /**
+   * 切会话 / 切目录 / 删会话之前，先把当前这一轮停干净：
+   * abort 掉模型请求与工具，把挂着的审批、提问当作取消，再等它走完收尾（最多 5 秒）。
+   * 返回 false 表示没停下来（有工具不响应中断）。
+   */
+  const stopCurrentTurn = async (): Promise<boolean> => {
+    if (!running) return true
+    controller?.abort()
+    approver.rejectAll()
+    asker.rejectAll()
+    const c = current
+    if (c) {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const cap = new Promise<void>((ok) => {
+        timer = setTimeout(ok, 5000)
+      })
+      try {
+        await Promise.race([c.catch(() => {}), cap])
+      } finally {
+        if (timer) clearTimeout(timer)
+      }
+    }
+    return !running
+  }
+
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity })
   for await (const raw of rl) {
     const line = raw.trim()
@@ -390,6 +415,20 @@ async function main(): Promise<void> {
         }
         // 关键：不能 await —— 否则执行期间读不到 stdin，approve/abort 永远进不来（死锁）
         if (text || paths.length) current = run().finally(() => { current = undefined })
+        break
+      }
+      // 插队：这一轮还在跑的时候，用户这句话直接落进当前会话，模型下一步就能看到
+      // （不做新一轮：不重新计 turn、不动正在跑的工具）
+      case 'insert': {
+        const text = String(cmd.text ?? '').trim()
+        if (!text) break
+        if (running) {
+          await session.append({ kind: 'user/message', text })
+          send({ type: 'notice', text: '已插话：模型下一步就能看到' })
+        } else {
+          // 没在跑就等同于正常发一轮
+          current = runTask(text).finally(() => { current = undefined })
+        }
         break
       }
       case 'list-models': {
@@ -516,8 +555,8 @@ async function main(): Promise<void> {
       case 'cwd': {
         // 切 workspace：策略与工具都要重建（GUI 里换项目）
         const dir = resolve(String(cmd.dir ?? ''))
-        if (running) {
-          send({ type: 'error', message: '请先等当前轮结束' })
+        if (running && !(await stopCurrentTurn())) {
+          send({ type: 'error', message: '这一轮没停下来（可能有工具不响应），稍后再切目录' })
           break
         }
         opts.root = dir
@@ -531,8 +570,8 @@ async function main(): Promise<void> {
         break
       }
       case 'new-session': {
-        if (running) {
-          send({ type: 'error', message: '请先等当前轮结束' })
+        if (running && !(await stopCurrentTurn())) {
+          send({ type: 'error', message: '这一轮没停下来（可能有工具不响应），稍后再新建' })
           break
         }
         session = await Session.create(opts.dataDir, meta())
@@ -541,8 +580,8 @@ async function main(): Promise<void> {
         break
       }
       case 'delete-session': {
-        if (running) {
-          send({ type: 'error', message: '请先等当前轮结束' })
+        if (running && !(await stopCurrentTurn())) {
+          send({ type: 'error', message: '这一轮没停下来（可能有工具不响应），稍后再删' })
           break
         }
         const id = String(cmd.id ?? '')
@@ -596,10 +635,13 @@ async function main(): Promise<void> {
         break
       }
       case 'load-session': {
-        if (running) {
-          send({ type: 'error', message: '请先等当前轮结束' })
+        // 切会话不再要求先等这一轮跑完：先把它停干净（abort + 等收尾），再切过去
+        const wasRunning = running
+        if (wasRunning && !(await stopCurrentTurn())) {
+          send({ type: 'error', message: '这一轮没停下来（可能有工具不响应），稍后再切' })
           break
         }
+        if (wasRunning) send({ type: 'notice', text: '上一轮已中断，已切到目标会话' })
         try {
           session = await Session.open(opts.dataDir, String(cmd.id ?? ''))
           agent = await buildAgent()

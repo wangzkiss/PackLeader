@@ -173,7 +173,11 @@ export function createRuntimeTools(opts: { root: string }): Tool[] {
       const file = abs(needString(args, 'path'))
       const want = Math.min(5000, Math.max(1, optNumber(args, 'lines') ?? 200))
       const st = await stat(file).catch(() => null)
-      if (!st) throw new Error(`不存在：${relPath(base, file)}`)
+      if (!st) {
+        throw new Error(
+          `不存在：${relPath(base, file)}（路径要写实际值：%USERNAME% / $env:X 这类环境变量不会展开）`,
+        )
+      }
       if (!st.isFile()) throw new Error(`不是文件：${relPath(base, file)}（目录请用 list）`)
       const tail = await readTail(file, want)
       const head = `${relPath(base, file)}（${fmtSize(tail.bytes)}，编码 ${tail.encoding}，末 ${want} 行${tail.truncated ? '，只读了最后 1MB' : ''}）`
@@ -384,5 +388,86 @@ export function createRuntimeTools(opts: { root: string }): Tool[] {
     },
   }
 
-  return [logtail, processlist, netprobe, sysstat]
+  const waitfor: Tool = {
+    name: 'waitfor',
+    description:
+      '等一个条件成立再往下做，条件一成立就立刻返回（不白等）：target=port 等端口能连上，file 等文件出现，' +
+      'process 等进程出现，window 等某个窗口出现（Windows）。要等 GUI 起来 / 服务监听 / 产物落盘时用它，别用 sleep 硬等。',
+    parameters: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', description: 'port | file | process | window' },
+        host: { type: 'string', description: 'target=port 时的主机，默认 127.0.0.1' },
+        port: { type: 'integer', description: 'target=port 时的端口' },
+        path: { type: 'string', description: 'target=file 时的路径（相对 workspace 或绝对）' },
+        pattern: { type: 'string', description: 'target=process/window 时匹配的文本（进程名或窗口标题，不分大小写）' },
+        timeout_ms: { type: 'integer', description: '最多等多久，默认 30000，最多 600000' },
+        interval_ms: { type: 'integer', description: '轮询间隔，默认 300' },
+      },
+      required: ['target'],
+    },
+    permission: 'read',
+    async run(_ctx, args) {
+      const target = needString(args, 'target').toLowerCase()
+      const timeoutMs = Math.min(600_000, Math.max(100, optNumber(args, 'timeout_ms') ?? 30_000))
+      const intervalMs = Math.min(5_000, Math.max(50, optNumber(args, 'interval_ms') ?? 300))
+      const started = Date.now()
+      const deadline = started + timeoutMs
+      let tries = 0
+      let last = ''
+
+      const check = async (): Promise<boolean> => {
+        tries++
+        if (target === 'port') {
+          const host = optString(args, 'host') ?? '127.0.0.1'
+          const port = optNumber(args, 'port')
+          if (!port) throw new Error('target=port 需要 port')
+          const r = await probeTcp(host, port, Math.min(2000, intervalMs + 1500))
+          last = r.ok ? `${host}:${port} 连得上（${r.ms}ms）` : `${host}:${port} 还连不上：${r.error}`
+          return r.ok
+        }
+        if (target === 'file') {
+          const p = abs(needString(args, 'path'))
+          const st = await stat(p).catch(() => null)
+          last = st ? `${relPath(base, p)} 已存在（${st.isFile() ? fmtSize(st.size) : '目录'}）` : `${relPath(base, p)} 还没有`
+          return Boolean(st)
+        }
+        if (target === 'process') {
+          const pat = needString(args, 'pattern').toLowerCase()
+          const cmd = isWin ? 'tasklist /FO CSV /NH' : 'ps -eo pid,ppid,pcpu,rss,comm'
+          const r = await runShell(cmd, { cwd: opts.root, timeoutMs: 15_000 })
+          const procs = isWin ? parseTasklist(r.stdout) : parsePs(r.stdout)
+          const hit = procs.find((x) => x.name.toLowerCase().includes(pat))
+          last = hit ? `进程 ${hit.name}（pid ${hit.pid}）在跑` : `没有名字含「${pat}」的进程`
+          return Boolean(hit)
+        }
+        if (target === 'window') {
+          if (!isWin) throw new Error('target=window 只支持 Windows')
+          const pat = needString(args, 'pattern')
+          const safe = pat.replace(/'/g, "''")
+          const cmd = `Get-Process | Where-Object { $_.MainWindowTitle -and $_.MainWindowTitle -like '*${safe}*' } | Select-Object -First 1 -ExpandProperty Id`
+          const r = await runShell(cmd, { cwd: opts.root, timeoutMs: 20_000 })
+          const pid = r.stdout.trim()
+          last = pid ? `窗口「${pat}」已出现（pid ${pid}）` : `还没有标题含「${pat}」的窗口`
+          return Boolean(pid)
+        }
+        throw new Error(`target 只能是 port / file / process / window，收到 ${target}`)
+      }
+
+      for (;;) {
+        const ok = await check()
+        const ms = Date.now() - started
+        if (ok) return { content: `等了 ${ms}ms（${tries} 次轮询）：${last}`, meta: { tries, ms } }
+        if (Date.now() >= deadline) {
+          return {
+            content: `等满 ${ms}ms 还没有成立（${tries} 次轮询）：${last}\n可以加大 timeout_ms，或换一个判据。`,
+            meta: { tries, ms },
+          }
+        }
+        await new Promise((r) => setTimeout(r, intervalMs))
+      }
+    },
+  }
+
+  return [logtail, processlist, netprobe, sysstat, waitfor]
 }

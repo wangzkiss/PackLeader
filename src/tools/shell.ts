@@ -161,8 +161,11 @@ export function createShellTools(opts: { cwd: string; timeoutMs?: number }): Too
   const tool: Tool = {
     name: 'shell',
     description: isWin
-      ? `执行一条 ${shell.label} 命令（一次性，不保留状态）。工作目录是 workspace 根。${legacyHint}`
-      : `执行一条 ${shell.label} 命令（一次性，不保留状态）。工作目录是 workspace 根。`,
+      ? `执行一条 ${shell.label} 命令（一次性，不保留状态）。工作目录是 workspace 根。${legacyHint}` +
+        '复杂脚本、带中文或引号的命令，先 write 到临时文件再用 -File 执行，比在命令行里拼更稳。' +
+        '要等进程/端口/窗口/文件出现，用 waitfor，别在命令里 sleep。'
+      : `执行一条 ${shell.label} 命令（一次性，不保留状态）。工作目录是 workspace 根。` +
+        '要等端口/文件出现，用 waitfor，别在命令里 sleep。',
     parameters: {
       type: 'object',
       properties: {
@@ -185,6 +188,14 @@ export function createShellTools(opts: { cwd: string; timeoutMs?: number }): Too
       if (r.stderr.trim()) parts.push(`[stderr]\n${r.stderr.trimEnd()}`)
       if (r.timedOut) parts.push('[命令超时被终止]')
       parts.push(`[exit code: ${r.exitCode}]`)
+      // PowerShell 5.1 会把原生命令（git / curl / 进度条类）写到 stderr 的信息当 NativeCommandError，
+      // 退出码跟着变非 0，命令其实已成功。这里说一句，免得模型当成失败去重跑。
+      if (r.exitCode !== 0 && /NativeCommandError|RemoteException/.test(r.stderr)) {
+        parts.push(
+          '[提示] 这是 Windows PowerShell 把原生命令写到 stderr 的进度信息当成错误记录的常见现象，' +
+            '命令很可能已经成功。先看实际效果（文件变没变、输出里的结果）再决定要不要重跑。',
+        )
+      }
       return { content: parts.join('\n'), exitCode: r.exitCode, meta: { ms: r.ms } }
     },
   }

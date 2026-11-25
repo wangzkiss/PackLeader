@@ -80,6 +80,67 @@ const DEFAULT_MAX_OUTPUT = 64 * 1024
 /** 上下文压缩阈值：估算字符数超了就把早期的工具结果压成摘要 */
 const DEFAULT_MAX_CONTEXT = 240_000
 
+/** 按字节预算取一段前缀，不把多字节字符切碎 */
+function headOfBytes(s: string, maxBytes: number): string {
+  if (Buffer.byteLength(s, 'utf8') <= maxBytes) return s
+  let lo = 0
+  let hi = s.length
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1
+    if (Buffer.byteLength(s.slice(0, mid), 'utf8') <= maxBytes) lo = mid
+    else hi = mid - 1
+  }
+  // 最后一格可能正好落在 emoji 的代理对中间，退回去一个，别留下孤立代理项
+  if (lo > 0 && isHighSurrogate(s.charCodeAt(lo - 1))) lo--
+  return s.slice(0, lo)
+}
+
+/** 按字节预算取一段后缀，不把多字节字符切碎 */
+function tailOfBytes(s: string, maxBytes: number): string {
+  if (Buffer.byteLength(s, 'utf8') <= maxBytes) return s
+  let lo = 0
+  let hi = s.length
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (Buffer.byteLength(s.slice(mid), 'utf8') <= maxBytes) hi = mid
+    else lo = mid + 1
+  }
+  // 起点落在代理对的后半截时往后挪一格
+  if (lo < s.length && isLowSurrogate(s.charCodeAt(lo))) lo++
+  return s.slice(lo)
+}
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff
+}
+
+/**
+ * 把超长输出裁到 max 字节以内：头 60% + 尾 25% 的字节预算。
+ * 早先按「原内容的 60% 字符 + 25% 字符」切，758KB 的输出裁完还剩 645KB，
+ * 64KB 的上限等于没设——按预算切才能真正把上下文压住。
+ */
+export function truncateOutput(
+  content: string,
+  max: number,
+  spill?: string,
+): { content: string; truncated: boolean; omittedChars: number } {
+  const bytes = Buffer.byteLength(content, 'utf8')
+  if (bytes <= max) return { content, truncated: false, omittedChars: 0 }
+  const head = headOfBytes(content, Math.floor(max * 0.6))
+  const tail = tailOfBytes(content, Math.floor(max * 0.25))
+  const omitted = content.length - head.length - tail.length
+  const where = spill ? `，完整内容见 ${spill}` : ''
+  return {
+    content: `${head}\n\n… [省略 ${omitted} 字符 / 共 ${bytes} 字节${where}] …\n\n${tail}`,
+    truncated: true,
+    omittedChars: omitted,
+  }
+}
+
 export class Agent {
   private opts: AgentOptions
   private pendingApproval: string | null = null
@@ -141,15 +202,8 @@ export class Agent {
     await mkdir(spillDir, { recursive: true }).catch(() => undefined)
     await writeFile(spill, content, 'utf8').catch(() => undefined)
 
-    const chars = content.length
-    const head = content.slice(0, Math.floor(chars * 0.6))
-    const tail = content.slice(-Math.floor(chars * 0.25))
-    const omitted = chars - head.length - tail.length
-    return {
-      content: `${head}\n\n… [省略 ${omitted} 字符 / 共 ${bytes} 字节，完整内容见 ${spill}] …\n\n${tail}`,
-      truncated: true,
-      spill,
-    }
+    const clipped = truncateOutput(content, max, spill)
+    return { content: clipped.content, truncated: true, spill }
   }
 
   private async executeTool(
@@ -374,6 +428,9 @@ export class Agent {
     let verifyRound = 0
     let stepBase = 0
 
+    // 本回合内出现过的 tool+args，用提示「这一步和前面某步完全一样」
+    const seenCalls = new Map<string, number>()
+
     try {
       for (;;) {
         for (let i = 1; i <= maxSteps; i++) {
@@ -439,7 +496,14 @@ export class Agent {
         for (const call of res.toolCalls) {
           totalCalls++
           await session.append({ kind: 'tool/call', turn, step, call })
+          const sig = `${call.name}:${JSON.stringify(call.args)}`
+          const dupOf = seenCalls.get(sig)
+          if (dupOf === undefined) seenCalls.set(sig, step)
           const { result } = await this.executeTool(call, turn, step)
+          // 一字不差的重复调用：结果照给，但提醒一句，别让模型把它当新信息
+          if (dupOf !== undefined) {
+            result.content = `[提示] 这一步的调用与第 ${dupOf} 步完全相同，结果应当一致；若确实没变化，就换别的查法。\n${result.content}`
+          }
           // 只有真的写成功了才算"改过文件"，后面据此决定要不要跑验证
           if (result.ok && (call.name === 'write' || call.name === 'edit')) {
             const p = (call.args as Record<string, unknown> | undefined)?.path

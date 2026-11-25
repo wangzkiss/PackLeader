@@ -171,13 +171,25 @@ export function createFsTools(root: string): Tool[] {
 
   const read: Tool = {
     name: 'read',
-    description: '读取一个文本文件并带行号返回。可指定 offset/limit 分段读大文件。',
+    description:
+      '读取一个文本文件并带行号返回。可指定 offset/limit 分段读大文件；要一次看几处不相连的段（改代码前对比上下文），用 ranges 一次读完，别来回读。',
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: '文件路径（绝对或相对 workspace）' },
         offset: { type: 'integer', description: '从第几行开始（1 起），默认 1' },
         limit: { type: 'integer', description: '最多读多少行，默认全部（最多 2000）' },
+        ranges: {
+          type: 'array',
+          description: '一次读多段：每项 {offset, limit}（行号从 1 起，limit 默认 200）。给了它就忽略顶层 offset/limit，最多 8 段',
+          items: {
+            type: 'object',
+            properties: {
+              offset: { type: 'integer', description: '起始行（1 起）' },
+              limit: { type: 'integer', description: '读多少行，默认 200' },
+            },
+          },
+        },
       },
       required: ['path'],
     },
@@ -190,24 +202,50 @@ export function createFsTools(root: string): Tool[] {
       const text = await readFile(file, 'utf8')
       ctx.readFiles.add(file)
       const lines = text.split('\n')
-      const offset = Math.max(1, optNumber(args, 'offset') ?? 1)
-      const want = Math.min(2000, optNumber(args, 'limit') ?? 2000)
       // 按字节预算切片，避免读出一个 90KB 的结果又被上层截断（白读一次）
       const budget = 48 * 1024
-      const picked: string[] = []
-      let bytes = 0
-      for (let i = offset - 1; i < lines.length && picked.length < want; i++) {
-        const line = lines[i]!
-        const cost = Buffer.byteLength(line, 'utf8') + 8
-        if (bytes + cost > budget) break
-        picked.push(line)
-        bytes += cost
+      let used = 0
+      const take = (from1: number, want: number) => {
+        const offset = Math.max(1, from1)
+        const picked: string[] = []
+        for (let i = offset - 1; i < lines.length && picked.length < want; i++) {
+          const line = lines[i]!
+          const cost = Buffer.byteLength(line, 'utf8') + 8
+          if (used + cost > budget) break
+          picked.push(line)
+          used += cost
+        }
+        if (!picked.length && offset <= lines.length) picked.push(lines[offset - 1]!.slice(0, 4000))
+        return { offset, picked }
       }
-      if (!picked.length && offset <= lines.length) picked.push(lines[offset - 1]!.slice(0, 4000))
-      const body = picked.map((l, i) => `${String(offset + i).padStart(5)}| ${l}`).join('\n')
-      const nextLine = offset + picked.length
+      const withLineNo = (offset: number, picked: string[]) =>
+        picked.map((l, i) => `${String(offset + i).padStart(5)}| ${l}`).join('\n')
+
+      const rawRanges = Array.isArray(args.ranges) ? (args.ranges as unknown[]).slice(0, 8) : []
+      if (rawRanges.length) {
+        const blocks: string[] = []
+        for (const raw of rawRanges) {
+          const r = (raw ?? {}) as Record<string, unknown>
+          const from = Math.max(1, optNumber(r, 'offset') ?? 1)
+          const want = Math.min(2000, optNumber(r, 'limit') ?? 200)
+          const { offset, picked } = take(from, want)
+          if (!picked.length) {
+            blocks.push(`【${from} 起】超出文件末尾（共 ${lines.length} 行）`)
+            continue
+          }
+          blocks.push(`【${offset}-${offset + picked.length - 1}】\n${withLineNo(offset, picked)}`)
+        }
+        return { content: `${rel(root, file)}（共 ${lines.length} 行，${rawRanges.length} 段）\n${blocks.join('\n\n')}` }
+      }
+
+      const offset = Math.max(1, optNumber(args, 'offset') ?? 1)
+      const want = Math.min(2000, optNumber(args, 'limit') ?? 2000)
+      const taken = take(offset, want)
+      const nextLine = taken.offset + taken.picked.length
       const footer = nextLine <= lines.length ? `\n[还有 ${lines.length - nextLine + 1} 行，用 offset=${nextLine} 继续]` : ''
-      return { content: `${rel(root, file)} (共 ${lines.length} 行，本次 ${offset}-${offset + picked.length - 1})\n${body}${footer}` }
+      return {
+        content: `${rel(root, file)} (共 ${lines.length} 行，本次 ${taken.offset}-${taken.offset + taken.picked.length - 1})\n${withLineNo(taken.offset, taken.picked)}${footer}`,
+      }
     },
   }
 

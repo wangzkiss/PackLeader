@@ -219,3 +219,26 @@ test('e2e: 两轮编辑后 undo 回到第一轮内容', async () => {
     await s.close()
   }
 })
+
+test('e2e: 工具输出远超上限时按 64KB 预算截断（不是只裁 15%）', async () => {
+  const s = await setup(
+    [
+      { toolCalls: [{ name: 'shell', args: { command: `node -e "process.stdout.write('x'.repeat(300*1024))"` } }] },
+      { text: 'done' },
+    ],
+    { mode: 'full', approval: 'allow' },
+  )
+  try {
+    await s.agent.runTurn('吐一大段输出')
+    const res = s.session.events.find((e) => e.kind === 'tool/result') as
+      | { content?: string; truncated?: boolean }
+      | undefined
+    assert.ok(res, '要有 tool/result')
+    const bytes = Buffer.byteLength(String(res.content), 'utf8')
+    assert.equal(res.truncated, true)
+    assert.ok(bytes < 90 * 1024, `截断后 ${bytes} 字节，应回到 64KB 量级而不是原内容的 85%`)
+    assert.match(String(res.content), /省略/)
+  } finally {
+    await s.close()
+  }
+})

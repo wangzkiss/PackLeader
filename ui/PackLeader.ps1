@@ -72,6 +72,55 @@ $xaml = @'
     <Style TargetType="TextBox">
       <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
     </Style>
+    <!-- 滚动条：系统默认那条带箭头的浅色槽在深色底上太跳，整个重画（宽 10、无箭头、圆角滑块） -->
+    <Style x:Key="ThinThumb" TargetType="Thumb">
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Thumb">
+            <Border x:Name="bd" Background="#333A46" CornerRadius="4" Margin="2"/>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bd" Property="Background" Value="#4B5563"/>
+              </Trigger>
+              <Trigger Property="IsDragging" Value="True">
+                <Setter TargetName="bd" Property="Background" Value="#5B6675"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style TargetType="ScrollBar">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Width" Value="10"/>
+      <Setter Property="MinWidth" Value="10"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ScrollBar">
+            <Grid Background="Transparent">
+              <Track x:Name="PART_Track" IsDirectionReversed="True">
+                <Track.DecreaseRepeatButton>
+                  <RepeatButton Command="ScrollBar.PageUpCommand" Opacity="0" Focusable="False"/>
+                </Track.DecreaseRepeatButton>
+                <Track.Thumb>
+                  <Thumb Style="{StaticResource ThinThumb}"/>
+                </Track.Thumb>
+                <Track.IncreaseRepeatButton>
+                  <RepeatButton Command="ScrollBar.PageDownCommand" Opacity="0" Focusable="False"/>
+                </Track.IncreaseRepeatButton>
+              </Track>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="Orientation" Value="Horizontal">
+                <Setter Property="Width" Value="Auto"/>
+                <Setter Property="Height" Value="10"/>
+                <Setter TargetName="PART_Track" Property="IsDirectionReversed" Value="False"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
   </Window.Resources>
   <Grid>
     <Grid.ColumnDefinitions>
@@ -132,31 +181,6 @@ $xaml = @'
           </StackPanel>
         </ScrollViewer>
 
-        <!-- 底部：工作目录 + 权限 -->
-        <Border Grid.Row="3" BorderBrush="#12FFFFFF" BorderThickness="0,1,0,0" Padding="12,10">
-          <StackPanel>
-            <DockPanel>
-              <TextBlock Text="工作目录" Foreground="#6B7280" FontSize="10.5" DockPanel.Dock="Left" VerticalAlignment="Center"/>
-              <Button x:Name="PickFolderBtn" Content="换" DockPanel.Dock="Right" Cursor="Hand" FontSize="10.5"
-                      Padding="6,1" Height="20" Background="Transparent" Foreground="#ADB2B8"
-                      BorderBrush="#1FFFFFFF" BorderThickness="1"/>
-              <TextBlock x:Name="WorkspaceLabel" Text="" Foreground="#ADB2B8" FontSize="11"
-                         Margin="8,0,6,0" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
-                         TextWrapping="NoWrap"/>
-            </DockPanel>
-            <DockPanel Margin="0,8,0,0">
-              <TextBlock Text="权限" Foreground="#6B7280" FontSize="10.5" DockPanel.Dock="Left" VerticalAlignment="Center"/>
-              <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-                <Button x:Name="ModeRead" Content="只读" Cursor="Hand" FontSize="10.5" Padding="7,1" Height="20"
-                        Background="Transparent" Foreground="#ADB2B8" BorderThickness="0"/>
-                <Button x:Name="ModeGuard" Content="询问" Cursor="Hand" FontSize="10.5" Padding="7,1" Height="20" Margin="2,0"
-                        Background="Transparent" Foreground="#ADB2B8" BorderThickness="0"/>
-                <Button x:Name="ModeFull" Content="完全" Cursor="Hand" FontSize="10.5" Padding="7,1" Height="20"
-                        Background="Transparent" Foreground="#ADB2B8" BorderThickness="0"/>
-              </StackPanel>
-            </DockPanel>
-          </StackPanel>
-        </Border>
       </Grid>
     </Border>
 
@@ -180,12 +204,7 @@ $xaml = @'
           <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" HorizontalAlignment="Right" VerticalAlignment="Center">
             <Button x:Name="SettingsBtn" Content="设置" Height="24" Padding="8,0" Cursor="Hand" FontSize="11"
                     Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF" BorderThickness="1"
-                    Margin="0,0,10,0" ToolTip="填写模型端点地址和 API Key"/>
-            <TextBlock Text="模型" Foreground="#6B7280" FontSize="10.5" VerticalAlignment="Center" Margin="0,0,6,0"/>
-            <Border Background="#16181D" BorderBrush="#12FFFFFF" BorderThickness="1" CornerRadius="6" Padding="8,3">
-              <TextBox x:Name="ModelBox" Width="132" Background="Transparent" Foreground="#CFD3D6" BorderThickness="0"
-                       FontFamily="Cascadia Mono, Consolas" FontSize="11.5" VerticalContentAlignment="Center"/>
-            </Border>
+                    ToolTip="填写模型端点地址和 API Key"/>
           </StackPanel>
         </DockPanel>
       </Border>
@@ -208,17 +227,37 @@ $xaml = @'
               <Button x:Name="AttachBtn" DockPanel.Dock="Left" Content="+ 附件" Height="26" Padding="9,0"
                       Cursor="Hand" FontSize="11.5" Margin="0,0,10,0"
                       Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF" BorderThickness="1"/>
-              <TextBlock x:Name="Hint" DockPanel.Dock="Left" Text="Enter 发送 · Shift+Enter 换行 · 也可以直接拖文件进来"
-                         Foreground="#5B626D" FontSize="10.5" VerticalAlignment="Center"/>
+              <Button x:Name="PickFolderBtn" DockPanel.Dock="Left" Content="目录" Height="26" Padding="9,0"
+                      Cursor="Hand" FontSize="11" Margin="0,0,10,0" MaxWidth="240"
+                      Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF" BorderThickness="1"
+                      ToolTip="切换工作目录"/>
+              <!-- 模型和权限都放在输入框下面这条：发消息时就在手边，不用再往左上角去找 -->
               <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" HorizontalAlignment="Right">
                 <TextBlock x:Name="UsageText" Text="" Foreground="#5B626D" FontSize="10.5"
-                           VerticalAlignment="Center" Margin="0,0,10,0"/>
+                           VerticalAlignment="Center" Margin="0,0,8,0"/>
+                <Button x:Name="ModelPill" Content="模型" Height="26" Padding="9,0" Cursor="Hand" FontSize="11"
+                        FontFamily="Cascadia Mono, Consolas" Background="#16181D" Foreground="#ADB2B8"
+                        BorderBrush="#1FFFFFFF" BorderThickness="1" ToolTip="切换模型" Margin="0,0,8,0"/>
+                <Border Background="#16181D" BorderBrush="#1FFFFFFF" BorderThickness="1" CornerRadius="6"
+                        Padding="2,0" Margin="0,0,10,0">
+                  <StackPanel Orientation="Horizontal">
+                    <Button x:Name="ModeRead" Content="只读" Cursor="Hand" FontSize="10.5" Padding="7,2" Height="22"
+                            Background="Transparent" Foreground="#ADB2B8" BorderThickness="0" ToolTip="只能读，改动一律拒绕"/>
+                    <Button x:Name="ModeGuard" Content="询问" Cursor="Hand" FontSize="10.5" Padding="7,2" Height="22"
+                            Background="Transparent" Foreground="#ADB2B8" BorderThickness="0" ToolTip="改文件 / 跑命令前先问你"/>
+                    <Button x:Name="ModeFull" Content="完全" Cursor="Hand" FontSize="10.5" Padding="7,2" Height="22"
+                            Background="Transparent" Foreground="#ADB2B8" BorderThickness="0" ToolTip="全部放行，不再询问"/>
+                  </StackPanel>
+                </Border>
                 <Button x:Name="StopBtn" Content="停止" Height="26" Padding="10,0" Cursor="Hand" FontSize="11.5"
                         Background="Transparent" Foreground="#F87171" BorderBrush="#66F87171" BorderThickness="1"
                         IsEnabled="False" Visibility="Collapsed"/>
                 <Button x:Name="SendBtn" Content="发送" Height="26" Padding="14,0" Cursor="Hand" FontSize="11.5"
                         FontWeight="SemiBold" Background="#2B5CFF" Foreground="White" BorderThickness="0"/>
               </StackPanel>
+              <TextBlock x:Name="Hint" DockPanel.Dock="Left" Text="Enter 发送 · Shift+Enter 换行 · Ctrl+V 贴图"
+                         Foreground="#5B626D" FontSize="10.5" VerticalAlignment="Center"
+                         TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"/>
             </DockPanel>
           </StackPanel>
         </Border>
@@ -300,6 +339,23 @@ $xaml = @'
         </StackPanel>
       </Border>
     </Grid>
+
+    <!-- 图片预览：点缩略图弹大图，点背景 / × / Esc 都能关 -->
+    <Grid x:Name="ImagePreview" Grid.ColumnSpan="2" Visibility="Collapsed" Background="#F2000000">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="*"/>
+      </Grid.RowDefinitions>
+      <DockPanel Grid.Row="0" Margin="20,14,20,0">
+        <Button x:Name="PreviewClose" DockPanel.Dock="Right" Content="×" Width="32" Height="32" Cursor="Hand"
+                FontSize="17" Background="Transparent" Foreground="#CFD3D6" BorderThickness="0"
+                ToolTip="关闭（Esc）"/>
+        <TextBlock x:Name="PreviewName" Text="" Foreground="#ADB2B8" FontSize="11.5" VerticalAlignment="Center"
+                   TextTrimming="CharacterEllipsis" TextWrapping="NoWrap" Margin="0,0,12,0"/>
+      </DockPanel>
+      <Image x:Name="PreviewImage" Grid.Row="1" Margin="20,8,20,20" Stretch="Uniform"
+             HorizontalAlignment="Center" VerticalAlignment="Center"/>
+    </Grid>
   </Grid>
 </Window>
 '@
@@ -317,12 +373,11 @@ $InputBox = $window.FindName('Input')
 $SendBtn = $window.FindName('SendBtn')
 $StopBtn = $window.FindName('StopBtn')
 $UsageText = $window.FindName('UsageText')
-$WorkspaceLabel = $window.FindName('WorkspaceLabel')
 $PickFolderBtn = $window.FindName('PickFolderBtn')
 $ModeRead = $window.FindName('ModeRead')
 $ModeGuard = $window.FindName('ModeGuard')
 $ModeFull = $window.FindName('ModeFull')
-$ModelBox = $window.FindName('ModelBox')
+$ModelPill = $window.FindName('ModelPill')
 $NewChatBtn = $window.FindName('NewChatBtn')
 $SessionList = $window.FindName('SessionList')
 $TitleText = $window.FindName('TitleText')
@@ -343,6 +398,10 @@ $ModelChips = $window.FindName('ModelChips')
 $ModelHint = $window.FindName('ModelHint')
 $AttachBtn = $window.FindName('AttachBtn')
 $AttachList = $window.FindName('AttachList')
+$ImagePreview = $window.FindName('ImagePreview')
+$PreviewImage = $window.FindName('PreviewImage')
+$PreviewName = $window.FindName('PreviewName')
+$PreviewClose = $window.FindName('PreviewClose')
 $ConfirmOverlay = $window.FindName('ConfirmOverlay')
 $ConfirmTitle = $window.FindName('ConfirmTitle')
 $ConfirmText = $window.FindName('ConfirmText')
@@ -394,15 +453,34 @@ function Add-UserMessage([string]$text, [object]$files = $null) {
     $wrap.Margin = '0,6,0,0'
     foreach ($f in $list) {
       $nm = if ($f.name) { [string]$f.name } else { [System.IO.Path]::GetFileName([string]$f) }
+      $fp = [string]$f.path
       $sz = if ($null -ne $f.bytes) { Format-FileSize ([double]$f.bytes) } else { '' }
       $b = New-Object System.Windows.Controls.Border
       $b.Background = (Brush '#1F242C')
       $b.BorderBrush = (Brush '#1FFFFFFF')
       $b.BorderThickness = '1'
       $b.CornerRadius = '6'
-      $b.Padding = '8,4,8,4'
+      $b.Padding = '6,4,8,4'
       $b.Margin = '0,0,6,6'
-      $b.Child = (New-Text $(if ($sz) { "$nm · $sz" } else { $nm }) 10.5 '#9AA1AC')
+      # 发出去的图片也留个缩略图（用数据目录里那份拷贝，原文件删了也还在）
+      if ($fp -and (Test-ImagePath $fp)) {
+        $box = New-Object System.Windows.Controls.StackPanel
+        $box.Orientation = 'Horizontal'
+        $thumb = New-ImageThumb $fp 40
+        if ($thumb) { $box.Children.Add($thumb) | Out-Null }
+        $meta = New-Object System.Windows.Controls.StackPanel
+        $meta.VerticalAlignment = 'Center'
+        $nTb = New-Text $nm 10.5 '#9AA1AC' 'Normal' 'Segoe UI' 0
+        $nTb.MaxWidth = 200
+        $nTb.TextTrimming = 'CharacterEllipsis'
+        $nTb.TextWrapping = 'NoWrap'
+        $meta.Children.Add($nTb) | Out-Null
+        if ($sz) { $meta.Children.Add((New-Text $sz 9.5 '#6B7280' 'Normal' 'Segoe UI' 1)) | Out-Null }
+        $box.Children.Add($meta) | Out-Null
+        $b.Child = $box
+      } else {
+        $b.Child = (New-Text $(if ($sz) { "$nm · $sz" } else { $nm }) 10.5 '#9AA1AC')
+      }
       $wrap.Children.Add($b) | Out-Null
     }
     $sp.Children.Add($wrap) | Out-Null
@@ -521,7 +599,9 @@ function Add-ReasoningBlock {
     Head = $head; Body = $body; Border = $outer
     Chars = 0; T0 = (Get-Date); Open = $true; Done = $false; Secs = 0
   }
-  $head.Add_MouseLeftButtonUp({ Toggle-Reasoning $node }.GetNewClosure())
+  # 节点挂在标题自己的 Tag 上：PS 5.1 下这个事件里的 GetNewClosure 拿不到 $node，点了会抛异常
+  $head.Tag = $node
+  $head.Add_MouseLeftButtonUp({ param($s, $e) Toggle-Reasoning $s.Tag })
   $script:reasonNode = $node
   return $node
 }
@@ -534,7 +614,7 @@ function Complete-Reasoning {
   $n.Open = $false
   $n.Body.Visibility = 'Collapsed'
   Update-ReasoningHeader $n
-  # 只解绑"当前"，节点本身还在界面上（点标题仍能展开），toggle 用的是闭包里的 $node
+  # 只解绑"当前"，节点本身还在界面上（点标题仍能展开），toggle 用的是节点 Tag 上的那一份
   $script:reasonNode = $null
 }
 
@@ -722,17 +802,23 @@ function Add-ApprovalCard($e) {
   $no.BorderBrush = (Brush '#26FFFFFF')
   $no.BorderThickness = '1'
 
-  $reqId = $e.reqId
+  # reqId 挂在按钮 Tag 上，别靠 GetNewClosure：PS 5.1 下闭包在这里拿不到 $reqId，
+  # 点「允许一次」会发出 reqId=null，host 那边对不上号，审批就一直悬着
+  $reqId = [string]$e.reqId
+  $yes.Tag = $reqId
   $yes.Add_Click({
-    Send-Host @{ cmd = 'approve'; reqId = $reqId; allowed = $true }
-    $btns.IsEnabled = $false
-    $yes.Content = '已允许'
-  }.GetNewClosure())
+    param($s, $e)
+    Send-Host @{ cmd = 'approve'; reqId = [string]$s.Tag; allowed = $true }
+    $s.Parent.IsEnabled = $false
+    $s.Content = '已允许'
+  })
+  $no.Tag = $reqId
   $no.Add_Click({
-    Send-Host @{ cmd = 'approve'; reqId = $reqId; allowed = $false }
-    $btns.IsEnabled = $false
-    $no.Content = '已拒绝'
-  }.GetNewClosure())
+    param($s, $e)
+    Send-Host @{ cmd = 'approve'; reqId = [string]$s.Tag; allowed = $false }
+    $s.Parent.IsEnabled = $false
+    $s.Content = '已拒绝'
+  })
 
   $btns.Children.Add($yes) | Out-Null
   $btns.Children.Add($no) | Out-Null
@@ -808,31 +894,40 @@ function Set-Sessions($items) {
     [System.Windows.Controls.Grid]::SetColumn($del, 1)
     $grid.Children.Add($del) | Out-Null
 
+    # 这一行的 id / 标题 / 删除按钮全挂在 $row.Tag 上，回调从 $s.Tag 取：
+    # PS 5.1 下这些事件里的 GetNewClosure 拿不到外部变量（实测出去的 id 是 null，
+    # host 回「非法会话 id」；点行切会话、hover 判断选中行也是同一个毛病）
+    $row.Tag = @{ id = $sid; title = $stitle; del = $del }
+    $del.Tag = $row.Tag
     $del.Add_Click({
       param($s, $ev)
       $ev.Handled = $true
-      Show-Confirm -title "删除会话「$stitle」？" `
+      Show-Confirm -title ('删除会话「' + $s.Tag.title + '」？') `
                    -text "会删掉它的会话日志和 checkpoint，不能恢复。会话里的附件文件也会一起删。" `
                    -yesText '删除' `
-                   -onYes { Send-Host @{ cmd = 'delete-session'; id = $sid } }.GetNewClosure()
-    }.GetNewClosure())
-    $del.Add_MouseEnter({ $this.Foreground = (Brush '#F87171') }.GetNewClosure())
-    $del.Add_MouseLeave({ $this.Foreground = (Brush '#6B7280') }.GetNewClosure())
+                   -onYes { param($targetId) Send-Host @{ cmd = 'delete-session'; id = $targetId } } `
+                   -arg $s.Tag.id
+    })
+    $del.Add_MouseEnter({ param($s, $e) $s.Foreground = (Brush '#F87171') })
+    $del.Add_MouseLeave({ param($s, $e) $s.Foreground = (Brush '#6B7280') })
 
     $row.Child = $grid
 
     $row.Add_MouseLeftButtonUp({
-      Send-Host @{ cmd = 'load-session'; id = $sid }
-    }.GetNewClosure())
+      param($s, $e)
+      Send-Host @{ cmd = 'load-session'; id = [string]$s.Tag.id }
+    })
     $row.Add_MouseEnter({
-      $this.Background = (Brush '#1B1F27')
-      $del.Visibility = 'Visible'
-    }.GetNewClosure())
+      param($s, $e)
+      $s.Background = (Brush '#1B1F27')
+      $s.Tag.del.Visibility = 'Visible'
+    })
     $row.Add_MouseLeave({
-      $del.Visibility = 'Hidden'
-      if ($sid -eq [string]$script:sessionId) { $this.Background = (Brush '#20242E') }
-      else { $this.Background = [System.Windows.Media.Brushes]::Transparent }
-    }.GetNewClosure())
+      param($s, $e)
+      $s.Tag.del.Visibility = 'Hidden'
+      if ($s.Tag.id -eq [string]$script:sessionId) { $s.Background = (Brush '#20242E') }
+      else { $s.Background = [System.Windows.Media.Brushes]::Transparent }
+    })
 
     $SessionList.Children.Add($row) | Out-Null
   }
@@ -865,7 +960,8 @@ function Add-EmptyState {
     $b.Foreground = (Brush '#CFD3D6')
     $b.BorderBrush = (Brush '#1FFFFFFF')
     $b.BorderThickness = '1'
-    $b.Add_Click({ Start-Turn $ex }.GetNewClosure())
+    $b.Tag = [string]$ex
+    $b.Add_Click({ param($s, $e) Start-Turn ([string]$s.Tag) })
     $sp.Children.Add($b) | Out-Null
   }
   $Transcript.Children.Add($sp) | Out-Null
@@ -978,6 +1074,11 @@ $script:toolRows = @{}
 $script:verifyRows = @{}
 $script:tickSeen = $false
 $script:modelName = $Model
+$script:modelChoices = @()
+$script:cwdPath = ''
+$script:modelPopup = $null
+$script:flatTpl = $null
+$script:fetching = $false
 $script:sessionId = ''
 $script:hostGone = $false
 $script:history = New-Object System.Collections.ArrayList
@@ -994,11 +1095,14 @@ $script:hasKey = $true
 $script:confirmRun = $null
 
 function Show-Confirm {
-  param([string]$title, [string]$text, [string]$yesText = '确定', [scriptblock]$onYes)
+  # $arg 是给回调的实参：不靠 GetNewClosure 隐式捕获，PowerShell 5.1 下那个写法不可靠
+  # （见下面删除按钮处的注释）
+  param([string]$title, [string]$text, [string]$yesText = '确定', [scriptblock]$onYes, [object]$arg)
   $ConfirmTitle.Text = $title
   $ConfirmText.Text = $text
   $ConfirmYes.Content = $yesText
   $script:confirmRun = $onYes
+  $script:confirmArg = $arg
   $ConfirmOverlay.Visibility = 'Visible'
   $ConfirmYes.Focus() | Out-Null
 }
@@ -1006,13 +1110,15 @@ function Show-Confirm {
 function Hide-Confirm {
   $ConfirmOverlay.Visibility = 'Collapsed'
   $script:confirmRun = $null
+  $script:confirmArg = $null
 }
 
 $ConfirmNo.Add_Click({ Hide-Confirm })
 $ConfirmYes.Add_Click({
   $run = $script:confirmRun
+  $arg = $script:confirmArg
   Hide-Confirm
-  if ($run) { & $run }
+  if ($run) { & $run $arg }
 })
 
 # ---------------------------------------------------------------- 附件
@@ -1022,6 +1128,216 @@ function Format-FileSize([double]$n) {
   if ($n -lt 1024) { return "$([int]$n) B" }
   if ($n -lt 1048576) { return "$([math]::Round($n / 1024)) KB" }
   return "$([math]::Round($n / 1048576, 1)) MB"
+}
+
+# ---------------- 图片预览 ----------------
+function Show-ImagePreview([string]$path) {
+  if (-not $path) { return }
+  try {
+    $bytes = [System.IO.File]::ReadAllBytes($path)
+    $ms = [System.IO.MemoryStream]::new($bytes)
+    $bi = New-Object System.Windows.Media.Imaging.BitmapImage
+    $bi.BeginInit()
+    $bi.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+    $bi.StreamSource = $ms
+    $bi.EndInit()
+    $PreviewImage.Source = $bi
+    # 按窗口现尺寸算最大边，别让图顶到标题栏或两边
+    $PreviewImage.MaxWidth = [math]::Max(320, $window.ActualWidth - 40)
+    $PreviewImage.MaxHeight = [math]::Max(240, $window.ActualHeight - 120)
+    $PreviewName.Text = ('{0}  ·  {1} × {2}  ·  {3}' -f [System.IO.Path]::GetFileName($path), $bi.PixelWidth, $bi.PixelHeight, (Format-FileSize ([int64]$bytes.Length)))
+    $ImagePreview.Visibility = 'Visible'
+  } catch {
+    Log ('预览失败（' + $path + '）: ' + ($_ | Out-String))
+    Add-SystemLine ('打不开这张图：' + [System.IO.Path]::GetFileName($path)) '#F87171'
+  }
+}
+
+function Hide-ImagePreview {
+  $ImagePreview.Visibility = 'Collapsed'
+  $PreviewImage.Source = $null
+}
+
+# ---------------- 模型切换（底部那颗按钮 + 弹出菜单） ----------------
+function Update-ModelPill([string]$name) {
+  $t = $name
+  if (-not $t) { $t = '模型' }
+  $short = $t
+  if ($short.Length -gt 26) { $short = $short.Substring(0, 25) + '…' }
+  $ModelPill.Content = $short
+  $ModelPill.ToolTip = $(if ($name) { '当前模型：' + $name + '（点一下切换）' } else { '切换模型' })
+}
+
+# 工作目录按钮：只放最后两段目录名，完整路径放 ToolTip（中间那条工具栏位置有限）
+function Update-CwdPill([string]$path) {
+  $script:cwdPath = [string]$path
+  $label = '目录'
+  if ($path) {
+    $trimmed = ([string]$path).TrimEnd([char]92, [char]47)
+    $leaf = [System.IO.Path]::GetFileName($trimmed)
+    if (-not $leaf) { $leaf = $trimmed }
+    $parent = [System.IO.Path]::GetFileName([System.IO.Path]::GetDirectoryName($trimmed))
+    $label = $(if ($parent) { [System.IO.Path]::Combine($parent, $leaf) } else { $leaf })
+    if ($label.Length -gt 26) { $label = '…' + $label.Substring($label.Length - 25) }
+  }
+  $PickFolderBtn.Content = $label
+  $PickFolderBtn.ToolTip = $(if ($path) { '工作目录：' + $path + '（点一下换）' } else { '选择工作目录' })
+}
+
+# 下拉菜单自己画：ContextMenu 的 MenuItem 是系统模板（白底、蓝高亮），深色界面上太跳
+function New-FlatTemplate {
+  if ($script:flatTpl) { return $script:flatTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="6" Padding="{TemplateBinding Padding}">
+    <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#242A34"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#2C333F"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:flatTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:flatTpl
+}
+
+function New-MenuRow([string]$text, [string]$mark) {
+  $b = New-Object System.Windows.Controls.Button
+  $b.Padding = '10,7'
+  $b.HorizontalContentAlignment = 'Left'
+  $b.Cursor = 'Hand'
+  $b.FontSize = 11.5
+  $b.FontFamily = 'Cascadia Mono, Consolas'
+  $b.Foreground = (Brush '#CFD3D6')
+  $b.Background = [System.Windows.Media.Brushes]::Transparent
+  $b.BorderThickness = '0'
+  $b.Template = (New-FlatTemplate)
+  $inner = New-Object System.Windows.Controls.DockPanel
+  $mk = New-Object System.Windows.Controls.TextBlock
+  $mk.Text = $mark
+  $mk.Width = 16
+  $mk.Foreground = (Brush '#8AB4FF')
+  $mk.FontFamily = 'Segoe UI'
+  $mk.VerticalAlignment = 'Center'
+  [System.Windows.Controls.DockPanel]::SetDock($mk, 'Left')
+  $inner.Children.Add($mk) | Out-Null
+  $tb = New-Object System.Windows.Controls.TextBlock
+  $tb.Text = $text
+  $tb.TextTrimming = 'CharacterEllipsis'
+  $tb.TextWrapping = 'NoWrap'
+  $tb.VerticalAlignment = 'Center'
+  $inner.Children.Add($tb) | Out-Null
+  $b.Content = $inner
+  return $b
+}
+
+function Show-ModelMenu([object]$anchor) {
+  if ($script:modelPopup) { $script:modelPopup.IsOpen = $false }
+  $box = New-Object System.Windows.Controls.Border
+  $box.Background = (Brush '#1B1F27')
+  $box.BorderBrush = (Brush '#33FFFFFF')
+  $box.BorderThickness = '1'
+  $box.CornerRadius = '8'
+  $box.Padding = '4'
+  $box.MinWidth = 240
+  $box.MaxWidth = 460
+  $col = New-Object System.Windows.Controls.StackPanel
+
+  $list = @($script:modelChoices)
+  if ($list.Count -eq 0 -and $script:modelName) { $list = @($script:modelName) }
+  foreach ($m in $list) {
+    $isCur = ([string]$m -eq [string]$script:modelName)
+    $row = New-MenuRow ([string]$m) $(if ($isCur) { '✓' } else { '' })
+    $row.Tag = [string]$m
+    $row.Add_Click({
+      param($s, $e)
+      if ($script:modelPopup) { $script:modelPopup.IsOpen = $false }
+      Send-Host @{ cmd = 'model'; model = [string]$s.Tag }
+    })
+    $col.Children.Add($row) | Out-Null
+  }
+  if ($list.Count -eq 0) {
+    $col.Children.Add((New-MenuRow '还没有模型列表，先去设置里拉一次' '')) | Out-Null
+  }
+
+  $sep = New-Object System.Windows.Controls.Border
+  $sep.Height = '1'
+  $sep.Margin = '6,4,6,4'
+  $sep.Background = (Brush '#1FFFFFFF')
+  $col.Children.Add($sep) | Out-Null
+
+  $cfg = New-MenuRow '在设置里换端点 / 拉取模型…' ''
+  $cfg.Foreground = (Brush '#8AB4FF')
+  $cfg.FontFamily = 'Segoe UI'
+  $cfg.Add_Click({
+    if ($script:modelPopup) { $script:modelPopup.IsOpen = $false }
+    Open-Settings
+  })
+  $col.Children.Add($cfg) | Out-Null
+
+  $box.Child = $col
+  $pop = New-Object System.Windows.Controls.Primitives.Popup
+  $pop.PlacementTarget = $anchor
+  $pop.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Top
+  $pop.VerticalOffset = -6
+  $pop.StaysOpen = $false
+  $pop.AllowsTransparency = $true
+  $pop.Child = $box
+  $script:modelPopup = $pop
+  $pop.IsOpen = $true
+}
+
+# 扩展名判断图片：和 src/core/attach.ts 里的 IMAGE_EXT 对齐
+function Test-ImagePath([string]$path) {
+  $ext = [System.IO.Path]::GetExtension($path).ToLowerInvariant()
+  return @('.png', '.jpg', '.jpeg', '.webp', '.gif') -contains $ext
+}
+
+# 缩略图：DecodePixelHeight 只解到 120px 高，几百 MB 的截图也不会把整张读进内存。
+# 坑：必须先设 CacheOption=OnLoad 再给 StreamSource，EndInit 时才会真的解码；
+# 顺序反过来（先给流、再设 OnLoad）会变成延迟解码，流一关就解不出来，
+# 最后 Image 的宽是 0——附件条上只剩文件名，缩略图根本不显示（实测）。
+# 用 MemoryStream 而非 FileStream：不占文件句柄，用户的原图随时能删能改。
+function New-ImageThumb([string]$path, [double]$h = 40) {
+  try {
+    $ms = [System.IO.MemoryStream]::new([System.IO.File]::ReadAllBytes($path))
+    $bi = New-Object System.Windows.Media.Imaging.BitmapImage
+    $bi.BeginInit()
+    $bi.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+    $bi.DecodePixelHeight = 120
+    $bi.StreamSource = $ms
+    $bi.EndInit()
+    $img = New-Object System.Windows.Controls.Image
+    $img.Source = $bi
+    $img.Height = $h
+    $img.MaxWidth = 160
+    $img.Stretch = 'Uniform'
+    # 缩略图包一层无边框按钮：Image 本身不参与 UIA 的 Invoke，包成按钮既好点也好测
+    $btn = New-Object System.Windows.Controls.Button
+    $btn.Content = $img
+    $btn.Padding = '0'
+    $btn.Margin = '0,0,7,0'
+    $btn.BorderThickness = '0'
+    $btn.Background = [System.Windows.Media.Brushes]::Transparent
+    $btn.VerticalAlignment = 'Center'
+    $btn.Cursor = 'Hand'
+    $btn.ToolTip = '点开看大图'
+    $btn.Tag = $path
+    $btn.Add_Click({
+      param($s, $e)
+      $e.Handled = $true
+      Show-ImagePreview ([string]$s.Tag)
+    })
+    return $btn
+  } catch {
+    Log ("缩略图生成失败（$path）: " + ($_ | Out-String))
+    return $null
+  }
 }
 
 function Update-AttachList {
@@ -1039,14 +1355,25 @@ function Update-AttachList {
     $b.BorderBrush = (Brush '#1FFFFFFF')
     $b.BorderThickness = '1'
     $b.CornerRadius = '6'
-    $b.Padding = '8,4,5,4'
+    $b.Padding = '6,4,5,4'
     $b.Margin = '0,0,6,6'
     $sp = New-Object System.Windows.Controls.StackPanel
     $sp.Orientation = 'Horizontal'
+    # 图片给缩略图：粘完截图要能一眼看出贴的是哪张，只给个文件名等于没预览
+    if (Test-ImagePath $f) {
+      $thumb = New-ImageThumb $f 40
+      if ($thumb) { $sp.Children.Add($thumb) | Out-Null }
+    }
+    $txt = New-Object System.Windows.Controls.StackPanel
+    $txt.VerticalAlignment = 'Center'
     $name = [System.IO.Path]::GetFileName($f)
-    $label = New-Text -text ("{0} · {1}" -f $name, (Format-FileSize $size)) -size 10.5 -color '#CFD3D6'
-    $label.VerticalAlignment = 'Center'
-    $sp.Children.Add($label) | Out-Null
+    $nameTb = New-Text $name 10.5 '#CFD3D6' 'Normal' 'Segoe UI' 0
+    $nameTb.MaxWidth = 200
+    $nameTb.TextTrimming = 'CharacterEllipsis'
+    $nameTb.TextWrapping = 'NoWrap'
+    $txt.Children.Add($nameTb) | Out-Null
+    $txt.Children.Add((New-Text (Format-FileSize $size) 9.5 '#7C838E' 'Normal' 'Segoe UI' 1)) | Out-Null
+    $sp.Children.Add($txt) | Out-Null
     $x = New-Object System.Windows.Controls.Button
     $x.Content = '×'
     $x.Width = 16
@@ -1059,7 +1386,14 @@ function Update-AttachList {
     $x.Foreground = (Brush '#7C838E')
     $x.VerticalAlignment = 'Center'
     $x.ToolTip = '移除'
-    $x.Add_Click({ $script:attachFiles.Remove($f); Update-AttachList }.GetNewClosure())
+    # 路径挂在按钮自己的 Tag 上：PS 5.1 下这里用 GetNewClosure 拿到的 $f 是 null，
+    # 点 × 就抛「不能对 Null 值表达式调用方法」把整个窗口带崩（实测）
+    $x.Tag = $f
+    $x.Add_Click({
+      param($s, $e)
+      [void]$script:attachFiles.Remove([string]$s.Tag)
+      Update-AttachList
+    })
     $sp.Children.Add($x) | Out-Null
     $b.Child = $sp
     $AttachList.Children.Add($b) | Out-Null
@@ -1085,10 +1419,50 @@ $AttachBtn.Add_Click({
   if ($dlg.ShowDialog()) { Add-Attachments $dlg.FileNames }
 })
 
+# 粘贴：Clipboard 里是图片或文件时收成附件。
+# WPF 的 TextBox 只认文本格式，截图/文件在它眼里“没东西可粘”——Ctrl+V 毫无反应，也不报错。
+# 所以自己在 PreviewKeyDown 里看一眼剪贴板，当成附件收下，再吃掉这次按键。
+function Save-ClipboardImage {
+  $img = $null
+  try { $img = [System.Windows.Clipboard]::GetImage() } catch { return $null }
+  if (-not $img) { return $null }
+  # 落成临时 png：附件入库是按文件路径拷的，剪贴板里的位图没路径
+  $dir = Join-Path $env:TEMP 'packleader-paste'
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  $path = Join-Path $dir ('paste-{0}.png' -f (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+  $enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
+  $enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($img)) | Out-Null
+  $fs = [System.IO.File]::Create($path)
+  try { $enc.Save($fs) } finally { $fs.Close() }
+  return $path
+}
+
+$InputBox.Add_PreviewKeyDown({
+  param($s, $e)
+  if ($e.Key -ne [System.Windows.Input.Key]::V) { return }
+  if (([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Control) -eq 0) { return }
+  $added = $false
+  try {
+    if ([System.Windows.Clipboard]::ContainsFileDropList()) {
+      # 在资源管理器里 Ctrl+C 一个文件：剪贴板同时有文件名文本和文件列表，按附件走才对
+      $paths = [System.Windows.Clipboard]::GetFileDropList()
+      if ($paths -and $paths.Count -gt 0) { Add-Attachments @($paths); $added = $true }
+    } elseif ([System.Windows.Clipboard]::ContainsImage()) {
+      # 截图（Win+Shift+S、QQ/微信截图…）只有位图没有文件，存成临时 png 再当附件
+      $imgPath = Save-ClipboardImage
+      if ($imgPath) { Add-Attachments @($imgPath); $added = $true }
+    }
+  } catch {
+    Log ("粘贴附件失败: " + ($_ | Out-String))
+  }
+  # 收进附件就吃掉这次粘贴，别让 TextBox 再插一段文件路径文本
+  if ($added) { $e.Handled = $true }
+})
+
 # 拖拽：TextBox 自己会吞掉 Drop，所以把它的 AllowDrop 关掉，统一由窗口收
 $window.AllowDrop = $true
 $InputBox.AllowDrop = $false
-$InputBox.Add_DragOver({ param($s, $e) if ($e.Data -and $e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) { $e.Effects = 'Copy' } }.GetNewClosure())
+$InputBox.Add_DragOver({ param($s, $e) if ($e.Data -and $e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) { $e.Effects = 'Copy' } })
 $window.Add_DragOver({ param($s, $e) if ($e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) { $e.Effects = 'Copy'; $e.Handled = $true } })
 $window.Add_Drop({
   param($s, $e)
@@ -1194,8 +1568,8 @@ function Handle-Event([string]$line) {
       $script:verifyCmd = [string]$e.verify
       $script:visionOn = [bool]$e.vision
       $script:hasKey = [bool]$e.hasKey
-      $WorkspaceLabel.Text = [string]$e.cwd
-      $ModelBox.Text = [string]$e.model
+      Update-CwdPill ([string]$e.cwd)
+      Update-ModelPill ([string]$e.model)
       $TitleText.Text = $(if ($e.title -and $e.title -ne '(empty)') { [string]$e.title } else { '新对话' })
       $SubTitle.Text = [string]$e.mode
       Set-ModeVisual ([string]$e.mode)
@@ -1334,6 +1708,12 @@ function Handle-Event([string]$line) {
     'notice' { Add-SystemLine ([string]$e.text) '#9BA3B4' }
     'error' {
       Add-SystemLine ("错误：" + $e.message) '#F87171'
+      # 拉模型失败也要在设置面板里现形，别一直停在「拉取中…」
+      if ($script:fetching) {
+        $script:fetching = $false
+        $ModelHint.Foreground = (Brush '#F87171')
+        $ModelHint.Text = [string]$e.message
+      }
       if ($e.needsSetup) { Open-Settings }
       if ($e.fatal) { Set-Busy $false }
     }
@@ -1344,14 +1724,17 @@ function Handle-Event([string]$line) {
       if ($null -ne $e.vision) { $script:visionOn = [bool]$e.vision }
       $script:modelName = [string]$e.model
       $script:hasKey = $true
-      $ModelBox.Text = [string]$e.model
+      Update-ModelPill ([string]$e.model)
       Close-Settings
       Add-SystemLine ("已切换模型：" + $e.model + " @ " + $e.baseURL) '#4ADE80'
     }
     'models' {
+      $script:fetching = $false
       # 端点里真实存在的模型：点一个就填进「模型名」
       $ModelChips.Children.Clear()
       $items = @($e.items)
+      # 底部模型菜单用同一份列表
+      $script:modelChoices = @($items)
       if ($items.Count -eq 0) {
         $ModelHint.Foreground = (Brush '#F87171')
         $ModelHint.Text = '端点没返回任何模型（检查地址要不要带 /v1）'
@@ -1371,8 +1754,8 @@ function Handle-Event([string]$line) {
           $btn.BorderBrush = (Brush '#1FFFFFFF')
           $btn.Background = (Brush '#1A1D24')
           $btn.Foreground = (Brush '#CFD3D6')
-          $modelId = [string]$id
-          $btn.Add_Click({ $CfgModel.Text = $modelId }.GetNewClosure())
+          $btn.Tag = [string]$id
+          $btn.Add_Click({ param($s, $e) $CfgModel.Text = [string]$s.Tag })
           $ModelChips.Children.Add($btn) | Out-Null
         }
       }
@@ -1398,9 +1781,9 @@ function Handle-Event([string]$line) {
     }
     'sessions' { Set-Sessions $e.items }
     'mode' { Set-ModeVisual ([string]$e.mode); $SubTitle.Text = [string]$e.mode }
-    'model' { $script:modelName = [string]$e.model; $ModelBox.Text = [string]$e.model }
+    'model' { $script:modelName = [string]$e.model; Update-ModelPill ([string]$e.model) }
     'cwd' {
-      $WorkspaceLabel.Text = [string]$e.cwd
+      Update-CwdPill ([string]$e.cwd)
       # 记住上次用的目录：下次双击启动直接从这里开始，不用每次都换
       try {
         $stateDir = Join-Path $env:LOCALAPPDATA 'PackLeader'
@@ -1426,6 +1809,7 @@ $CfgFetch.Add_Click({
   $ModelChips.Visibility = 'Collapsed'
   $ModelHint.Foreground = (Brush '#7C838E')
   $ModelHint.Text = '拉取中…'
+  $script:fetching = $true
   Send-Host @{ cmd = 'list-models'; baseURL = $CfgUrl.Text.Trim(); apiKey = $CfgKey.Text.Trim() }
 })
 $CfgCancel.Add_Click({ Close-Settings })
@@ -1474,11 +1858,25 @@ $InputBox.Add_PreviewKeyDown({
   }
 })
 
-$ModelBox.Add_PreviewKeyDown({
+# 底部模型按钮：点开就是可选模型列表，选一个直接切
+$ModelPill.Add_Click({
   param($s, $e)
-  if ($e.Key -eq [System.Windows.Input.Key]::Return) {
+  # 还没拉过列表就先问一次；没 key 就不问，免得每点一下都往对话里塞一条错误
+  if ($script:modelChoices.Count -eq 0 -and $script:hasKey) {
+    Send-Host @{ cmd = 'list-models'; baseURL = $script:cfgBaseURL }
+  }
+  Show-ModelMenu $s
+})
+
+# 图片预览：× / 点背景 / Esc 都能关
+$PreviewClose.Add_Click({ Hide-ImagePreview })
+$ImagePreview.Add_MouseLeftButtonUp({ Hide-ImagePreview })
+$PreviewImage.Add_MouseLeftButtonUp({ param($s, $e) $e.Handled = $true })
+$window.Add_PreviewKeyDown({
+  param($s, $e)
+  if ($e.Key -eq [System.Windows.Input.Key]::Escape -and $ImagePreview.Visibility -eq 'Visible') {
     $e.Handled = $true
-    Send-Host @{ cmd = 'model'; model = $ModelBox.Text }
+    Hide-ImagePreview
   }
 })
 
@@ -1490,20 +1888,22 @@ $NewChatBtn.Add_Click({
 })
 
 foreach ($pair in @(@('read-only', $ModeRead), @('guarded', $ModeGuard), @('full', $ModeFull))) {
-  $m = $pair[0]
+  $pair[1].Tag = [string]$pair[0]
   $pair[1].Add_Click({
+    param($s, $e)
+    $m = [string]$s.Tag
     Set-ModeVisual $m
     Send-Host @{ cmd = 'mode'; mode = $m }
-  }.GetNewClosure())
+  })
 }
 
 $PickFolderBtn.Add_Click({
   $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
   $dlg.Description = '选择工作目录'
-  $dlg.SelectedPath = $WorkspaceLabel.Text
+  $dlg.SelectedPath = $(if ($script:cwdPath) { $script:cwdPath } else { $env:USERPROFILE })
   $dlg.ShowNewFolderButton = $false
   if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-    Send-Host @{ cmd = 'cwd'; cwd = $dlg.SelectedPath }
+    Send-Host @{ cmd = 'cwd'; dir = $dlg.SelectedPath }
   }
 })
 
@@ -1557,8 +1957,8 @@ $window.Add_Loaded({
     [void][PL.Dwm]::DwmSetWindowAttribute($h, 20, [ref]$on, 4)
     [void][PL.Dwm]::DwmSetWindowAttribute($h, 19, [ref]$on, 4)
   } catch { Log ("深色标题栏失败: " + ($_ | Out-String)) }
-  $WorkspaceLabel.Text = $Cwd
-  $ModelBox.Text = $Model
+  Update-CwdPill $Cwd
+  Update-ModelPill ([string]$Model)
   Set-ModeVisual $Mode
   $SubTitle.Text = $Mode
   Clear-Transcript

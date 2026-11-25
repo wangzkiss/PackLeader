@@ -154,7 +154,7 @@ async function main(): Promise<void> {
   const { Audit: AuditClass } = await import('./core/audit.ts')
   const audit: Audit = await AuditClass.open(join(opts.dataDir, 'audit.sqlite'))
   const checkpoints = new Checkpoints(join(opts.dataDir, 'ckpt'))
-  const tools = createDefaultTools({ root: opts.root })
+  let tools = createDefaultTools({ root: opts.root })
   const llm = new OpenAiClient({ baseURL: opts.baseURL, apiKey: opts.apiKey, model: opts.model })
   const policy = new Policy(opts.root, opts.mode)
   const approver = new HostApprover()
@@ -436,8 +436,10 @@ async function main(): Promise<void> {
         }
         opts.root = dir
         policy.setRoot(dir)
-        const t = createDefaultTools({ root: dir })
-        for (const [k, v] of t) tools.set(k, v)
+        // createDefaultTools 返回的是 ToolRegistry，不是 Map。原来这里是 for..of 遍历它，
+        // 直接抛 "t is not iterable"（换目录必现）。整个换掉，再重建 agent 让它用上新工具
+        tools = createDefaultTools({ root: dir })
+        agent = buildAgent()
         send({ type: 'cwd', cwd: dir })
         break
       }

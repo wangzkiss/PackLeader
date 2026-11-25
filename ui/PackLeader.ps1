@@ -598,7 +598,18 @@ $window.Dispatcher.add_UnhandledException({
 })
 
 $Transcript = $window.FindName('Transcript')
+# 回放旧历史时要往「临时面板」里画（画完一次性插到顶部），平时就是 Transcript
+$script:renderHost = $Transcript
 $Scroller = $window.FindName('Scroller')
+# 滑到顶就自动补一批更早的记录（点顶部那一行也一样）。
+# 补的内容插在上方、视口会往下跳，Load-OlderHistory 里会补回去。
+$Scroller.Add_ScrollChanged({
+  param($s, $e)
+  if ($script:loadingOlder -or $script:replayAt -le 0) { return }
+  if ($e.VerticalOffset -gt 0.5) { return }
+  $script:loadingOlder = $true
+  try { Load-OlderHistory } finally { $script:loadingOlder = $false }
+})
 $InputBox = $window.FindName('Input')
 $SendBtn = $window.FindName('SendBtn')
 $StopBtn = $window.FindName('StopBtn')
@@ -653,8 +664,27 @@ $InputYes = $window.FindName('InputYes')
 $InputNo = $window.FindName('InputNo')
 
 # ---------------------------------------------------------------- 画东西的小工具
+# Brush / FontFamily 缓存：回放长会话要建几千个，每次都解析颜色字符串、每次新建 FontFamily 太浪费
+$script:brushCache = @{}
+$script:fontCache = @{}
+
 function Brush([string]$hex) {
-  return (New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.ColorConverter]::ConvertFromString($hex)))
+  # 缓存：回放一个长会话要建几千个 Brush，每建一个都 ColorConverter.ConvertFromString 太贵。
+  # SolidColorBrush 是 Freezable，只读共享给多个元素是安全的（本文件里没有改 Brush.Color 的地方）。
+  $b = $script:brushCache[$hex]
+  if ($b) { return $b }
+  $b = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.ColorConverter]::ConvertFromString($hex))
+  $script:brushCache[$hex] = $b
+  return $b
+}
+
+function New-Font([string]$name) {
+  # FontFamily 也缓存：回放时每个 TextBlock / Run 都要一个，重复建同样是浪费
+  $f = $script:fontCache[$name]
+  if ($f) { return $f }
+  $f = New-Object System.Windows.Media.FontFamily($name)
+  $script:fontCache[$name] = $f
+  return $f
 }
 
 function New-Text {
@@ -664,7 +694,7 @@ function New-Text {
   $tb.Text = $text
   $tb.FontSize = $size
   $tb.Foreground = (Brush $color)
-  $tb.FontFamily = (New-Object System.Windows.Media.FontFamily($font))
+  $tb.FontFamily = (New-Font $font)
   $tb.TextWrapping = 'Wrap'
   $tb.Margin = "0,0,0,$mb"
   if ($weight -eq 'SemiBold') { $tb.FontWeight = [System.Windows.FontWeights]::SemiBold }
@@ -675,7 +705,7 @@ function New-Text {
 function Add-Container([double]$mb = 14) {
   $sp = New-Object System.Windows.Controls.StackPanel
   $sp.Margin = "0,0,0,$mb"
-  $Transcript.Children.Add($sp) | Out-Null
+  $script:renderHost.Children.Add($sp) | Out-Null
   return $sp
 }
 
@@ -758,6 +788,24 @@ function New-CopyMenu([object]$box) {
   $cm.Items.Add($ma) | Out-Null
   return $cm
 }
+
+# 右键菜单改成「按需建」：回放一个长会话要上千个 ContextMenu（每个还带两个 MenuItem，
+# 还各自套自定义模板），全预建比消息内容本身还贵。这里只记下要复制的文本，
+# 右键那一刻现做一个——用户感觉不到，回放少一大截开销。
+$script:copyBoxOf = @{}
+function Set-CopyMenu([object]$el, [object]$box) {
+  $script:copyBoxOf[$el] = $box
+  $el.Add_MouseRightButtonUp({ param($s, $ev) Show-CopyMenu $s })
+}
+
+function Show-CopyMenu([object]$el) {
+  $box = $script:copyBoxOf[$el]
+  if (-not $box) { return }
+  $cm = New-CopyMenu $box
+  $cm.PlacementTarget = $el
+  $cm.Placement = [System.Windows.Controls.Primitives.PlacementMode]::MousePoint
+  $cm.IsOpen = $true
+}
 function Add-UserMessage([string]$text, [object]$files = $null) {
   $sp = Add-Container 20
   $label = New-Text '你' 10.5 '#6B7280' 'Normal' 'Segoe UI' 4
@@ -769,7 +817,9 @@ function Add-UserMessage([string]$text, [object]$files = $null) {
     $sp.Children.Add($body) | Out-Null
   }
   # 附件：只显示名字和大小，不显示数据目录里那一长串路径
-  $list = @($files)
+  # 老会话的 user/message 可能没有 files 字段（$null）：@($null) 会得到一个元素，
+  # 会多画一个空附件框，先过滤掉
+  $list = @(@($files) | Where-Object { $null -ne $_ })
   if ($list.Count -gt 0) {
     $wrap = New-Object System.Windows.Controls.WrapPanel
     $wrap.Orientation = 'Horizontal'
@@ -808,7 +858,7 @@ function Add-UserMessage([string]$text, [object]$files = $null) {
     }
     $sp.Children.Add($wrap) | Out-Null
   }
-  $sp.ContextMenu = (New-CopyMenu (@{ text = "你：$text" }))
+  Set-CopyMenu $sp @{ text = "你：$text" }
   Append-CopyLog "你：$text"
   $script:currentAssistant = $null
 }
@@ -908,7 +958,7 @@ function Add-AssistantMessage {
   $body.Children.Add($tb) | Out-Null
   $script:assistantBody = $body
   $script:assistantBox = @{ text = '' }
-  $sp.ContextMenu = (New-CopyMenu $script:assistantBox)
+  Set-CopyMenu $sp $script:assistantBox
   return $tb
 }
 
@@ -948,11 +998,11 @@ function Add-ToolRow([string]$name, [string]$summary, [object]$parent = $null) {
   $dp.Children.Add($sumTb) | Out-Null
 
   $outer.Child = $dp
-  # 右键可复制这一行的「工具名 + 参数 + 结果」；文本随着状态变，放在 $box 里跟着更新
   $box = @{ text = "$name  $summary" }
-  $outer.ContextMenu = (New-CopyMenu $box)
+  # 右键可复制这一行的「工具名 + 参数 + 结果」；文本随着状态变，放在 $box 里跟着更新
+  Set-CopyMenu $outer $box
   if ($parent) { $parent.Children.Add($outer) | Out-Null }
-  else { $Transcript.Children.Add($outer) | Out-Null }
+  else { $script:renderHost.Children.Add($outer) | Out-Null }
   $status.Tag = @{ box = $box }
   return $status
 }
@@ -1015,7 +1065,7 @@ function New-ToolGroup {
   $sp.Children.Add($items) | Out-Null
 
   $outer.Child = $sp
-  $Transcript.Children.Add($outer) | Out-Null
+  $script:renderHost.Children.Add($outer) | Out-Null
 
   $g = New-Object PSObject -Property @{
     Head = $title; Sum = $sum; Items = $items; Border = $outer
@@ -1169,8 +1219,8 @@ function Add-ReasoningBlock {
 
   $outer.Child = $stack
   $box = @{ text = '' }
-  $outer.ContextMenu = (New-CopyMenu $box)
-  $Transcript.Children.Add($outer) | Out-Null
+  Set-CopyMenu $outer $box
+  $script:renderHost.Children.Add($outer) | Out-Null
 
   $node = New-Object PSObject -Property @{
     Head = $head; Title = $title; Time = $time; Sum = $sum; Body = $body
@@ -1236,13 +1286,13 @@ function Add-VerifyRow([string]$label, [int]$round) {
   $dp.Children.Add($cmdTb) | Out-Null
 
   $outer.Child = $dp
-  $Transcript.Children.Add($outer) | Out-Null
+  $script:renderHost.Children.Add($outer) | Out-Null
   return @{ Status = $status; Border = $outer }
 }
 
 function Add-SystemLine([string]$text, [string]$color = '#7C838E') {  $tb = New-Text $text 11 $color 'Normal' 'Segoe UI' 10
   $tb.HorizontalAlignment = 'Left'
-  $Transcript.Children.Add($tb) | Out-Null
+  $script:renderHost.Children.Add($tb) | Out-Null
 }
 
 # ---------------- 极简 Markdown：粗体、行内代码、标题、列表、代码块 ----------------
@@ -1251,7 +1301,7 @@ function New-Run([string]$t, [string]$color, [bool]$bold, [bool]$mono) {
   $r.Text = $t
   $r.Foreground = (Brush $color)
   if ($bold) { $r.FontWeight = [System.Windows.FontWeights]::SemiBold }
-  if ($mono) { $r.FontFamily = (New-Object System.Windows.Media.FontFamily('Cascadia Mono, Consolas')) }
+  if ($mono) { $r.FontFamily = (New-Font 'Cascadia Mono, Consolas') }
   return $r
 }
 
@@ -1557,7 +1607,7 @@ function Add-ApprovalCard($e) {
 
   $card.Child = $sp
   [System.Windows.Automation.AutomationProperties]::SetAutomationId($card, 'ApprovalCard')
-  $Transcript.Children.Add($card) | Out-Null
+  $script:renderHost.Children.Add($card) | Out-Null
   $Scroller.ScrollToEnd()
 }
 
@@ -1633,7 +1683,7 @@ function Add-QuestionCard($e) {
   $sp.Children.Add($optWrap) | Out-Null
 
   $card.Child = $sp
-  $Transcript.Children.Add($card) | Out-Null
+  $script:renderHost.Children.Add($card) | Out-Null
   $Scroller.ScrollToEnd()
 }
 
@@ -1665,7 +1715,7 @@ function Update-TodoCard($items) {
     $card.Child = $sp
 
     $script:todoCard = @{ card = $card; body = $body; count = $cnt }
-    $Transcript.Children.Add($card) | Out-Null
+    $script:renderHost.Children.Add($card) | Out-Null
   }
 
   $script:todoCard.body.Children.Clear()
@@ -1823,7 +1873,7 @@ function New-SessionRow($it) {
   $del = New-Object System.Windows.Controls.Button
   # 删除用垃圾桶图标（Segoe MDL2 Assets 的 E74D），不用字符 ×——在深色界面上太像关窗口
   $del.Content = [string][char]0xE74D
-  $del.FontFamily = (New-Object System.Windows.Media.FontFamily('Segoe MDL2 Assets'))
+  $del.FontFamily = (New-Font 'Segoe MDL2 Assets')
   $del.FontSize = 12
   $del.Width = 22
   $del.Height = 22
@@ -1959,6 +2009,151 @@ function Set-Sessions($items) {
   Update-SideFit
 }
 
+# ---------------------------------------------------------------- 历史回放（分批）
+# 一个 400 轮的会话有 4000+ 条事件，一次性全建成 UI 元素要十几秒：构建约 9 秒，
+# 之后 Transcript（普通 StackPanel，没有虚拟化）还要把四五千个元素全部量一遍，又是十几秒。
+# 所以切会话先画最后一批（默认 10 轮），往上滚或点顶部那一行再一批一批补。
+$script:replayEvents = @()
+$script:replayAt = 0
+$script:replayHasUser = $false
+$script:replayEnd = $null
+$script:moreRow = $null
+$script:loadingOlder = $false
+$script:replayBatchTurns = 10
+
+# 从 $end 往回数 $turns 个 turn/start，返回这一批的起点：切在整轮边界上，
+# 不然一批可能从某条回答中间开始，工具行也对不上它的调用。
+function Get-ReplayStart([object[]]$evs, [int]$end, [int]$turns) {
+  $seen = 0
+  for ($i = $end - 1; $i -ge 0; $i--) {
+    if ($evs[$i].kind -eq 'turn/start') {
+      $seen++
+      if ($seen -gt $turns) { return $i + 1 }
+    }
+  }
+  return 0
+}
+
+# 把 [from, to) 这段事件画到一个独立面板里（不直接往 Transcript 里塞）
+function Render-ReplayRange([int]$from, [int]$to) {
+  $panel = New-Object System.Windows.Controls.StackPanel
+  $prevHost = $script:renderHost
+  $script:renderHost = $panel
+  try {
+    for ($i = $from; $i -lt $to; $i++) {
+      $ev = $script:replayEvents[$i]
+      if ($ev.kind -eq 'user/message') { Add-UserMessage ([string]$ev.text) $ev.files; $script:replayHasUser = $true }
+      elseif ($ev.kind -eq 'assistant/message') {
+        # 历史里的思考过程也要能看，默认收起成一行摘要
+        if ($ev.reasoning) {
+          $rn = Add-ReasoningBlock
+          $rn.Body.Text = [string]$ev.reasoning
+          $rn.Secs = [math]::Round(([double]$ev.ms) / 1000.0, 1)
+          Complete-Reasoning
+        }
+        if ($ev.text) {
+          if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
+          Render-Markdown $script:assistantBody ([string]$ev.text)
+          $script:currentAssistant = $null
+        }
+      }
+      elseif ($ev.kind -eq 'tool/call') {
+        $sum = ''
+        if ($ev.call.args) { $sum = ($ev.call.args | ConvertTo-Json -Compress -Depth 4) }
+        $st = Add-ToolLine ([string]$ev.call.name) $sum
+        $script:toolRows[[string]$ev.call.id] = $st
+      }
+      elseif ($ev.kind -eq 'tool/result') {
+        $st = $script:toolRows[[string]$ev.callId]
+        if ($st) {
+          if ($ev.ok) { Set-ToolLineDone ([string]$ev.callId) "✓  $($ev.ms)ms" $true }
+          else { Set-ToolLineDone ([string]$ev.callId) '✕  失败' $false }
+        }
+      }
+      elseif ($ev.kind -eq 'memory/saved') {
+        # 历史里的记忆也回放出来，可以照样撤销
+        Add-MemoryCard $ev.items | Out-Null
+      }
+      elseif ($ev.kind -eq 'memory/undone') {
+        Set-MemoryUndone @($ev.ids)
+      }
+    }
+    # 一批画完必须把工具分组断掉：否则下一批的工具行会加进这一批已经插到界面上的组里
+    Close-ToolGroup
+    $script:currentAssistant = $null
+  } finally {
+    $script:renderHost = $prevHost
+  }
+  return $panel
+}
+
+function Update-ReplayMore {
+  if ($script:replayAt -gt 0) {
+    if (-not $script:moreRow) {
+      $b = New-Object System.Windows.Controls.Button
+      $b.HorizontalAlignment = 'Center'
+      $b.Height = 26
+      $b.Padding = '12,0'
+      $b.Margin = '0,0,0,10'
+      $b.FontSize = 11
+      $b.Cursor = 'Hand'
+      $b.Focusable = $false
+      $b.Background = (Brush '#12141A')
+      $b.Foreground = (Brush '#9BA3B4')
+      $b.BorderBrush = (Brush '#1FFFFFFF')
+      $b.BorderThickness = '1'
+      $b.Template = (New-FlatTemplate)
+      $b.ToolTip = '也可以直接往上滚，到底会自动加载'
+      $b.Add_Click({ param($s, $e) Load-OlderHistory })
+      $script:moreRow = $b
+    }
+    $script:moreRow.Content = "↑ 显示更早的记录（还有 $($script:replayAt) 条事件）"
+    if ($Transcript.Children.IndexOf($script:moreRow) -lt 0) {
+      $Transcript.Children.Insert(0, $script:moreRow) | Out-Null
+    }
+    return
+  }
+  if ($script:moreRow) {
+    $Transcript.Children.Remove($script:moreRow) | Out-Null
+    $script:moreRow = $null
+  }
+  if ($script:replayEnd) { return }
+  if ($script:replayHasUser) {
+    $end = New-Text "— 以上为历史记录 · $($script:replayEvents.Count) 条事件 —" 10 '#4B5158' 'Normal' 'Segoe UI' 0
+    $script:replayEnd = $end
+    $Transcript.Children.Add($end) | Out-Null
+  } else {
+    Add-EmptyState
+  }
+}
+
+# 画一批：$older=$true 时往顶部插（用户往上翻），否则追加到末尾（刚切过去）
+function Render-ReplayBatch([bool]$older) {
+  if ($script:replayAt -le 0) { return $false }
+  $from = Get-ReplayStart $script:replayEvents $script:replayAt $script:replayBatchTurns
+  $panel = Render-ReplayRange $from $script:replayAt
+  $script:replayAt = $from
+  $at = 0
+  if ($older -and $script:moreRow -and $Transcript.Children.IndexOf($script:moreRow) -ge 0) {
+    $at = $Transcript.Children.IndexOf($script:moreRow) + 1
+  }
+  $Transcript.Children.Insert($at, $panel)
+  Update-ReplayMore
+  return $true
+}
+
+# 往上补一批。插完要把视口留在原来看到的地方：顶部突然多出内容时
+# ScrollViewer 的偏移量是按顶部算的，不补一下画面会往下跳一屏。
+function Load-OlderHistory {
+  if ($script:replayAt -le 0) { return }
+  $before = $Scroller.VerticalOffset
+  $extentBefore = $Scroller.ExtentHeight
+  if (-not (Render-ReplayBatch $true)) { return }
+  $Scroller.UpdateLayout()
+  $delta = $Scroller.ExtentHeight - $extentBefore
+  if ($delta -gt 0) { $Scroller.ScrollToVerticalOffset($before + $delta) }
+}
+
 function Clear-Transcript {
   $Transcript.Children.Clear()
   $script:todoCard = $null
@@ -1969,6 +2164,7 @@ function Clear-Transcript {
   $script:toolGroup = $null
   $script:assistantBox = $null
   $script:copyLog.Clear() | Out-Null
+  $script:copyBoxOf = @{}
   $script:memoryCards = New-Object System.Collections.ArrayList
   if ($AttachList) { Update-AttachList }
 $script:verifyRows = @{}
@@ -1997,7 +2193,7 @@ function Add-EmptyState {
     $b.Add_Click({ param($s, $e) Start-Turn ([string]$s.Tag) })
     $sp.Children.Add($b) | Out-Null
   }
-  $Transcript.Children.Add($sp) | Out-Null
+  $script:renderHost.Children.Add($sp) | Out-Null
 }
 
 # ---------------------------------------------------------------- 与 host 通信
@@ -2558,7 +2754,7 @@ function Update-AttachList {
     $x = New-Object System.Windows.Controls.Button
     # 移除也是这样：垃圾桶图标，不用字符 ×
     $x.Content = [string][char]0xE74D
-    $x.FontFamily = (New-Object System.Windows.Media.FontFamily('Segoe MDL2 Assets'))
+    $x.FontFamily = (New-Font 'Segoe MDL2 Assets')
     $x.Width = 16
     $x.Height = 16
     $x.Margin = '6,0,0,0'
@@ -2887,56 +3083,16 @@ function Handle-Event([string]$line) {
 
       if (-not $script:busy) {
         Clear-Transcript
-        $hasUser = $false
-        foreach ($ev in $e.events) {
-          if ($ev.kind -eq 'user/message') { Add-UserMessage ([string]$ev.text) $ev.files; $hasUser = $true }
-          elseif ($ev.kind -eq 'assistant/message') {
-            # 历史里的思考过程也要能看，默认收起成一行摘要
-            if ($ev.reasoning) {
-              $rn = Add-ReasoningBlock
-              $rn.Body.Text = [string]$ev.reasoning
-              $rn.Secs = [math]::Round(([double]$ev.ms) / 1000.0, 1)
-              Complete-Reasoning
-            }
-            if ($ev.text) {
-              if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
-              Render-Markdown $script:assistantBody ([string]$ev.text)
-              $script:currentAssistant = $null
-            }
-          }
-          elseif ($ev.kind -eq 'tool/call') {
-            $sum = ''
-            if ($ev.call.args) { $sum = ($ev.call.args | ConvertTo-Json -Compress -Depth 4) }
-            $st = Add-ToolLine ([string]$ev.call.name) $sum
-            $script:toolRows[[string]$ev.call.id] = $st
-          }
-          elseif ($ev.kind -eq 'tool/result') {
-            $st = $script:toolRows[[string]$ev.callId]
-            if ($st) {
-              if ($ev.ok) { Set-ToolLineDone ([string]$ev.callId) "✓  $($ev.ms)ms" $true }
-              else { Set-ToolLineDone ([string]$ev.callId) '✕  失败' $false }
-            }
-          }
-          elseif ($ev.kind -eq 'memory/saved') {
-            # 历史里的记忆也回放出来，可以照样撤销
-            Add-MemoryCard $ev.items | Out-Null
-          }
-          elseif ($ev.kind -eq 'memory/undone') {
-            Set-MemoryUndone @($ev.ids)
-          }
-        }
-        if ($e.events.Count -gt 0) {
-          if ($hasUser) {
-            $end = New-Text "— 以上为历史记录 · $($e.events.Count) 条事件 —" 10 '#4B5158' 'Normal' 'Segoe UI' 0
-            $Transcript.Children.Add($end) | Out-Null
-          } else {
-            Add-EmptyState
-          }
-        } else {
-          Add-EmptyState
-        }
+        # 回放分批：先画最后一批（默认 10 轮），往上滚或点顶部那一行再补更早的
+        $script:replayEvents = @($e.events)
+        $script:replayAt = $script:replayEvents.Count
+        $script:replayHasUser = $false
+        $script:replayEnd = $null
+        $script:moreRow = $null
+        Render-ReplayBatch $false | Out-Null
         $Scroller.ScrollToEnd()
       }
+      $window.UpdateLayout()
       Send-Host @{ cmd = 'list-sessions' }
     }
     'reasoning' {
@@ -3316,7 +3472,7 @@ function Measure-TextWidth([string]$text, [double]$size = 12) {
   $tb = New-Object System.Windows.Controls.TextBlock
   $tb.Text = $text
   $tb.FontSize = $size
-  $tb.FontFamily = (New-Object System.Windows.Media.FontFamily('Segoe UI'))
+  $tb.FontFamily = (New-Font 'Segoe UI')
   $tb.Measure([System.Windows.Size]::new([double]::PositiveInfinity, [double]::PositiveInfinity))
   return $tb.DesiredSize.Width
 }

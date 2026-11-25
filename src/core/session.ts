@@ -27,6 +27,30 @@ function assertSessionId(id: string): void {
   if (!/^s-[a-z0-9]+-[a-z0-9]+$/.test(id)) throw new Error(`非法会话 id：${id}`)
 }
 
+/** list() 的摘要缓存：key 是会话 id，带上 session.jsonl 与 meta.json 的 mtime/size，
+ *  变了才重读。切会话后界面每次都会要一次会话列表，不缓存的话每个会话文件
+ *  都要整份读+解析一遍，光为了拿标题 / 轮数 / 时间。 */
+const summaryCache = new Map<
+  string,
+  {
+    jsonl: { mtimeMs: number; size: number }
+    meta: { mtimeMs: number; size: number } | null
+    title: string
+    group: string
+    updatedAt: number
+    turns: number
+  }
+>()
+
+async function statOrNull(p: string): Promise<{ mtimeMs: number; size: number } | null> {
+  try {
+    const s = await stat(p)
+    return { mtimeMs: s.mtimeMs, size: s.size }
+  } catch {
+    return null
+  }
+}
+
 async function readMeta(dir: string): Promise<SessionMeta> {
   try {
     const raw = await readFile(join(dir, 'meta.json'), 'utf8')
@@ -112,14 +136,38 @@ export class Session {
     const out: Array<{ id: string; title: string; group: string; updatedAt: number; turns: number }> = []
     for (const id of ids) {
       try {
+        const dir = join(root, id)
+        const jsonl = await statOrNull(join(dir, 'session.jsonl'))
+        if (!jsonl) continue
+        const meta = await statOrNull(join(dir, 'meta.json'))
+        const hit = summaryCache.get(id)
+        const sameJsonl =
+          hit && hit.jsonl.mtimeMs === jsonl.mtimeMs && hit.jsonl.size === jsonl.size
+        const sameMeta =
+          hit &&
+          ((hit.meta === null && meta === null) ||
+            (hit.meta !== null && meta !== null && hit.meta.mtimeMs === meta.mtimeMs && hit.meta.size === meta.size))
+        if (hit && sameJsonl && sameMeta) {
+          out.push({ id, title: hit.title, group: hit.group, updatedAt: hit.updatedAt, turns: hit.turns })
+          continue
+        }
         const s = await Session.open(dataDir, id)
-        out.push({
+        const item = {
           id,
           title: s.title(),
           group: (s.meta.group ?? '').trim(),
           updatedAt: s.events.length ? s.events[s.events.length - 1]!.at : 0,
           turns: s.events.filter((e) => e.kind === 'turn/start').length,
+        }
+        summaryCache.set(id, {
+          jsonl,
+          meta,
+          title: item.title,
+          group: item.group,
+          updatedAt: item.updatedAt,
+          turns: item.turns,
         })
+        out.push(item)
       } catch {
         /* 忽略损坏会话 */
       }

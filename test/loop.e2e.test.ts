@@ -70,7 +70,13 @@ test('e2e: 模型调用工具 → 结果入历史 → 最终答复', async () =>
     const second = s.llmServer.requests[1]!
     assert.ok(second.messages.some((m: any) => m.role === 'assistant' && m.tool_calls?.length))
     assert.ok(second.messages.some((m: any) => m.role === 'tool' && m.tool_call_id === 'call_w1'))
-    assert.equal(second.tools.length, 7)
+    // 工具集扩过（list/find/outline/logtail… 陆续加），这里断言「该有的都在、名字不重复」，
+    // 而不是把数量写死 —— 数量写死会让每次加工具都要来改这一行
+    const toolNames: string[] = second.tools.map((t: any) => t.function?.name ?? t.name)
+    for (const name of ['read', 'write', 'edit', 'glob', 'grep', 'shell', 'list', 'find', 'outline', 'logtail', 'netprobe']) {
+      assert.ok(toolNames.includes(name), `发给模型的 schema 里缺 ${name}`)
+    }
+    assert.equal(new Set(toolNames).size, toolNames.length, '工具名不该重复')
     assert.equal(second.model, 'test-model')
 
     // 审计

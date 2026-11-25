@@ -124,3 +124,33 @@ test('policy: 越界写被拒，read-only 一律拒写', async () => {
   const full = new Policy(root, 'full')
   assert.equal(full.gate('write', outside), 'allow')
 })
+
+test('fs.edit 容忍 CRLF/LF 与行尾空白差异', async () => {
+  const { root, ctx, tools } = await ws()
+  const edit = tools.get('edit')!
+  const p = join(root, 'crlf.ts')
+  await writeFile(p, 'const a = 1\r\nconst b = 2\r\nconst c = 3\r\n', 'utf8')
+  const r = await edit.run(ctx, {
+    path: 'crlf.ts',
+    old: 'const b = 2  \nconst c = 3',
+    new: 'const b = 20\nconst c = 30',
+  })
+  assert.match(r.content, /已修改/)
+  assert.equal(await readFile(p, 'utf8'), 'const a = 1\r\nconst b = 20\r\nconst c = 30\r\n')
+})
+
+test('fs.edit 不命中时指出最接近的行号', async () => {
+  const { ctx, tools } = await ws()
+  const edit = tools.get('edit')!
+  await assert.rejects(
+    () => edit.run(ctx, { path: 'src/a.ts', old: '// TODO: fix\nconst zzz = 9', new: 'x' }),
+    /第 2 行/,
+  )
+})
+
+test('fs.edit 多命中时列出每个命中的行号', async () => {
+  const { ctx, tools } = await ws()
+  const edit = tools.get('edit')!
+  await writeFile(join(ctx.root, 'dup2.txt'), 'aa\nbb\naa\n', 'utf8')
+  await assert.rejects(() => edit.run(ctx, { path: 'dup2.txt', old: 'aa\n', new: 'xx\n' }), /第 1、3 行/)
+})

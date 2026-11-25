@@ -374,7 +374,10 @@ dist\PackLeader-Setup-0.1.0.exe --uninstall /S # 静默卸载（或开始菜单�
 **已实现（可跑、有测试、真模型验证过）**
 
 - Agent 主循环：turn → step → tool batch，事件全落盘，`max-steps` 保护
-- 7 个工具：`read` `write` `edit` `glob` `grep` `shell` `todo_write`
+- 18 个工具（原 7 个）
+  - 文件：`read` `write` `edit` `glob` `grep` `list` `find` `outline` `stat` `hash` `move` `remove`
+  - 运行时：`shell` `logtail` `processlist` `netprobe` `sysstat`
+  - 便签：`todo_write`
 - 三档策略 + 一次性审批 + fail-closed + `auto` 审计标记
 - 写前快照与轮次级撤销（含外部改动冲突检测、超大文件跳过）
 - 审计投影（SQLite，`node:sqlite`）+ 成本统计 + 从日志重建
@@ -410,7 +413,7 @@ src/
 │  ├─ checkpoint.ts       写前快照 + 撤销
 │  └─ audit.ts            SQLite 投影 + 重建
 ├─ llm/openai.ts          OpenAI 兼容流式客户端
-├─ tools/                 fs / shell / todo
+├─ tools/                 fs / runtime / shell / todo
 └─ tui/                   ANSI 渲染 + 终端审批
 ```
 
@@ -424,7 +427,7 @@ src/
 npm test     # 或 node --disable-warning=ExperimentalWarning --test "test/*.test.ts"
 ```
 
-58 个测试，覆盖：
+72 个测试，覆盖：
 
 - 会话恢复（含损坏半行、截断结果的说明文本）
 - 文件工具与路径越界、`{a,b}` 大括号 glob、`path` 限定范围

@@ -172,7 +172,8 @@ export function createFsTools(root: string): Tool[] {
   const read: Tool = {
     name: 'read',
     description:
-      '读取一个文本文件并带行号返回。可指定 offset/limit 分段读大文件；要一次看几处不相连的段（改代码前对比上下文），用 ranges 一次读完，别来回读。',
+      '读取一个文本文件并带行号返回。可指定 offset/limit 分段读大文件；要一次看几处不相连的段（改代码前对比上下文），用 ranges 一次读完，别来回读。' +
+      'path 可以是绝对路径：读不受 workspace 限制（查全局配置、依赖源码、系统日志都行），只有写/删/执行才限制在工作目录内。',
     parameters: {
       type: 'object',
       properties: {

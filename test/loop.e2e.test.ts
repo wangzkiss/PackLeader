@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, stat } from 'node:fs/promises'
+import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -215,6 +215,35 @@ test('e2e: 两轮编辑后 undo 回到第一轮内容', async () => {
     const r = await ck.undo(s.session.id, 2)
     assert.deepEqual(r.restored, [join(s.root, 'f.txt')])
     assert.equal(await readFile(join(s.root, 'f.txt'), 'utf8'), 'v1')
+  } finally {
+    await s.close()
+  }
+})
+
+test('e2e: guarded 下 move 的 to 越界被拒（不能借第一个 target 混过去）', async () => {
+  // 源在 workspace 内、目标在 workspace 外：早先 gate 只看 targets[0]，整条会放行
+  const outsideDir = await mkdtemp(join(tmpdir(), 'pl-outside-'))
+  const s = await setup(
+    [
+      { toolCalls: [{ id: 'call_m1', name: 'move', args: { from: 'a.txt', to: join(outsideDir, 'stolen.txt') } }] },
+      { text: '被拒了' },
+    ],
+    { mode: 'guarded', approval: 'allow' },
+  )
+  try {
+    await writeFile(join(s.root, 'a.txt'), 'keep me', 'utf8')
+    const r = await s.agent.runTurn('把 a.txt 挪到外面去')
+    assert.equal(r.reason, 'done')
+
+    // 源文件没动，目标没出现
+    assert.equal(await readFile(join(s.root, 'a.txt'), 'utf8'), 'keep me')
+    await assert.rejects(() => stat(join(outsideDir, 'stolen.txt')))
+
+    // 拒绝原因要点出越界的那个路径，而不是含糊的「不允许」
+    const row = s.audit.queryToolCalls({ limit: 1 })[0]!
+    assert.equal(row.decision, 'denied')
+    assert.match(String(row.error), /越界/)
+    assert.match(String(row.error), /stolen\.txt/)
   } finally {
     await s.close()
   }

@@ -468,10 +468,16 @@ dsh lite audit rebuild         # 从 sessions/*.jsonl 全量重建
         guarded     → 写/执行逐条问（默认）
         full        → 不问，但仍有目录白名单
 第 2 层 沙箱策略（sandbox-policy）
-        workspaceRoot 内的写放行；外出写 = 越界 → 触发审批或拒绝
+        写/删/执行：一次调用的**每一个** target 都要在 workspaceRoot 内，
+                    任一越界即 deny（guarded / read-only）
+        读：不限域
 第 3 层 逐条审批（user-approval）
         一次一授权，不记忆、不可批量，无应答者 = 拒
 ```
+
+**读为什么不限域**：这套边界是「防手滑」不是「防恶意」。把读也锁进 workspace，模型就查不了 `~/.gitconfig`、依赖源码、系统日志——而这些恰恰是排查问题要看的。会留下痕迹的只有写、删、执行，边界只管它们。这条约定同时写在 `read` 工具描述和系统提示里，模型和用户都看得见。
+
+**多 target 必须逐个查**：`move` 的 targets 是 `[from, to]`。曾经 `gate` 只取 `targets[0]`，于是 `move from=<域内> to=<域外>` 整条被判成「域内」——源和目标分列两处时，边界形同虚设。现在 `policy.gate` 接受 `string | string[]`，`outsideOf()` 逐个比对，拒绝信息还会点出是哪个路径出的界。
 
 **刻意不加**「总是允许」：Kite 的 `approval_remember` 是它最危险的设计之一；A 档不需要，加了迟早出事。
 

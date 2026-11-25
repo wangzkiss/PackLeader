@@ -73,15 +73,30 @@ export class Policy {
   }
 
   /**
-   * 工具是否放行：
-   *  - read   → allow
-   *  - write  → read-only 档一律 deny；越界 deny（full 档除外）；guarded 档 ask；full 档 allow
-   *  - detail（命令文本 / 改动摘要）命中危险清单 → 一律 ask，full 档也不例外
+   * 越界的第一个路径；都在域内则返回 undefined。
+   *
+   * 一次调用可能碰多个路径（move 的 from/to、批量 target），必须逐个查。
+   * 早先 gate 只看 targets[0]，`move from=<域内> to=<域外>` 就整条溜过去了。
    */
-  gate(permission: Permission, absPath?: string, detail?: string): Gate {
+  outsideOf(paths: string | string[] | undefined): string | undefined {
+    const list = paths === undefined ? [] : typeof paths === 'string' ? [paths] : paths
+    return list.find((p) => typeof p === 'string' && p !== '' && !this.inside(p))
+  }
+
+  /**
+   * 工具是否放行：
+   *  - read   → allow（读不限域，见下方注释；这是刻意的取舍，不是漏了）
+   *  - write  → read-only 档一律 deny；任一 target 出界即 deny（full 档除外）；guarded 档 ask；full 档 allow
+   *  - detail（命令文本 / 改动摘要）命中危险清单 → 一律 ask，full 档也不例外
+   *
+   * 读为什么不限域：这是「防手滑」不是「防恶意」。把读也锁在 workspace 内，
+   * 模型就查不了全局配置（~/.gitconfig）、依赖源码、系统日志——而这些正是它排查问题要看的。
+   * 写、执行、删除才是会留下痕迹的操作，边界只管它们。
+   */
+  gate(permission: Permission, absPath?: string | string[], detail?: string): Gate {
     if (permission === 'read') return 'allow'
     if (this.mode === 'read-only') return 'deny'
-    if (absPath && !this.inside(absPath) && this.mode !== 'full') return 'deny'
+    if (this.mode !== 'full' && this.outsideOf(absPath)) return 'deny'
     if (detail && dangerOf(detail)) return 'ask'
     if (this.mode === 'full') return 'allow'
     return 'ask'

@@ -175,6 +175,7 @@ export class Agent {
       `5. 预算意识：单轮最多 ${this.opts.maxSteps ?? DEFAULT_MAX_STEPS} 步，到上限会被强制收尾。` +
         '证据够了就回答，不要为了“更全面”无限探索。',
       '6. 大文件别整篇翻：先用 grep 定位行号，再 read 带 offset/limit 精确取几段。同一个文件反复分页读通常说明该换搜索词了。',
+      '7. 边界只管写和执行：读可以用绝对路径读 workspace 外的文件（全局配置、依赖源码、系统日志都行），写/删/执行才限制在工作目录内。',
       '',
       '可用工具：',
       tools.describe(),
@@ -252,17 +253,19 @@ export class Agent {
     const cmdText = String(call.args.command ?? call.args.cmd ?? '')
     const danger = cmdText ? dangerOf(cmdText) : null
     const allowKey = `${tool.name}:${targets[0] ?? (cmdText.slice(0, 120) || '*')}`
-    let gate = policy.gate(tool.permission, targets[0], cmdText)
+    // 所有 target 都要过边界：一次 move 有 from/to 两个，只看第一个等于没查
+    let gate = policy.gate(tool.permission, targets, cmdText)
     // 危险命令：full 档也要问一次
     if (danger) gate = 'ask'
     let decision: Decision | undefined
     let autoApproved = false
     if (gate === 'deny') {
       decision = 'denied'
+      const outside = policy.outsideOf(targets)
       const reason =
         policy.mode === 'read-only'
           ? `read-only 模式下不允许 ${tool.name}`
-          : `路径越界（${policy.mode}）：${targets[0] ?? ''}`
+          : `路径越界（${policy.mode}）：${outside ?? targets[0] ?? ''}`
       const result: ToolResult = { ok: false, content: `已拒绝：${reason}`, ms: 0 }
       await session.append({ kind: 'approval/decided', reqId: `deny-${startedAt}`, decision })
       audit.recordApproval({

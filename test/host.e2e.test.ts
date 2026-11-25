@@ -159,8 +159,15 @@ test('host: ready sends a question index and history-slice returns only the requ
     host.send({ cmd: 'history-slice', session: savedSession.id, requestId: 1, mode: 'tail' })
     const slice = await host.next('history-slice')
     assert.equal(slice.requestId, 1)
-    assert.equal(slice.from, 3)
-    assert.deepEqual((slice.events as Array<{ kind: string }>).map((event) => event.kind), ['turn/start', 'user/message', 'assistant/message'])
+    // tail 默认给最后一轮；会话里只有 2 轮，会一起给（最多 6 轮）
+    assert.equal(slice.from, 1)
+    assert.deepEqual((slice.events as Array<{ kind: string }>).map((event) => event.kind), [
+      'user/message',
+      'assistant/message',
+      'turn/start',
+      'user/message',
+      'assistant/message',
+    ])
 
     host.send({ cmd: 'history-slice', session: savedSession.id, requestId: 2, mode: 'around', target: 1 })
     const around = await host.next('history-slice')

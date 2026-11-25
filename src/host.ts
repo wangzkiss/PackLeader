@@ -725,8 +725,23 @@ async function main(): Promise<void> {
           to = next === undefined ? session.events.length : turnStart(next)
           jumpTo = question
         } else {
-          const question = questions.length ? questions[questions.length - 1]! : 0
-          from = turnStart(question)
+          // 首屏：最后几轮一起给。只给最后一轮的话，长对话一打开就得往上翻几十次，
+          // 每翻一次一次往返（~270ms），体验上跟"卡"没区别。
+          const maxTailTurns = Math.max(1, Math.min(50, Number(cmd.turns ?? 6)))
+          const startAt = Math.max(0, questions.length - maxTailTurns)
+          from = turnStart(questions[startAt] ?? 0)
+        }
+        // 一次别把整段历史塞成一行大 JSON：PowerShell 侧 ConvertFrom-Json 是同步的，
+        // 几 MB 的一行会把 UI 线程卡住。按字节切，切了就让前端接着拉下一段。
+        const maxBytes = Math.max(16 * 1024, Math.min(4 * 1024 * 1024, Number(cmd.maxBytes ?? 512 * 1024)))
+        let bytes = 0
+        let cut = to
+        for (let i = from; i < to; i++) {
+          bytes += JSON.stringify(session.events[i]).length + 1
+          if (bytes > maxBytes && i > from) {
+            cut = i
+            break
+          }
         }
         send({
           type: 'history-slice',
@@ -734,9 +749,11 @@ async function main(): Promise<void> {
           requestId,
           mode,
           from,
-          to,
+          to: cut,
+          truncated: cut < to,
+          nextFrom: cut,
           jumpTo,
-          events: session.events.slice(from, to),
+          events: session.events.slice(from, cut),
         })
         break
       }

@@ -19,7 +19,8 @@ param(
   [string]$DataDir = $env:PL_GUI_DATA,
   [string]$BaseUrl = $env:PL_GUI_BASE_URL,
   [string]$ApiKey = $env:PL_GUI_API_KEY,
-  [string]$Model = $env:PL_GUI_MODEL
+  [string]$Model = $env:PL_GUI_MODEL,
+  [string]$Session = $env:PL_GUI_SESSION
 )
 
 
@@ -618,6 +619,14 @@ $window.Dispatcher.add_UnhandledException({
 $Transcript = $window.FindName('Transcript')
 # 回放旧历史时要往「临时面板」里画（画完一次性插到顶部），平时就是 Transcript
 $script:renderHost = $Transcript
+# 历史回放：单条正文/思考超过 6000 / 4000 字先只画前面一段，点「展开」再画剩下的
+$script:replayFoldChars = 6000
+$script:reasonFoldChars = 4000
+# 一次 history-slice 的耗时统计（跟着 UI 日志走，方便以后看趋势）
+$script:historyT0 = $null
+$script:historyFetched = 0
+# 尾巴自动补段（tail 被字节切开时，后续 after 段画完要继续贴底）
+$script:historyTailFill = $false
 $Scroller = $window.FindName('Scroller')
 $QuestionIndexCanvas = $window.FindName('QuestionIndexCanvas')
 # 滑到顶就自动补一批更早的记录（点顶部那一行也一样）。
@@ -1413,6 +1422,41 @@ function Render-Markdown($hostPanel, [string]$text) {
   }
 }
 
+# 超长文本先截一段看，剩下的用一行提示带过（思考过程回放用）
+function Clip-LongText([string]$t, [int]$max) {
+  if ($t.Length -le $max) { return $t }
+  return $t.Substring(0, $max) + "`n…（已折叠 $($t.Length - $max) 字）"
+}
+
+# 历史回放时，单条超长正文先画前面一段，剩下的点一下再画
+function Add-FoldMore($panel, [string]$rest, [int]$chars) {
+  $b = New-Object System.Windows.Controls.Button
+  $b.Content = "… 还有 $chars 字，展开全文"
+  $b.HorizontalAlignment = 'Left'
+  $b.Height = 26
+  $b.Padding = '12,0'
+  $b.Margin = '4,2,0,0'
+  $b.FontSize = 11
+  $b.Cursor = 'Hand'
+  $b.Focusable = $false
+  $b.Background = (Brush '#12141A')
+  $b.Foreground = (Brush '#9BA3B4')
+  $b.BorderBrush = (Brush '#1FFFFFFF')
+  $b.BorderThickness = '1'
+  $b.Template = (New-FlatTemplate)
+  # PS 5.1 里闭包拿不到局部变量，靠 Tag 把要画的东西递过去
+  $b.Tag = @{ panel = $panel; rest = $rest }
+  $b.Add_Click({
+    param($s, $e)
+    $r = $s.Tag
+    $s.Visibility = 'Collapsed'
+    $box = New-Object System.Windows.Controls.StackPanel
+    Render-Markdown $box ([string]$r.rest)
+    $r.panel.Children.Add($box) | Out-Null
+  })
+  $panel.Children.Add($b) | Out-Null
+}
+
 # 审批选项卡片模板：不用系统 Button 默认模板 —— 原生模板在 IsEnabled=False 时变浅灰白底，深色界面里刺眼
 function New-OptionTemplate {
   if ($script:optTpl) { return $script:optTpl }
@@ -2057,16 +2101,23 @@ $script:userElements = @{}
 function Render-ReplayEvent($ev) {
   if ($ev.kind -eq 'user/message') { Add-UserMessage ([string]$ev.text) $ev.files; $script:replayHasUser = $true }
   elseif ($ev.kind -eq 'assistant/message') {
-    # 历史里的思考过程也要能看，默认收起成一行摘要
+    # 历史里的思考过程也要能看，默认收起成一行摘要；超长的先只放前一段
     if ($ev.reasoning) {
       $rn = Add-ReasoningBlock
-      $rn.Body.Text = [string]$ev.reasoning
+      $rn.Body.Text = (Clip-LongText ([string]$ev.reasoning) $script:reasonFoldChars)
       $rn.Secs = [math]::Round(([double]$ev.ms) / 1000.0, 1)
       Complete-Reasoning
     }
     if ($ev.text) {
       if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
-      Render-Markdown $script:assistantBody ([string]$ev.text)
+      $txt = [string]$ev.text
+      if ($txt.Length -gt $script:replayFoldChars) {
+        # 一条几千字的回答一次全画出来，布局和滚动都会变慢：先画前面一段
+        Render-Markdown $script:assistantBody $txt.Substring(0, $script:replayFoldChars)
+        Add-FoldMore $script:assistantBody $txt.Substring($script:replayFoldChars) ($txt.Length - $script:replayFoldChars)
+      } else {
+        Render-Markdown $script:assistantBody $txt
+      }
       $script:currentAssistant = $null
     }
   }
@@ -2119,6 +2170,8 @@ function Send-HistoryRequest([string]$mode, [int]$cursor = 0, [int]$target = 0) 
   if ($script:historyLoading) { return }
   $script:historyLoading = $true
   $script:historyRequestId++
+  $script:historyT0 = [System.Diagnostics.Stopwatch]::StartNew()
+  $script:historyFetched = 0
   Send-Host @{ cmd = 'history-slice'; session = $script:sessionId; requestId = $script:historyRequestId; mode = $mode; cursor = $cursor; target = $target }
 }
 
@@ -2141,11 +2194,14 @@ function Start-HistoryRender($e) {
     $insertAt = 0
     if ($script:moreRow -and $Transcript.Children.IndexOf($script:moreRow) -eq 0) { $insertAt = 1 }
     $Transcript.Children.Insert($insertAt, $panel)
-    $script:replayRenderJob = @{ events = $events; from = $from; next = 0; panel = $panel; mode = $mode }
+    $script:replayRenderJob = @{ events = $events; from = $from; next = 0; panel = $panel; mode = $mode; truncated = [bool]$e.truncated; nextFrom = [int]$e.nextFrom }
   } else {
     $Transcript.Children.Add($panel) | Out-Null
-    $script:replayRenderJob = @{ events = $events; from = $from; next = 0; panel = $panel; mode = $mode; jumpTo = $e.jumpTo }
+    $script:replayRenderJob = @{ events = $events; from = $from; next = 0; panel = $panel; mode = $mode; jumpTo = $e.jumpTo; truncated = [bool]$e.truncated; nextFrom = [int]$e.nextFrom }
   }
+  if ($mode -eq 'tail') { $script:historyTailFill = $true }
+  elseif ($mode -eq 'around') { $script:historyTailFill = $false }
+  $script:historyFetched += $events.Count
   $script:replayEvents = $events
   $script:replayAt = $from
 }
@@ -2184,11 +2240,23 @@ function Continue-ReplayRender {
     $script:historyBefore = [int]$job.from
     if ($null -ne $job.jumpTo -and $script:userElements.ContainsKey([int]$job.jumpTo)) {
       $script:userElements[[int]$job.jumpTo].BringIntoView()
-    } elseif ($job.mode -eq 'tail') {
+    } elseif ($job.mode -eq 'tail' -or ($job.mode -eq 'after' -and $script:historyTailFill)) {
       $Scroller.ScrollToEnd()
     }
   }
+  # host 按字节把一段历史切开了：这一段画完就接着拉下一段，用户不用管
+  if ($job.truncated) {
+    $script:historyLoading = $false
+    if ($job.mode -eq 'before') { Send-HistoryRequest 'before' ([int]$job.from) }
+    else { Send-HistoryRequest 'after' ([int]$job.nextFrom) }
+    return
+  }
+  $script:historyTailFill = $false
   $script:historyLoading = $false
+  if ($script:historyT0) {
+    Log ("history: mode=$($job.mode) 事件=$($script:historyFetched) 耗时=$($script:historyT0.ElapsedMilliseconds)ms")
+    $script:historyT0 = $null
+  }
   Update-ReplayMore
   if ($script:pendingJump -ge 0) {
     $target = $script:pendingJump
@@ -2315,6 +2383,7 @@ $psi.WorkingDirectory = $root
 $hostArgs = @('--disable-warning=ExperimentalWarning', $hostTs, '--cwd', $Cwd, '--mode', $Mode, '--data-dir', $DataDir,
               '--base-url', $BaseUrl, '--model', $Model)
 if ($ApiKey) { $hostArgs += @('--api-key', $ApiKey) }
+if ($Session) { $hostArgs += @('--resume', $Session) }
 # .NET Framework 4.8 没有 ArgumentList（那是 .NET Core 的），只能自己拼带引号的字符串
 $psi.Arguments = ($hostArgs | ForEach-Object {
   if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }

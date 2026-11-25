@@ -173,7 +173,7 @@ ${dim('配置文件：<数据目录>/config.json（界面里填的端点/Key 存
 }
 
 /** 桌面窗口：起一个 WPF 进程（PowerShell 自带，不引入 Electron），它再拉起 src/host.ts */
-async function cmdGui(cfg: Config): Promise<void> {
+async function cmdGui(cfg: Config, flags: Record<string, string | boolean>): Promise<void> {
   const repoRoot = join(import.meta.dirname, '..')
   const ps1 = join(repoRoot, 'ui', 'PackLeader.ps1')
   if (!existsSync(ps1)) {
@@ -206,6 +206,7 @@ async function cmdGui(cfg: Config): Promise<void> {
       PL_GUI_BASE_URL: cfg.baseURL,
       PL_GUI_API_KEY: cfg.apiKey,
       PL_GUI_MODEL: cfg.model,
+      PL_GUI_SESSION: typeof flags.resume === 'string' ? flags.resume : '',
     },
     stdio: 'inherit',
     // 从启动器 exe（无控制台进程）拉起时会新开一个黑窗，这里压掉
@@ -396,7 +397,7 @@ async function main(): Promise<void> {
   if (command === 'audit') return cmdAudit(cfg, flags, positional)
   if (command === 'undo') return cmdUndo(cfg, flags)
   if (command === 'doctor') return cmdDoctor(cfg, flags)
-  if (command === 'gui') return cmdGui(cfg)
+  if (command === 'gui') return cmdGui(cfg, flags)
 
   if (!cfg.apiKey) {
     process.stderr.write(

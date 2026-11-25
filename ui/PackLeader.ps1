@@ -154,7 +154,7 @@ $xaml = @'
               </Border>
               <ControlTemplate.Triggers>
                 <Trigger Property="IsMouseOver" Value="True">
-                  <Setter TargetName="bd" Property="Background" Value="#1B1F27"/>
+                  <Setter TargetName="bd" Property="Background" Value="#1B2029"/>
                   <Setter TargetName="bd" Property="BorderBrush" Value="#33FFFFFF"/>
                 </Trigger>
               </ControlTemplate.Triggers>
@@ -556,7 +556,7 @@ function New-MenuItemTemplate {
   </Border>
   <ControlTemplate.Triggers>
     <Trigger Property="IsHighlighted" Value="True">
-      <Setter TargetName="bd" Property="Background" Value="#242A34"/>
+      <Setter TargetName="bd" Property="Background" Value="#1B2029"/>
     </Trigger>
   </ControlTemplate.Triggers>
 </ControlTemplate>
@@ -1169,10 +1169,10 @@ function New-OptionTemplate {
   </Border>
   <ControlTemplate.Triggers>
     <Trigger Property="IsMouseOver" Value="True">
-      <Setter TargetName="bd" Property="Background" Value="#1A1F27"/>
+      <Setter TargetName="bd" Property="Background" Value="#1B2029"/>
     </Trigger>
     <Trigger Property="IsPressed" Value="True">
-      <Setter TargetName="bd" Property="Background" Value="#232A35"/>
+      <Setter TargetName="bd" Property="Background" Value="#263450"/>
     </Trigger>
   </ControlTemplate.Triggers>
 </ControlTemplate>
@@ -1316,6 +1316,7 @@ function Add-ApprovalCard($e) {
   $toggle.Foreground = (Brush '#7C838E')
   $toggle.FontSize = 11
   $toggle.Content = ([string][char]0x2304) + ' 收起选项'
+  $toggle.Template = (New-FlatTemplate)
   [System.Windows.Automation.AutomationProperties]::SetAutomationId($toggle, 'ApprovalToggle')
   $sp.Children.Add($toggle) | Out-Null
 
@@ -1331,7 +1332,7 @@ function Add-ApprovalCard($e) {
     $c.done = $true
     Send-Host @{ cmd = 'approve'; reqId = $c.reqId; decision = 'allowed-once' }
     $s.BorderBrush = (Brush '#4F7DF0')
-    $s.Background = (Brush '#161B26')
+    $s.Background = (Brush '#263450')
     $s.Tag.check.Visibility = 'Visible'
     $c.no.BorderBrush = (Brush '#1FFFFFFF')
     $c.no.IsEnabled = $false
@@ -1347,7 +1348,7 @@ function Add-ApprovalCard($e) {
     $c.done = $true
     Send-Host @{ cmd = 'approve'; reqId = $c.reqId; decision = 'denied' }
     $s.BorderBrush = (Brush '#B45454')
-    $s.Background = (Brush '#1B1416')
+    $s.Background = (Brush '#263450')
     $s.Tag.check.Visibility = 'Visible'
     $c.yes.BorderBrush = (Brush '#1FFFFFFF')
     $c.yes.IsEnabled = $false
@@ -1474,7 +1475,7 @@ function New-SessionRow($it) {
   $sid = [string]$it.id
   $stitle = [string]$it.title
   $selected = ($sid -eq [string]$script:sessionId)
-  $row.Background = $(if ($selected) { Brush '#20242E' } else { [System.Windows.Media.Brushes]::Transparent })
+  $row.Background = $(if ($selected) { Brush '#263450' } else { [System.Windows.Media.Brushes]::Transparent })
 
   $grid = New-Object System.Windows.Controls.Grid
   $c1 = New-Object System.Windows.Controls.ColumnDefinition
@@ -1539,13 +1540,13 @@ function New-SessionRow($it) {
   })
   $row.Add_MouseEnter({
     param($s, $e)
-    $s.Background = (Brush '#1B1F27')
+    $s.Background = (Brush '#1B2029')
     $s.Tag.del.Visibility = 'Visible'
   })
   $row.Add_MouseLeave({
     param($s, $e)
     $s.Tag.del.Visibility = 'Hidden'
-    if ($s.Tag.id -eq [string]$script:sessionId) { $s.Background = (Brush '#20242E') }
+    if ($s.Tag.id -eq [string]$script:sessionId) { $s.Background = (Brush '#263450') }
     else { $s.Background = [System.Windows.Media.Brushes]::Transparent }
   })
   return $row
@@ -1667,6 +1668,7 @@ function Add-EmptyState {
     $b.BorderBrush = (Brush '#1FFFFFFF')
     $b.BorderThickness = '1'
     $b.Tag = [string]$ex
+    $b.Template = (New-FlatTemplate)
     $b.Add_Click({ param($s, $e) Start-Turn ([string]$s.Tag) })
     $sp.Children.Add($b) | Out-Null
   }
@@ -1946,7 +1948,7 @@ function New-FlatTemplate {
   </Border>
   <ControlTemplate.Triggers>
     <Trigger Property="IsMouseOver" Value="True">
-      <Setter TargetName="bd" Property="Background" Value="#242A34"/>
+      <Setter TargetName="bd" Property="Background" Value="#1B2029"/>
     </Trigger>
     <Trigger Property="IsPressed" Value="True">
       <Setter TargetName="bd" Property="Background" Value="#2C333F"/>
@@ -1968,10 +1970,10 @@ function New-SelTemplate {
   </Border>
   <ControlTemplate.Triggers>
     <Trigger Property="IsMouseOver" Value="True">
-      <Setter TargetName="bd" Property="Background" Value="#2F3F63"/>
+      <Setter TargetName="bd" Property="Background" Value="#2E3D5C"/>
     </Trigger>
     <Trigger Property="IsPressed" Value="True">
-      <Setter TargetName="bd" Property="Background" Value="#3A4C77"/>
+      <Setter TargetName="bd" Property="Background" Value="#35466B"/>
     </Trigger>
   </ControlTemplate.Triggers>
 </ControlTemplate>
@@ -2005,6 +2007,31 @@ function New-SendTemplate {
   return $script:sendTpl
 }
 
+# 危险操作（删除/确认删）：红底按钮，悬停亮一点；不走系统模板，避免悬停变白底
+function New-DangerTemplate {
+  if ($script:dangerTpl) { return $script:dangerTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="6" Padding="{TemplateBinding Padding}">
+    <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#FF8A8A"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#E05A5A"/>
+    </Trigger>
+    <Trigger Property="IsEnabled" Value="False">
+      <Setter TargetName="bd" Property="Background" Value="#5A3A3E"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:dangerTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:dangerTpl
+}
+
 # 底栏、左栏的按钮统一自绘：系统模板一悬停就是浅灰/白底，跟深色界面对不上
 $ModelPill.Template = (New-FlatTemplate)
 $ModeRead.Template = (New-FlatTemplate)
@@ -2016,6 +2043,15 @@ $StopBtn.Template = (New-FlatTemplate)
 $NewChatBtn.Template = (New-FlatTemplate)
 $SettingsBtn.Template = (New-FlatTemplate)
 $SendBtn.Template = (New-SendTemplate)
+# 设置面板、确认框、预览、输入浮层里的按钮也要同一套，不然一悬停就冒浅色块
+$CfgFetch.Template = (New-FlatTemplate)
+$CfgCancel.Template = (New-FlatTemplate)
+$ConfirmNo.Template = (New-FlatTemplate)
+$InputNo.Template = (New-FlatTemplate)
+$PreviewClose.Template = (New-FlatTemplate)
+$CfgSave.Template = (New-SendTemplate)
+$InputYes.Template = (New-SendTemplate)
+$ConfirmYes.Template = (New-DangerTemplate)
 
 function New-MenuRow([string]$text, [string]$mark) {
   $b = New-Object System.Windows.Controls.Button
@@ -2630,6 +2666,7 @@ function Handle-Event([string]$line) {
           $btn.Cursor = 'Hand'
           $btn.BorderThickness = '1'
           $btn.BorderBrush = (Brush '#1FFFFFFF')
+          $btn.Template = (New-FlatTemplate)
           $btn.Background = (Brush '#1A1D24')
           $btn.Foreground = (Brush '#CFD3D6')
           $btn.Tag = [string]$id

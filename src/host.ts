@@ -327,6 +327,17 @@ async function main(): Promise<void> {
     return { calls, prompt, completion, cacheRead }
   }
 
+  // 把「文字 + 本地文件」整理成一条要落进会话的用户消息：
+  // 附件先入库（拷进数据目录），文本类内联，图片留给 deriveMessages 按需读成 base64。
+  // 正着一轮（task）和插队（insert）共用，插话带附件才不会有第二套逻辑。
+  const prepare = async (text: string, paths: string[]): Promise<{ text: string; files?: Attachment[] }> => {
+    if (!paths.length) return { text }
+    const ing = await ingestFiles(opts.dataDir, session.id, paths, { vision: opts.vision })
+    if (ing.attachments.length) return { text: `${text}\n\n${ing.text}`, files: ing.attachments }
+    // 拷贝失败/被删就让模型知道，而不是静默少一个文件
+    return { text: `${text}\n\n[附件] 指定的 ${paths.length} 个文件都没读到（可能已被删除或没有权限）` }
+  }
+
   const runTask = async (text: string, files?: Attachment[]): Promise<void> => {
     if (running) {
       send({ type: 'error', message: '上一轮还没结束（可先点停止）' })
@@ -407,35 +418,33 @@ async function main(): Promise<void> {
         const text = String(cmd.text ?? '').trim()
         const paths = Array.isArray(cmd.files) ? (cmd.files as unknown[]).filter((x): x is string => typeof x === 'string') : []
         const run = async (): Promise<void> => {
-          let prompt = text
-          let files: Attachment[] | undefined
-          if (paths.length) {
-            // 附件先入库再开轮：拷贝失败/被删就让模型知道，而不是静默少一个文件
-            const ing = await ingestFiles(opts.dataDir, session.id, paths, { vision: opts.vision })
-            if (ing.attachments.length) {
-              prompt = `${text}\n\n${ing.text}`
-              files = ing.attachments
-            } else {
-              prompt = `${text}\n\n[附件] 指定的 ${paths.length} 个文件都没读到（可能已被删除或没有权限）`
-            }
-          }
-          await runTask(prompt, files)
+          const p = await prepare(text, paths)
+          await runTask(p.text, p.files)
         }
         // 关键：不能 await —— 否则执行期间读不到 stdin，approve/abort 永远进不来（死锁）
         if (text || paths.length) current = run().finally(() => { current = undefined })
         break
       }
-      // 插队：这一轮还在跑的时候，用户这句话直接落进当前会话，模型下一步就能看到
+      // 插队：这一轮还在跑的时候，用户这句话（连同附件）直接落进当前会话，模型下一步就能看到
       // （不做新一轮：不重新计 turn、不动正在跑的工具）
       case 'insert': {
         const text = String(cmd.text ?? '').trim()
-        if (!text) break
+        const paths = Array.isArray(cmd.files) ? (cmd.files as unknown[]).filter((x): x is string => typeof x === 'string') : []
+        if (!text && !paths.length) break
         if (running) {
-          await session.append({ kind: 'user/message', text })
-          send({ type: 'notice', text: '已插话：模型下一步就能看到' })
+          // 附件照样先入库再追加：图片会被 deriveMessages 读成 base64，文本类内联，
+          // 所以插话带图和带文件跟正常发一轮是同一套处理
+          const p = await prepare(text, paths)
+          await session.append({ kind: 'user/message', text: p.text, ...(p.files?.length ? { files: p.files } : {}) })
+          const n = p.files?.length ?? 0
+          send({ type: 'notice', text: n ? `已插话（带 ${n} 个附件）：模型下一步就能看到` : '已插话：模型下一步就能看到' })
         } else {
           // 没在跑就等同于正常发一轮
-          current = runTask(text).finally(() => { current = undefined })
+          const run = async (): Promise<void> => {
+            const p = await prepare(text, paths)
+            await runTask(p.text, p.files)
+          }
+          current = run().finally(() => { current = undefined })
         }
         break
       }

@@ -130,6 +130,63 @@ test('insert: 跑着的时候插话，模型下一步能看到，且不另起一
   }
 })
 
+test('insert: 插话也能带附件——图片和文件的处理跟正常发一轮一致', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pl-insert3-ws-'))
+  const dataDir = await mkdtemp(join(tmpdir(), 'pl-insert3-data-'))
+  // 附件里放一个文本文件，看它会不会被内联进下一步的模型请求
+  const notePath = join(root, 'note.txt')
+  await import('node:fs/promises').then((fs) => fs.writeFile(notePath, '这条来自附件\n', 'utf8'))
+  const llm = await startFakeLlm([
+    { toolCalls: [{ id: 'c1', name: 'write', args: { path: 'a.txt', content: 'hello\n' } }] },
+    { text: '收到附件' },
+  ])
+  const host = new HostProc([
+    '--cwd', root,
+    '--data-dir', dataDir,
+    '--base-url', llm.url,
+    '--api-key', 'sk-x',
+    '--model', 'demo-model',
+  ])
+
+  try {
+    await host.next('ready')
+    const sessionId = String(host.seen.find((e) => e.type === 'ready')!.session)
+    host.send({ cmd: 'task', text: '创建 a.txt' })
+    await host.next('turn-start')
+
+    // 跑着的时候带附件插一句
+    host.send({ cmd: 'insert', text: '顺便看看这个文件', files: [notePath] })
+    const notice = await host.next('notice')
+    assert.match(String(notice.text), /已插话（带 1 个附件）/)
+
+    const ap = await host.next('approval')
+    host.send({ cmd: 'approve', reqId: ap.reqId, decision: 'allowed-once' })
+    await host.next('tool-end')
+    assert.equal((await host.next('turn-end')).reason, 'done')
+    assert.equal(host.count('turn-start'), 1, '插话带附件也不该另开一轮')
+
+    // 模型下一步的请求里要有附件内容（文本类走内联），并且指明入库后的目录
+    const last = JSON.stringify(llm.requests[llm.requests.length - 1])
+    assert.match(last, /这条来自附件/)
+    assert.ok(last.includes('files') && last.includes(sessionId), '请求里要带上入库目录和这一步的会话 id')
+
+    // 会话里那条 user/message 带着 files（历史回放才能显出附件卡片）
+    const raw = await import('node:fs/promises').then((fs) =>
+      fs.readFile(join(dataDir, 'sessions', sessionId, 'session.jsonl'), 'utf8'),
+    )
+    const inserted = raw
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as { kind?: string; files?: Array<{ name: string; path: string }> })
+      .find((e) => e.kind === 'user/message' && JSON.stringify(e).includes('顺便看看这个文件'))
+    assert.deepEqual(inserted?.files?.map((f) => f.name), ['note.txt'])
+    assert.ok(String(inserted?.files?.[0]?.path).includes(sessionId), '附件要拷进这个会话的 files 目录')
+  } finally {
+    await host.close()
+    await llm.close()
+  }
+})
+
 test('insert: 没在跑的时候发 insert，等同于正常发一轮', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pl-insert2-ws-'))
   const dataDir = await mkdtemp(join(tmpdir(), 'pl-insert2-data-'))

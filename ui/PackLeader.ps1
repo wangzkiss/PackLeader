@@ -288,10 +288,6 @@ $xaml = @'
               <Button x:Name="AttachBtn" DockPanel.Dock="Left" Content="+ 附件" Height="26" Padding="9,0"
                       Cursor="Hand" FontSize="11.5" Margin="0,0,10,0"
                       Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF" BorderThickness="1"/>
-              <Button x:Name="InsertConvBtn" DockPanel.Dock="Left" Content="插话" Height="26" Padding="9,0"
-                      Cursor="Hand" FontSize="11" Margin="0,0,10,0"
-                      Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF" BorderThickness="1"
-                      ToolTip="正在跑的时候，把输入框里的话直接插进这一步（模型下一步就看到）；没在跑时等同发送"/>
               <Button x:Name="PickFolderBtn" DockPanel.Dock="Left" Content="目录" Height="26" Padding="9,0"
                       Cursor="Hand" FontSize="11" Margin="0,0,10,0" MaxWidth="240"
                       Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF" BorderThickness="1"
@@ -320,7 +316,7 @@ $xaml = @'
                 <Button x:Name="SendBtn" Content="发送" Height="26" Padding="14,0" Cursor="Hand" FontSize="11.5"
                         FontWeight="SemiBold" Background="#2B5CFF" Foreground="White" BorderThickness="0"/>
               </StackPanel>
-              <TextBlock x:Name="Hint" DockPanel.Dock="Left" Text="Enter 发送 · Shift+Enter 换行 · Ctrl+V 贴图"
+              <TextBlock x:Name="Hint" DockPanel.Dock="Left" Text="Enter 发送（跑着时插话）· Shift+Enter 换行 · Ctrl+V 贴图/附件"
                          Foreground="#5B626D" FontSize="10.5" VerticalAlignment="Center"
                          TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"/>
             </DockPanel>
@@ -675,7 +671,7 @@ $CfgOpenLogs = $window.FindName('CfgOpenLogs')
 $ModelChips = $window.FindName('ModelChips')
 $ModelHint = $window.FindName('ModelHint')
 $AttachBtn = $window.FindName('AttachBtn')
-$InsertConvBtn = $window.FindName('InsertConvBtn')
+
 $AttachList = $window.FindName('AttachList')
 $ImagePreview = $window.FindName('ImagePreview')
 $PreviewImage = $window.FindName('PreviewImage')
@@ -1165,20 +1161,30 @@ function Set-ToolLineDone([string]$id, [string]$text, [bool]$ok) {
 }
 
 # ---------------------------------------------------------------- 思考链
-# Kite 那样的样式：收起时就是一行「⋯ 思考了片刻  <开头一句>            0.9s ▸」，
+# Kite 那样的样式：收起时就是一行「⋯ 思考了4s  <开头一句>            ▸」，
 # 点一下展开看全文。流式时展开，出正文 / 调工具后自动收起。
 $script:reasonNode = $null
+
+# 收起时的标题直接报耗时：「思考了4s」。
+# 不足一秒也写 1s（写 0s 像是没想过）；超过一分钟改用「1分30秒」，几秒的数字太长了
+function Format-ReasonSecs([double]$secs) {
+  $s = [int][math]::Round($secs)
+  if ($s -lt 1) { $s = 1 }
+  if ($s -lt 60) { return "${s}s" }
+  return (Format-Elapsed $secs)
+}
 
 function Update-ReasoningHeader($n) {
   if (-not $n) { return }
   if ($n.Done) {
-    $n.Title.Text = '思考了片刻'
+    $n.Title.Text = '思考了' + (Format-ReasonSecs $n.Secs)
     $n.Title.Foreground = (Brush '#9BA3B4')
   } else {
     $n.Title.Text = '思考中…'
     $n.Title.Foreground = (Brush '#8FA6FF')
   }
-  $tail = $(if ($n.Secs -ge 0.1) { "$([math]::Round($n.Secs, 1))s " } else { '' })
+  # 耗时已经写进标题了，右边这一格只留展开/收起箭头，免得一处时间报两遍
+  $tail = $(if (-not $n.Done -and $n.Secs -ge 0.1) { "$([math]::Round($n.Secs, 1))s " } else { '' })
   $n.Time.Text = $tail + $(if ($n.Open) { '▾' } else { '▸' })
   # 收起时用正文开头一句当摘要（压成单行，超长截断）
   $s = ($n.Body.Text -replace "\s+", ' ').Trim()
@@ -2733,7 +2739,7 @@ $ModeRead.Template = (New-FlatTemplate)
 $ModeGuard.Template = (New-FlatTemplate)
 $ModeFull.Template = (New-FlatTemplate)
 $AttachBtn.Template = (New-FlatTemplate)
-$InsertConvBtn.Template = (New-FlatTemplate)
+
 $PickFolderBtn.Template = (New-FlatTemplate)
 $StopBtn.Template = (New-FlatTemplate)
 $NewChatBtn.Template = (New-FlatTemplate)
@@ -2971,17 +2977,7 @@ $AttachBtn.Add_Click({
   if ($dlg.ShowDialog()) { Add-Attachments $dlg.FileNames }
 })
 
-# 插话：和 Kite 一样直接插队——不弹历史选择，把输入框里的话塞进正在跑的这一步
-$InsertConvBtn.Add_Click({
-  param($s, $e)
-  $t = $InputBox.Text
-  if (-not $t.Trim()) {
-    Add-SystemLine '先在输入框里写下要插的话，再点「插话」' '#9BA3B4'
-    $InputBox.Focus() | Out-Null
-    return
-  }
-  Start-Turn $t
-})
+# 插队不单独放按钮：跑着的时候按 Enter 就是插话（见 Start-Turn 的 busy 分支）
 
 # 粘贴：Clipboard 里是图片或文件时收成附件。
 # WPF 的 TextBox 只认文本格式，截图/文件在它眼里“没东西可粘”——Ctrl+V 毫无反应，也不报错。
@@ -3213,13 +3209,16 @@ function Start-Turn([string]$text) {
   }
   $script:historyIdx = $script:history.Count
 
-  # 插队：正在跑的时候不另起一轮，只把这句话塞进当前会话，模型下一步就能看到。
-  # 附件没法插队（入库附件是挂在轮次上的），先说清楚再发文字。
+  # 插队：正在跑的时候不另起一轮，只把这句话（和附件）塞进当前会话，模型下一步就能看到。
+  # 附件同样先入库：图片进上下文当图片，文本类内联，其余给路径。
   if ($script:busy) {
-    if ($files.Count -gt 0) { Add-SystemLine '插话只能带文字：附件等这一轮结束再发' '#9BA3B4' }
-    Send-Host @{ cmd = 'insert'; text = $text }
-    Add-UserMessage $text
+    $payload = @{ cmd = 'insert'; text = $text }
+    if ($files.Count) { $payload.files = $files }
+    Send-Host $payload
+    Add-UserMessage $text $files
     $InputBox.Text = ''
+    $script:attachFiles.Clear()
+    Update-AttachList
     $Scroller.ScrollToEnd()
     return
   }

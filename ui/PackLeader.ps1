@@ -358,6 +358,30 @@ $xaml = @'
       </Border>
     </Grid>
 
+    <!-- 单行输入浮层：重命名会话、填分组名都用它（同样不用系统 InputBox，那是白底对话框） -->
+    <Grid x:Name="InputOverlay" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#B8000000">
+      <Border Width="420" Background="#16181D" BorderBrush="#26FFFFFF" BorderThickness="1" CornerRadius="12"
+              HorizontalAlignment="Center" VerticalAlignment="Center" Padding="22,20,22,18">
+        <StackPanel>
+          <TextBlock x:Name="InputTitle" Text="" Foreground="#F9FAFB" FontSize="14" FontWeight="SemiBold"
+                     TextWrapping="Wrap"/>
+          <TextBlock x:Name="InputHint" Text="" Foreground="#6B7280" FontSize="10.5" Margin="0,7,0,0"
+                     TextWrapping="Wrap" LineHeight="16"/>
+          <TextBox x:Name="InputField" AutomationProperties.AutomationId="InputField" Height="30"
+                   Margin="0,12,0,0" Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF"
+                   BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center" FontSize="12"
+                   CaretBrush="#8AB4FF"/>
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+            <Button x:Name="InputNo" Content="取消" Height="28" Padding="14,0" Cursor="Hand" FontSize="11.5"
+                    Background="Transparent" Foreground="#ADB2B8" BorderBrush="#1FFFFFFF" BorderThickness="1"
+                    Margin="0,0,8,0"/>
+            <Button x:Name="InputYes" AutomationProperties.AutomationId="InputYes" Content="确定" Height="28"
+                    Padding="18,0" Cursor="Hand" FontSize="11.5" FontWeight="SemiBold" Background="#2B5CFF"
+                    Foreground="White" BorderThickness="0"/>
+          </StackPanel>
+        </StackPanel>
+      </Border>
+    </Grid>
     <!-- 图片预览：点缩略图弹大图，点背景 / × / Esc 都能关 -->
     <Grid x:Name="ImagePreview" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#F2000000">
       <Grid.RowDefinitions>
@@ -454,6 +478,12 @@ $ConfirmNo = $window.FindName('ConfirmNo')
 $SideSplitter = $window.FindName('SideSplitter')
 $SideCol = $window.FindName('RootGrid').ColumnDefinitions[0]
 $SideScroll = $window.FindName('SideScroll')
+$InputOverlay = $window.FindName('InputOverlay')
+$InputTitle = $window.FindName('InputTitle')
+$InputHint = $window.FindName('InputHint')
+$InputField = $window.FindName('InputField')
+$InputYes = $window.FindName('InputYes')
+$InputNo = $window.FindName('InputNo')
 
 # ---------------------------------------------------------------- 画东西的小工具
 function Brush([string]$hex) {
@@ -614,6 +644,87 @@ function Add-UserMessage([string]$text, [object]$files = $null) {
   $sp.ContextMenu = (New-CopyMenu (@{ text = "你：$text" }))
   Append-CopyLog "你：$text"
   $script:currentAssistant = $null
+}
+
+# ---------------------------------------------------------------- 记忆卡片
+# 一轮结束后模型写了记忆就在这里显出来，并给一个「撤销」——
+# 不想要那条记忆时不用去翻数据目录里的 jsonl
+$script:memoryCards = New-Object System.Collections.ArrayList
+
+function Set-MemoryUndone($ids) {
+  $drop = @{}
+  foreach ($i in @($ids)) { $drop[[string]$i] = $true }
+  foreach ($c in @($script:memoryCards)) {
+    $all = @($c.ids)
+    $left = @($all | Where-Object { -not $drop.ContainsKey([string]$_) })
+    if ($left.Count -eq $all.Count) { continue }
+    $c.ids = $left
+    if ($left.Count -eq 0) {
+      $c.state.Text = '已撤销'
+      $c.state.Foreground = (Brush '#6B7280')
+      $c.btn.Visibility = 'Collapsed'
+      foreach ($row in @($c.rows)) { $row.Foreground = (Brush '#5B626D') }
+    }
+  }
+}
+
+function Add-MemoryCard([object]$items) {
+  $list = @(@($items) | Where-Object { $_ -and [string]$_.text })
+  if ($list.Count -eq 0) { return }
+  $sp = Add-Container 16
+  $outer = New-Object System.Windows.Controls.Border
+  $outer.Background = (Brush '#12141A')
+  $outer.BorderBrush = (Brush '#12FFFFFF')
+  $outer.BorderThickness = '1'
+  $outer.CornerRadius = '8'
+  $outer.Padding = '10,8'
+  $inner = New-Object System.Windows.Controls.StackPanel
+  $outer.Child = $inner
+
+  $head = New-Object System.Windows.Controls.DockPanel
+  $state = New-Text '' 10.5 '#5B626D' 'Normal' 'Segoe UI' 0
+  $state.VerticalAlignment = 'Center'
+  [System.Windows.Controls.DockPanel]::SetDock($state, 'Right')
+  $head.Children.Add($state) | Out-Null
+
+  $undo = New-Object System.Windows.Controls.Button
+  $undo.Content = '撤销'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($undo, 'MemoryUndo')
+  $undo.FontSize = 10.5
+  $undo.Padding = '8,2'
+  $undo.Cursor = 'Hand'
+  $undo.Background = [System.Windows.Media.Brushes]::Transparent
+  $undo.Foreground = (Brush '#8AB4FF')
+  $undo.BorderThickness = '0'
+  $undo.ToolTip = '把这轮记下的记忆删掉'
+  [System.Windows.Controls.DockPanel]::SetDock($undo, 'Right')
+  $undo.Add_MouseEnter({ param($s, $e) $s.Foreground = (Brush '#B9CDFF') })
+  $undo.Add_MouseLeave({ param($s, $e) $s.Foreground = (Brush '#8AB4FF') })
+  $head.Children.Add($undo) | Out-Null
+
+  $title = New-Text ("记住了 " + $list.Count + " 条") 11 '#9BA3B4' 'SemiBold' 'Segoe UI' 0
+  $title.VerticalAlignment = 'Center'
+  $head.Children.Add($title) | Out-Null
+  $inner.Children.Add($head) | Out-Null
+
+  $rows = New-Object System.Collections.ArrayList
+  foreach ($m in $list) {
+    $line = New-Text ('· ' + [string]$m.text) 11 '#7C838E' 'Normal' 'Segoe UI' 0
+    $line.TextWrapping = 'Wrap'
+    $line.LineHeight = 18
+    $line.LineStackingStrategy = 'BlockLineHeight'
+    $line.Margin = '0,5,0,0'
+    $inner.Children.Add($line) | Out-Null
+    [void]$rows.Add($line)
+  }
+
+  $card = @{ ids = @($list | ForEach-Object { [string]$_.id }); state = $state; btn = $undo; rows = $rows }
+  $undo.Tag = $card
+  $undo.Add_Click({ param($s, $e) Send-Host @{ cmd = 'undo-memory'; ids = @($s.Tag.ids) } })
+  [void]$script:memoryCards.Add($card)
+
+  $sp.Children.Add($outer) | Out-Null
+  $Scroller.ScrollToEnd()
 }
 
 function Add-AssistantMessage {
@@ -1048,77 +1159,217 @@ function Render-Markdown($hostPanel, [string]$text) {
   }
 }
 
+# 审批选项卡片模板：不用系统 Button 默认模板 —— 原生模板在 IsEnabled=False 时变浅灰白底，深色界面里刺眼
+function New-OptionTemplate {
+  if ($script:optTpl) { return $script:optTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="8" Padding="{TemplateBinding Padding}">
+    <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#1A1F27"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#232A35"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:optTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:optTpl
+}
+
+# 一个可选项：左边勾选位 + 标题（可带徽标）+ 说明
+function New-ChoiceCard([string]$title, [string]$desc, [string]$badge = '') {
+  $b = New-Object System.Windows.Controls.Button
+  $b.Cursor = 'Hand'
+  $b.Padding = '10,8'
+  $b.Margin = '0,5,0,0'
+  $b.HorizontalContentAlignment = 'Left'
+  $b.Background = (Brush '#12151A')
+  $b.BorderBrush = (Brush '#1FFFFFFF')
+  $b.BorderThickness = '1'
+  $b.Template = (New-OptionTemplate)
+
+  $grid = New-Object System.Windows.Controls.Grid
+  $c1 = New-Object System.Windows.Controls.ColumnDefinition
+  $c1.Width = [System.Windows.GridLength]::new(18.0)
+  $c2 = New-Object System.Windows.Controls.ColumnDefinition
+  $c2.Width = New-Object System.Windows.GridLength 1, ([System.Windows.GridUnitType]::Star)
+  $grid.ColumnDefinitions.Add($c1)
+  $grid.ColumnDefinitions.Add($c2)
+
+  $chk = New-Text ([string][char]0x2713) 12 '#7EA6FF' 'Bold' 'Segoe UI' 0
+  $chk.Visibility = 'Hidden'
+  $chk.VerticalAlignment = 'Top'
+  $chk.Margin = '0,1,0,0'
+  [System.Windows.Controls.Grid]::SetColumn($chk, 0)
+  $grid.Children.Add($chk) | Out-Null
+
+  $box = New-Object System.Windows.Controls.StackPanel
+  $tl = New-Object System.Windows.Controls.StackPanel
+  $tl.Orientation = 'Horizontal'
+  $tl.Children.Add((New-Text $title 11.5 '#E6E8EE' 'SemiBold' 'Segoe UI' 0)) | Out-Null
+  if ($badge) {
+    $bd = New-Object System.Windows.Controls.Border
+    $bd.Background = (Brush '#1D3A2C')
+    $bd.CornerRadius = '8'
+    $bd.Padding = '6,1'
+    $bd.Margin = '7,0,0,0'
+    $bd.VerticalAlignment = 'Center'
+    $bd.Child = (New-Text $badge 9.5 '#7BE0A8' 'Normal' 'Segoe UI' 0)
+    $tl.Children.Add($bd) | Out-Null
+  }
+  $box.Children.Add($tl) | Out-Null
+  if ($desc) {
+    $dt = New-Text $desc 11 '#8B929E' 'Normal' 'Segoe UI' 0
+    $dt.Margin = '0,3,0,0'
+    $box.Children.Add($dt) | Out-Null
+  }
+  [System.Windows.Controls.Grid]::SetColumn($box, 1)
+  $grid.Children.Add($box) | Out-Null
+
+  $b.Content = $grid
+  $b.Tag = @{ check = $chk }
+  return $b
+}
+
+# 审批卡：照 Kite「模型在问你」的样子 —— 深色卡 + 整块选项（✓ 选中 + 推荐徽标），
+# 选完收起选项、显示「你选了：…」。命令发 decision 字段，host 那边才认得出是允许还是拒绝
 function Add-ApprovalCard($e) {
+  $reqId = [string]$e.reqId
+
   $card = New-Object System.Windows.Controls.Border
-  $card.Background = (Brush '#17140C')
-  $card.BorderBrush = (Brush '#59FBBF24')
+  $card.Background = (Brush '#14171D')
+  $card.BorderBrush = (Brush '#2A2F39')
   $card.BorderThickness = '1'
-  $card.CornerRadius = '8'
-  $card.Padding = '12,10'
-  $card.Margin = '0,2,0,10'
+  $card.CornerRadius = '10'
+  $card.Padding = '14,12'
+  $card.Margin = '0,4,0,12'
 
   $sp = New-Object System.Windows.Controls.StackPanel
-  $head = New-Text "需要确认 · $($e.tool)" 12 '#FBBF24' 'SemiBold' 'Segoe UI' 3
-  $sp.Children.Add($head) | Out-Null
-  $reason = New-Text ([string]$e.reason) 11.5 '#CFD3D6' 'Normal' 'Segoe UI' 6
-  $sp.Children.Add($reason) | Out-Null
+
+  # 标题行：橙点 + 「模型在问你 · 工具」
+  $hd = New-Object System.Windows.Controls.DockPanel
+  $dot = New-Object System.Windows.Controls.Border
+  $dot.Width = 16
+  $dot.Height = 16
+  $dot.CornerRadius = '8'
+  $dot.Background = (Brush '#FBBF24')
+  $dot.VerticalAlignment = 'Center'
+  $dot.Child = (New-Text '!' 10.5 '#1A1710' 'Bold' 'Segoe UI' 0)
+  [System.Windows.Controls.DockPanel]::SetDock($dot, 'Left')
+  $hd.Children.Add($dot) | Out-Null
+  $tt = New-Text ('模型在问你 · ' + [string]$e.tool) 12.5 '#E6E8EE' 'SemiBold' 'Segoe UI' 0
+  $tt.VerticalAlignment = 'Center'
+  $tt.Margin = '8,0,0,0'
+  $hd.Children.Add($tt) | Out-Null
+  $sp.Children.Add($hd) | Out-Null
+
+  # 问题：这个工具要什么权限
+  $q = New-Text ([string]$e.reason) 12 '#CFD3D6' 'Normal' 'Segoe UI' 0
+  $q.Margin = '0,8,0,0'
+  $sp.Children.Add($q) | Out-Null
 
   if ($e.detail) {
-    $det = New-Text ([string]$e.detail) 11 '#9BA3B4' 'Normal' 'Cascadia Mono, Consolas' 8
-    $det.TextWrapping = 'Wrap'
-    $det.MaxHeight = 90
-    $sp.Children.Add($det) | Out-Null
+    $detBox = New-Object System.Windows.Controls.Border
+    $detBox.Background = (Brush '#0E1116')
+    $detBox.BorderBrush = (Brush '#14FFFFFF')
+    $detBox.BorderThickness = '1'
+    $detBox.CornerRadius = '6'
+    $detBox.Padding = '9,7'
+    $detBox.Margin = '0,8,0,0'
+    $det = New-Text ([string]$e.detail) 11 '#9BA3B4' 'Normal' 'Cascadia Mono, Consolas' 0
+    $det.MaxHeight = 96
+    $detBox.Child = $det
+    $sp.Children.Add($detBox) | Out-Null
   }
 
-  $btns = New-Object System.Windows.Controls.StackPanel
-  $btns.Orientation = 'Horizontal'
+  # 「你选了：…」，选完才显示
+  $chosen = New-Text '' 11.5 '#C7CBD2' 'Normal' 'Segoe UI' 0
+  $chosen.Margin = '0,8,0,0'
+  $chosen.Visibility = 'Collapsed'
+  $sp.Children.Add($chosen) | Out-Null
 
-  $yes = New-Object System.Windows.Controls.Button
-  $yes.Content = '允许一次'
-  $yes.Height = 26
-  $yes.Padding = '12,0'
-  $yes.FontSize = 11.5
-  $yes.Cursor = 'Hand'
-  $yes.Background = (Brush '#FBBF24')
-  $yes.Foreground = (Brush '#1A1710')
-  $yes.BorderThickness = '0'
-  $yes.FontWeight = [System.Windows.FontWeights]::SemiBold
+  $optWrap = New-Object System.Windows.Controls.StackPanel
+  $optWrap.Margin = '0,6,0,0'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($optWrap, 'ApprovalOptions')
 
-  $no = New-Object System.Windows.Controls.Button
-  $no.Content = '拒绝'
-  $no.Height = 26
-  $no.Padding = '12,0'
-  $no.FontSize = 11.5
-  $no.Cursor = 'Hand'
-  $no.Margin = '8,0,0,0'
-  $no.Background = [System.Windows.Media.Brushes]::Transparent
-  $no.Foreground = (Brush '#CFD3D6')
-  $no.BorderBrush = (Brush '#26FFFFFF')
-  $no.BorderThickness = '1'
+  $yes = New-ChoiceCard '允许一次' '只放行这一次；下次遇到同样的操作还会再问' '推荐'
+  $no = New-ChoiceCard '拒绝' '这一轮不再执行这条命令，模型要换个做法'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($yes, 'ApprovalAllow')
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($no, 'ApprovalDeny')
+  $optWrap.Children.Add($yes) | Out-Null
+  $optWrap.Children.Add($no) | Out-Null
+  $sp.Children.Add($optWrap) | Out-Null
 
-  # reqId 挂在按钮 Tag 上，别靠 GetNewClosure：PS 5.1 下闭包在这里拿不到 $reqId，
-  # 点「允许一次」会发出 reqId=null，host 那边对不上号，审批就一直悬着
-  $reqId = [string]$e.reqId
-  $yes.Tag = $reqId
+  # 收起 / 展开选项
+  $toggle = New-Object System.Windows.Controls.Button
+  $toggle.Padding = '0'
+  $toggle.Margin = '2,8,0,0'
+  $toggle.HorizontalAlignment = 'Left'
+  $toggle.Cursor = 'Hand'
+  $toggle.Background = [System.Windows.Media.Brushes]::Transparent
+  $toggle.BorderThickness = '0'
+  $toggle.Foreground = (Brush '#7C838E')
+  $toggle.FontSize = 11
+  $toggle.Content = ([string][char]0x2304) + ' 收起选项'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($toggle, 'ApprovalToggle')
+  $sp.Children.Add($toggle) | Out-Null
+
+  # 卡片之间要互相引用，统一挂在一份哈希上（PS 5.1 的事件回调里拿不到外部变量，只能从 Tag 取）
+  $ctx = @{ reqId = $reqId; options = $optWrap; toggle = $toggle; chosen = $chosen; yes = $yes; no = $no; done = $false }
+  foreach ($b in @($yes, $no)) { $b.Tag.ctx = $ctx }
+  $toggle.Tag = $ctx
+
   $yes.Add_Click({
-    param($s, $e)
-    Send-Host @{ cmd = 'approve'; reqId = [string]$s.Tag; allowed = $true }
-    $s.Parent.IsEnabled = $false
-    $s.Content = '已允许'
+    param($s, $ev)
+    $c = $s.Tag.ctx
+    if ($c.done) { return }
+    $c.done = $true
+    Send-Host @{ cmd = 'approve'; reqId = $c.reqId; decision = 'allowed-once' }
+    $s.BorderBrush = (Brush '#4F7DF0')
+    $s.Background = (Brush '#161B26')
+    $s.Tag.check.Visibility = 'Visible'
+    $c.no.BorderBrush = (Brush '#1FFFFFFF')
+    $c.no.IsEnabled = $false
+    $c.chosen.Text = '你选了：允许一次'
+    $c.chosen.Visibility = 'Visible'
+    $c.options.Visibility = 'Collapsed'
+    $c.toggle.Content = ([string][char]0x2304) + ' 展开选项'
   })
-  $no.Tag = $reqId
   $no.Add_Click({
-    param($s, $e)
-    Send-Host @{ cmd = 'approve'; reqId = [string]$s.Tag; allowed = $false }
-    $s.Parent.IsEnabled = $false
-    $s.Content = '已拒绝'
+    param($s, $ev)
+    $c = $s.Tag.ctx
+    if ($c.done) { return }
+    $c.done = $true
+    Send-Host @{ cmd = 'approve'; reqId = $c.reqId; decision = 'denied' }
+    $s.BorderBrush = (Brush '#B45454')
+    $s.Background = (Brush '#1B1416')
+    $s.Tag.check.Visibility = 'Visible'
+    $c.yes.BorderBrush = (Brush '#1FFFFFFF')
+    $c.yes.IsEnabled = $false
+    $c.chosen.Text = '你选了：拒绝'
+    $c.chosen.Visibility = 'Visible'
+    $c.options.Visibility = 'Collapsed'
+    $c.toggle.Content = ([string][char]0x2304) + ' 展开选项'
   })
-
-  $btns.Children.Add($yes) | Out-Null
-  $btns.Children.Add($no) | Out-Null
-  $sp.Children.Add($btns) | Out-Null
+  $toggle.Add_Click({
+    param($s, $ev)
+    $c = $s.Tag
+    if ([string]$c.options.Visibility -eq 'Collapsed') {
+      $c.options.Visibility = 'Visible'
+      $s.Content = ([string][char]0x2304) + ' 收起选项'
+    } else {
+      $c.options.Visibility = 'Collapsed'
+      $s.Content = ([string][char]0x2304) + ' 展开选项'
+    }
+  })
 
   $card.Child = $sp
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($card, 'ApprovalCard')
   $Transcript.Children.Add($card) | Out-Null
   $Scroller.ScrollToEnd()
 }
@@ -1134,6 +1385,185 @@ function Format-Ago($ms) {
   return "$([math]::Floor($h / 24)) 天前"
 }
 
+# 会话行的右键菜单：重命名 / 移到分组 / 取消分组 / 删除
+# 菜单项的 Tag 挂一份哈希表（id / title / group），回调从 $s.Tag 取——
+# PS 5.1 下事件里的 GetNewClosure 拿不到外部变量
+function New-SessionMenu([object]$box) {
+  $cm = New-Object System.Windows.Controls.ContextMenu
+  $cm.Background = (Brush '#14171D')
+  $cm.Foreground = (Brush '#E6E8EE')
+  $cm.BorderBrush = (Brush '#2A2F39')
+  $cm.BorderThickness = '1'
+  $cm.Template = (New-CtxTemplate)
+
+  $mi = New-Object System.Windows.Controls.MenuItem
+  $mi.Header = '重命名…'
+  $mi.Foreground = (Brush '#E6E8EE')
+  $mi.Background = [System.Windows.Media.Brushes]::Transparent
+  $mi.Padding = '0'
+  $mi.Template = (New-MenuItemTemplate)
+  $mi.Tag = $box
+  $mi.Add_Click({
+    param($s, $e)
+    $b = $s.Tag
+    Show-Input -title ('重命名「' + $b.title + '」') -hint '留空＝恢复成用第一条消息当标题' -value ([string]$b.title) -okText '重命名' `
+               -onOk { param($r) Send-Host @{ cmd = 'rename-session'; id = [string]$r.arg.id; title = [string]$r.text } } `
+               -arg @{ id = [string]$b.id }
+  })
+  $cm.Items.Add($mi) | Out-Null
+
+  $mg = New-Object System.Windows.Controls.MenuItem
+  $mg.Header = '移到分组…'
+  $mg.Foreground = (Brush '#E6E8EE')
+  $mg.Background = [System.Windows.Media.Brushes]::Transparent
+  $mg.Padding = '0'
+  $mg.Template = (New-MenuItemTemplate)
+  $mg.Tag = $box
+  $mg.Add_Click({
+    param($s, $e)
+    $b = $s.Tag
+    $hint = $(if (@($script:sessionGroups).Count -gt 0) {
+      '已有分组：' + (@($script:sessionGroups) -join '、') + '。填新名字就是新建一个分组；留空＝移到未分组'
+    } else { '填一个组名（比如项目名）；留空＝未分组' })
+    Show-Input -title '移到分组' -hint $hint -value ([string]$b.group) -okText '移动' `
+               -onOk { param($r) Send-Host @{ cmd = 'group-session'; id = [string]$r.arg.id; group = [string]$r.text } } `
+               -arg @{ id = [string]$b.id }
+  })
+  $cm.Items.Add($mg) | Out-Null
+
+  if ([string]$box.group) {
+    $mu = New-Object System.Windows.Controls.MenuItem
+    $mu.Header = '取消分组'
+    $mu.Foreground = (Brush '#E6E8EE')
+    $mu.Background = [System.Windows.Media.Brushes]::Transparent
+    $mu.Padding = '0'
+    $mu.Template = (New-MenuItemTemplate)
+    $mu.Tag = $box
+    $mu.Add_Click({ param($s, $e) Send-Host @{ cmd = 'group-session'; id = [string]$s.Tag.id; group = '' } })
+    $cm.Items.Add($mu) | Out-Null
+  }
+
+  $md = New-Object System.Windows.Controls.MenuItem
+  $md.Header = '删除会话…'
+  $md.Foreground = (Brush '#E6E8EE')
+  $md.Background = [System.Windows.Media.Brushes]::Transparent
+  $md.Padding = '0'
+  $md.Template = (New-MenuItemTemplate)
+  $md.Tag = $box
+  $md.Add_Click({
+    param($s, $e)
+    $b = $s.Tag
+    Show-Confirm -title ('删除会话「' + $b.title + '」？') `
+                 -text "会删掉它的会话日志和 checkpoint，不能恢复。会话里的附件文件也会一起删。" `
+                 -yesText '删除' `
+                 -onYes { param($targetId) Send-Host @{ cmd = 'delete-session'; id = $targetId } } `
+                 -arg $b.id
+  })
+  $cm.Items.Add($md) | Out-Null
+
+  return $cm
+}
+
+# 左栏一行会话：标题 + N 轮 · 时间，悬停露出 ×，右键出菜单
+function New-SessionRow($it) {
+  $row = New-Object System.Windows.Controls.Border
+  $row.CornerRadius = '7'
+  $row.Padding = '8,6'
+  $row.Margin = '0,2,0,2'
+  $row.Cursor = 'Hand'
+  $sid = [string]$it.id
+  $stitle = [string]$it.title
+  $selected = ($sid -eq [string]$script:sessionId)
+  $row.Background = $(if ($selected) { Brush '#20242E' } else { [System.Windows.Media.Brushes]::Transparent })
+
+  $grid = New-Object System.Windows.Controls.Grid
+  $c1 = New-Object System.Windows.Controls.ColumnDefinition
+  $c1.Width = New-Object System.Windows.GridLength 1, ([System.Windows.GridUnitType]::Star)
+  $c2 = New-Object System.Windows.Controls.ColumnDefinition
+  $c2.Width = [System.Windows.GridLength]::Auto
+  $grid.ColumnDefinitions.Add($c1)
+  $grid.ColumnDefinitions.Add($c2)
+
+  $sp = New-Object System.Windows.Controls.StackPanel
+  $t = New-Text $stitle 12 '#E6E8EE' 'Normal' 'Segoe UI' 2
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($t, 'SessionTitle')
+  $t.TextTrimming = 'CharacterEllipsis'
+  $t.TextWrapping = 'NoWrap'
+  $sp.Children.Add($t) | Out-Null
+  $meta = New-Text "$($it.turns) 轮 · $(Format-Ago $it.updatedAt)" 10 '#6B7280' 'Normal' 'Segoe UI' 0
+  $sp.Children.Add($meta) | Out-Null
+  [System.Windows.Controls.Grid]::SetColumn($sp, 0)
+  $grid.Children.Add($sp) | Out-Null
+
+  # 删除按钮：平时藏着，鼠标移到这一行才露出来
+  $del = New-Object System.Windows.Controls.Button
+  # 删除用垃圾桶图标（Segoe MDL2 Assets 的 E74D），不用字符 ×——在深色界面上太像关窗口
+  $del.Content = [string][char]0xE74D
+  $del.FontFamily = (New-Object System.Windows.Media.FontFamily('Segoe MDL2 Assets'))
+  $del.FontSize = 12
+  $del.Width = 22
+  $del.Height = 22
+  $del.Padding = '0'
+  $del.Cursor = 'Hand'
+  $del.Background = [System.Windows.Media.Brushes]::Transparent
+  $del.Foreground = (Brush '#6B7280')
+  $del.BorderThickness = '0'
+  # 自绘模板：系统 Button 一悬停就是浅色底，深色行上一块白方块很跳
+  $del.Template = (New-FlatTemplate)
+  $del.VerticalAlignment = 'Center'
+  $del.Visibility = 'Hidden'
+  $del.ToolTip = '删除这个会话'
+  [System.Windows.Controls.Grid]::SetColumn($del, 1)
+  $grid.Children.Add($del) | Out-Null
+
+  $row.Tag = @{ id = $sid; title = $stitle; group = ([string]$it.group); del = $del }
+  $del.Tag = $row.Tag
+  $del.Add_Click({
+    param($s, $ev)
+    $ev.Handled = $true
+    Show-Confirm -title ('删除会话「' + $s.Tag.title + '」？') `
+                 -text "会删掉它的会话日志和 checkpoint，不能恢复。会话里的附件文件也会一起删。" `
+                 -yesText '删除' `
+                 -onYes { param($targetId) Send-Host @{ cmd = 'delete-session'; id = $targetId } } `
+                 -arg $s.Tag.id
+  })
+  $del.Add_MouseEnter({ param($s, $e) $s.Foreground = (Brush '#F87171') })
+  $del.Add_MouseLeave({ param($s, $e) $s.Foreground = (Brush '#6B7280') })
+
+  $row.Child = $grid
+  $row.ContextMenu = (New-SessionMenu $row.Tag)
+
+  $row.Add_MouseLeftButtonUp({
+    param($s, $e)
+    Send-Host @{ cmd = 'load-session'; id = [string]$s.Tag.id }
+  })
+  $row.Add_MouseEnter({
+    param($s, $e)
+    $s.Background = (Brush '#1B1F27')
+    $s.Tag.del.Visibility = 'Visible'
+  })
+  $row.Add_MouseLeave({
+    param($s, $e)
+    $s.Tag.del.Visibility = 'Hidden'
+    if ($s.Tag.id -eq [string]$script:sessionId) { $s.Background = (Brush '#20242E') }
+    else { $s.Background = [System.Windows.Media.Brushes]::Transparent }
+  })
+  return $row
+}
+
+# 组名 → 是否收起（只在这次运行里记，不落盘）
+$script:groupCollapsed = @{}
+# 现有的分组名：右键「移到分组」时当提示
+$script:sessionGroups = @()
+
+function Toggle-SessionGroup($t) {
+  $now = -not [bool]$script:groupCollapsed[$t.key]
+  $script:groupCollapsed[$t.key] = $now
+  $t.panel.Visibility = $(if ($now) { 'Collapsed' } else { 'Visible' })
+  $t.chevron.Text = $(if ($now) { '▸' } else { '▾' })
+  Log ("组头切换：'" + [string]$t.key + "' → " + $(if ($now) { '收起' } else { '展开' }))
+}
+
 function Set-Sessions($items) {
   # 记一份标题：左栏宽度上限按「最长的那个标题能不能完整显示」来定
   $script:sideTitles = @()
@@ -1146,88 +1576,60 @@ function Set-Sessions($items) {
     Update-SideFit
     return
   }
+  # 按组分：有组的按名字排，没组的放最后。host 已经按 updatedAt 倒序给过，组内不再重排
+  $buckets = [ordered]@{}
   foreach ($it in $items) {
-    $row = New-Object System.Windows.Controls.Border
-    $row.CornerRadius = '7'
-    $row.Padding = '8,6'
-    $row.Margin = '0,2,0,2'
-    $row.Cursor = 'Hand'
-    $sid = [string]$it.id
-    $stitle = [string]$it.title
-    $selected = ($sid -eq [string]$script:sessionId)
-    $row.Background = $(if ($selected) { Brush '#20242E' } else { [System.Windows.Media.Brushes]::Transparent })
-
-    $grid = New-Object System.Windows.Controls.Grid
-    $c1 = New-Object System.Windows.Controls.ColumnDefinition
-    $c1.Width = New-Object System.Windows.GridLength 1, ([System.Windows.GridUnitType]::Star)
-    $c2 = New-Object System.Windows.Controls.ColumnDefinition
-    $c2.Width = [System.Windows.GridLength]::Auto
-    $grid.ColumnDefinitions.Add($c1)
-    $grid.ColumnDefinitions.Add($c2)
-
-    $sp = New-Object System.Windows.Controls.StackPanel
-    $t = New-Text $stitle 12 '#E6E8EE' 'Normal' 'Segoe UI' 2
-    $t.TextTrimming = 'CharacterEllipsis'
-    $t.TextWrapping = 'NoWrap'
-    $sp.Children.Add($t) | Out-Null
-    $meta = New-Text "$($it.turns) 轮 · $(Format-Ago $it.updatedAt)" 10 '#6B7280' 'Normal' 'Segoe UI' 0
-    $sp.Children.Add($meta) | Out-Null
-    [System.Windows.Controls.Grid]::SetColumn($sp, 0)
-    $grid.Children.Add($sp) | Out-Null
-
-    # 删除按钮：平时藏着，鼠标移到这一行才露出来
-    $del = New-Object System.Windows.Controls.Button
-    $del.Content = '×'
-    $del.FontSize = 15
-    $del.Width = 22
-    $del.Height = 22
-    $del.Padding = '0'
-    $del.Cursor = 'Hand'
-    $del.Background = [System.Windows.Media.Brushes]::Transparent
-    $del.Foreground = (Brush '#6B7280')
-    $del.BorderThickness = '0'
-    $del.VerticalAlignment = 'Center'
-    $del.Visibility = 'Hidden'
-    $del.ToolTip = '删除这个会话'
-    [System.Windows.Controls.Grid]::SetColumn($del, 1)
-    $grid.Children.Add($del) | Out-Null
-
-    # 这一行的 id / 标题 / 删除按钮全挂在 $row.Tag 上，回调从 $s.Tag 取：
-    # PS 5.1 下这些事件里的 GetNewClosure 拿不到外部变量（实测出去的 id 是 null，
-    # host 回「非法会话 id」；点行切会话、hover 判断选中行也是同一个毛病）
-    $row.Tag = @{ id = $sid; title = $stitle; del = $del }
-    $del.Tag = $row.Tag
-    $del.Add_Click({
-      param($s, $ev)
-      $ev.Handled = $true
-      Show-Confirm -title ('删除会话「' + $s.Tag.title + '」？') `
-                   -text "会删掉它的会话日志和 checkpoint，不能恢复。会话里的附件文件也会一起删。" `
-                   -yesText '删除' `
-                   -onYes { param($targetId) Send-Host @{ cmd = 'delete-session'; id = $targetId } } `
-                   -arg $s.Tag.id
-    })
-    $del.Add_MouseEnter({ param($s, $e) $s.Foreground = (Brush '#F87171') })
-    $del.Add_MouseLeave({ param($s, $e) $s.Foreground = (Brush '#6B7280') })
-
-    $row.Child = $grid
-
-    $row.Add_MouseLeftButtonUp({
-      param($s, $e)
-      Send-Host @{ cmd = 'load-session'; id = [string]$s.Tag.id }
-    })
-    $row.Add_MouseEnter({
-      param($s, $e)
-      $s.Background = (Brush '#1B1F27')
-      $s.Tag.del.Visibility = 'Visible'
-    })
-    $row.Add_MouseLeave({
-      param($s, $e)
-      $s.Tag.del.Visibility = 'Hidden'
-      if ($s.Tag.id -eq [string]$script:sessionId) { $s.Background = (Brush '#20242E') }
-      else { $s.Background = [System.Windows.Media.Brushes]::Transparent }
-    })
-
-    $SessionList.Children.Add($row) | Out-Null
+    $g = ([string]$it.group).Trim()
+    if (-not $buckets.Contains($g)) { $buckets[$g] = New-Object System.Collections.ArrayList }
+    $buckets[$g].Add($it) | Out-Null
+  }
+  $script:sessionGroups = @($buckets.Keys | Where-Object { $_ -ne '' } | Sort-Object)
+  $names = @($script:sessionGroups) + ''
+  foreach ($g in $names) {
+    if (-not $buckets.Contains($g)) { continue }
+    $rows = $buckets[$g]
+    $panel = New-Object System.Windows.Controls.StackPanel
+    foreach ($it in $rows) { $panel.Children.Add((New-SessionRow $it)) | Out-Null }
+    # 一个分组都没有时不显示「未分组」这个头，跟以前一样平铺
+    if ($g -ne '' -or $script:sessionGroups.Count -gt 0) {
+      $label = $(if ($g) { $g } else { '未分组' })
+      $collapsed = [bool]$script:groupCollapsed[$g]
+      # 组头用 Button 而不是 Border：Button 有 AutomationPeer，UIA 能直接 Invoke，
+      # 圆角/悬停交给 New-FlatTemplate（和底部模型按钮同一套）
+      $head = New-Object System.Windows.Controls.Button
+      $head.Padding = '8,3'
+      $head.Margin = '0,6,0,2'
+      $head.Cursor = 'Hand'
+      $head.HorizontalContentAlignment = 'Left'
+      $head.Background = [System.Windows.Media.Brushes]::Transparent
+      $head.BorderThickness = '0'
+      $head.Template = (New-FlatTemplate)
+      $head.ToolTip = '点击收起 / 展开这个分组'
+      [System.Windows.Automation.AutomationProperties]::SetAutomationId($head, 'SessionGroupHead')
+      # Button 的 Content 是个 StackPanel，UIA 取不到 Name；显式给一个（验证脚本靠它认组）
+      [System.Windows.Automation.AutomationProperties]::SetName($head, $label)
+      $hline = New-Object System.Windows.Controls.StackPanel
+      $hline.Orientation = 'Horizontal'
+      $ch = New-Text $(if ($collapsed) { '▸' } else { '▾' }) 9.5 '#6B7280' 'Normal' 'Segoe UI' 0
+      $ch.VerticalAlignment = 'Center'
+      $nm = New-Text $label 10.5 '#8A91A0' 'SemiBold' 'Segoe UI' 0
+      [System.Windows.Automation.AutomationProperties]::SetAutomationId($nm, 'SessionGroupName')
+      $nm.Margin = '5,0,0,0'
+      $nm.TextTrimming = 'CharacterEllipsis'
+      $nm.VerticalAlignment = 'Center'
+      $cnt = New-Text ([string]$rows.Count) 9.5 '#4B5158' 'Normal' 'Segoe UI' 0
+      $cnt.Margin = '6,0,0,0'
+      $cnt.VerticalAlignment = 'Center'
+      $hline.Children.Add($ch) | Out-Null
+      $hline.Children.Add($nm) | Out-Null
+      $hline.Children.Add($cnt) | Out-Null
+      $head.Content = $hline
+      $head.Tag = @{ key = $g; panel = $panel; chevron = $ch }
+      $head.Add_Click({ param($s, $e) Toggle-SessionGroup $s.Tag })
+      $SessionList.Children.Add($head) | Out-Null
+      $panel.Visibility = $(if ($collapsed) { 'Collapsed' } else { 'Visible' })
+    }
+    $SessionList.Children.Add($panel) | Out-Null
   }
   # 标题变了：重新量一次左栏该有多宽（撑不下就放宽上限，全都装得下就收紧）
   Update-SideFit
@@ -1242,6 +1644,7 @@ function Clear-Transcript {
   $script:toolGroup = $null
   $script:assistantBox = $null
   $script:copyLog.Clear() | Out-Null
+  $script:memoryCards = New-Object System.Collections.ArrayList
 $script:verifyRows = @{}
 }
 
@@ -1424,6 +1827,52 @@ $ConfirmYes.Add_Click({
   if ($run) { & $run $arg }
 })
 
+# ---------------------------------------------------------------- 单行输入（重命名 / 分组）
+# 和确认框同一套深色浮层：不用 Microsoft.VisualBasic 的 InputBox（白底系统框，样式不统一）
+$script:inputRun = $null
+$script:inputArg = $null
+
+# 回调参数：$r.arg 是调用方给的上下文，$r.text 是用户输入（已 Trim）
+function Show-Input {
+  param([string]$title, [string]$hint = '', [string]$value = '', [string]$okText = '确定', [scriptblock]$onOk, [object]$arg)
+  $InputTitle.Text = $title
+  $InputHint.Text = $hint
+  $InputHint.Visibility = $(if ($hint) { 'Visible' } else { 'Collapsed' })
+  $InputField.Text = $value
+  $InputYes.Content = $okText
+  $script:inputRun = $onOk
+  $script:inputArg = $arg
+  $InputOverlay.Visibility = 'Visible'
+  $InputField.Focus() | Out-Null
+  $InputField.SelectAll()
+}
+
+function Hide-Input {
+  $InputOverlay.Visibility = 'Collapsed'
+  $script:inputRun = $null
+  $script:inputArg = $null
+}
+
+function Submit-Input {
+  $run = $script:inputRun
+  $r = @{ arg = $script:inputArg; text = ([string]$InputField.Text).Trim() }
+  Hide-Input
+  if ($run) { & $run $r }
+}
+
+$InputNo.Add_Click({ Hide-Input })
+$InputYes.Add_Click({ Submit-Input })
+$InputField.Add_PreviewKeyDown({
+  param($s, $e)
+  if ($e.Key -eq [System.Windows.Input.Key]::Return) { $e.Handled = $true; Submit-Input }
+  elseif ($e.Key -eq [System.Windows.Input.Key]::Escape) { $e.Handled = $true; Hide-Input }
+})
+$InputOverlay.Add_MouseLeftButtonUp({
+  param($s, $e)
+  # 点浮层的空白处 = 取消（点在卡片上时 OriginalSource 不是浮层本身）
+  if ([object]::ReferenceEquals($e.OriginalSource, $InputOverlay)) { Hide-Input }
+})
+
 # ---------------------------------------------------------------- 附件
 $script:attachFiles = New-Object System.Collections.ArrayList
 
@@ -1508,6 +1957,65 @@ function New-FlatTemplate {
   $script:flatTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
   return $script:flatTpl
 }
+
+# 选中态专用模板：悬停 / 按下都保持蓝底，不被灰色 hover 盖掉选中感
+function New-SelTemplate {
+  if ($script:selTpl) { return $script:selTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="6" Padding="{TemplateBinding Padding}">
+    <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#2F3F63"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#3A4C77"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:selTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:selTpl
+}
+
+# 发送键：蓝色实心，悬停亮一点、禁用变暗蓝，同样不走系统模板
+function New-SendTemplate {
+  if ($script:sendTpl) { return $script:sendTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="6" Padding="{TemplateBinding Padding}">
+    <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#3D6CFF"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#2450E0"/>
+    </Trigger>
+    <Trigger Property="IsEnabled" Value="False">
+      <Setter TargetName="bd" Property="Background" Value="#2F3A5C"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:sendTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:sendTpl
+}
+
+# 底栏、左栏的按钮统一自绘：系统模板一悬停就是浅灰/白底，跟深色界面对不上
+$ModelPill.Template = (New-FlatTemplate)
+$ModeRead.Template = (New-FlatTemplate)
+$ModeGuard.Template = (New-FlatTemplate)
+$ModeFull.Template = (New-FlatTemplate)
+$AttachBtn.Template = (New-FlatTemplate)
+$PickFolderBtn.Template = (New-FlatTemplate)
+$StopBtn.Template = (New-FlatTemplate)
+$NewChatBtn.Template = (New-FlatTemplate)
+$SettingsBtn.Template = (New-FlatTemplate)
+$SendBtn.Template = (New-SendTemplate)
 
 function New-MenuRow([string]$text, [string]$mark) {
   $b = New-Object System.Windows.Controls.Button
@@ -1682,13 +2190,16 @@ function Update-AttachList {
     $txt.Children.Add((New-Text (Format-FileSize $size) 9.5 '#7C838E' 'Normal' 'Segoe UI' 1)) | Out-Null
     $sp.Children.Add($txt) | Out-Null
     $x = New-Object System.Windows.Controls.Button
-    $x.Content = '×'
+    # 移除也是这样：垃圾桶图标，不用字符 ×
+    $x.Content = [string][char]0xE74D
+    $x.FontFamily = (New-Object System.Windows.Media.FontFamily('Segoe MDL2 Assets'))
     $x.Width = 16
     $x.Height = 16
     $x.Margin = '6,0,0,0'
-    $x.FontSize = 11
+    $x.FontSize = 10.5
     $x.Cursor = 'Hand'
     $x.BorderThickness = '0'
+    $x.Template = (New-FlatTemplate)
     $x.Background = [System.Windows.Media.Brushes]::Transparent
     $x.Foreground = (Brush '#7C838E')
     $x.VerticalAlignment = 'Center'
@@ -1875,11 +2386,14 @@ function Set-ModeVisual([string]$m) {
   foreach ($k in $script:modeButtons.Keys) {
     $b = $script:modeButtons[$k]
     if ($k -eq $m) {
-      $b.Background = (Brush '#232A3D')
+      # 选中：蓝底蓝字，模板也换成 Sel 版 —— 悬停时仍是蓝的，不会被灰色 hover 盖掉
+      $b.Background = (Brush '#263450')
       $b.Foreground = (Brush '#8FA6FF')
+      $b.Template = (New-SelTemplate)
     } else {
       $b.Background = [System.Windows.Media.Brushes]::Transparent
       $b.Foreground = (Brush '#ADB2B8')
+      $b.Template = (New-FlatTemplate)
     }
   }
 }
@@ -1964,6 +2478,13 @@ function Handle-Event([string]$line) {
               if ($ev.ok) { Set-ToolLineDone ([string]$ev.callId) "✓  $($ev.ms)ms" $true }
               else { Set-ToolLineDone ([string]$ev.callId) '✕  失败' $false }
             }
+          }
+          elseif ($ev.kind -eq 'memory/saved') {
+            # 历史里的记忆也回放出来，可以照样撤销
+            Add-MemoryCard $ev.items | Out-Null
+          }
+          elseif ($ev.kind -eq 'memory/undone') {
+            Set-MemoryUndone @($ev.ids)
           }
         }
         if ($e.events.Count -gt 0) {
@@ -2137,6 +2658,8 @@ function Handle-Event([string]$line) {
       Send-Host @{ cmd = 'list-sessions' }
       $Scroller.ScrollToEnd()
     }
+    'memory-saved' { Add-MemoryCard $e.items }
+    'memory-undone' { Set-MemoryUndone @($e.ids) }
     'sessions' { Set-Sessions $e.items }
     'mode' { Set-ModeVisual ([string]$e.mode); $SubTitle.Text = [string]$e.mode }
     'model' { $script:modelName = [string]$e.model; Update-ModelPill ([string]$e.model) }

@@ -8,11 +8,35 @@
  * 审计库只是投影，随时可由这些 jsonl 重建（见 core/audit.ts rebuild）。
  */
 
-import { appendFile, mkdir, readFile, readdir, rm, stat } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { EventInput, SessionEvent } from './events.ts'
 import type { LlmMessage } from './types.ts'
+
+/** 会话元信息：不进入 session.jsonl，避免污染模型历史投影 */
+export interface SessionMeta {
+  /** 自定义标题；空/缺省 = 用首条用户消息自动生成 */
+  title?: string
+  /** 分组名；空/缺省 = 未分组 */
+  group?: string
+}
+
+/** id 会直接拼进路径，所有对外接 id 的入口都得先过这道 */
+function assertSessionId(id: string): void {
+  if (!/^s-[a-z0-9]+-[a-z0-9]+$/.test(id)) throw new Error(`非法会话 id：${id}`)
+}
+
+async function readMeta(dir: string): Promise<SessionMeta> {
+  try {
+    const raw = await readFile(join(dir, 'meta.json'), 'utf8')
+    const v = JSON.parse(raw) as unknown
+    return v && typeof v === 'object' ? (v as SessionMeta) : {}
+  } catch {
+    // 没有 meta.json 是常态（老会话、新建会话），不是错误
+    return {}
+  }
+}
 
 export function newSessionId(now = Date.now()): string {
   const rand = Math.random().toString(36).slice(2, 6)
@@ -24,13 +48,15 @@ export class Session {
   readonly dir: string
   readonly file: string
   events: SessionEvent[]
+  meta: SessionMeta
   private seq: number
 
-  private constructor(id: string, dir: string, events: SessionEvent[]) {
+  private constructor(id: string, dir: string, events: SessionEvent[], meta: SessionMeta) {
     this.id = id
     this.dir = dir
     this.file = join(dir, 'session.jsonl')
     this.events = events
+    this.meta = meta
     this.seq = events.length ? events[events.length - 1]!.seq : 0
   }
 
@@ -41,7 +67,7 @@ export class Session {
     const id = newSessionId()
     const dir = join(dataDir, 'sessions', id)
     await mkdir(dir, { recursive: true })
-    const session = new Session(id, dir, [])
+    const session = new Session(id, dir, [], {})
     await session.append({ kind: 'session/start', id, ...meta })
     return session
   }
@@ -59,7 +85,7 @@ export class Session {
         // 崩溃留下的半行：忽略，不阻断恢复
       }
     }
-    return new Session(id, dir, events)
+    return new Session(id, dir, events, await readMeta(dir))
   }
 
   /** 最近一个会话（按 session.jsonl 的 mtime） */
@@ -78,16 +104,19 @@ export class Session {
     return best ? Session.open(dataDir, best.id) : null
   }
 
-  static async list(dataDir: string): Promise<Array<{ id: string; title: string; updatedAt: number; turns: number }>> {
+  static async list(
+    dataDir: string,
+  ): Promise<Array<{ id: string; title: string; group: string; updatedAt: number; turns: number }>> {
     const root = join(dataDir, 'sessions')
     const ids = await readdir(root).catch(() => [] as string[])
-    const out: Array<{ id: string; title: string; updatedAt: number; turns: number }> = []
+    const out: Array<{ id: string; title: string; group: string; updatedAt: number; turns: number }> = []
     for (const id of ids) {
       try {
         const s = await Session.open(dataDir, id)
         out.push({
           id,
           title: s.title(),
+          group: (s.meta.group ?? '').trim(),
           updatedAt: s.events.length ? s.events[s.events.length - 1]!.at : 0,
           turns: s.events.filter((e) => e.kind === 'turn/start').length,
         })
@@ -103,12 +132,34 @@ export class Session {
    * 只删 checkpoints 会留下悬空引用（undo 指向已经不存在的会话），只删会话则留一堆垃圾。
    */
   static async remove(dataDir: string, id: string): Promise<void> {
-    // id 直接拼进路径，必须挡路径穿越
-    if (!/^s-[a-z0-9]+-[a-z0-9]+$/.test(id)) throw new Error(`非法会话 id：${id}`)
+    assertSessionId(id)
     await rm(join(dataDir, 'sessions', id), { recursive: true, force: true })
     await rm(join(dataDir, 'ckpt', id), { recursive: true, force: true })
     // 附件也归会话：留着就是孤儿文件，用户还会以为"删干净了"
     await rm(join(dataDir, 'files', id), { recursive: true, force: true })
+  }
+
+  /**
+   * 改标题 / 分组：写 sessions/<id>/meta.json。
+   * 没传的字段保持原样；传空串表示清掉（回到自动标题 / 未分组）。
+   */
+  static async setMeta(dataDir: string, id: string, patch: SessionMeta): Promise<SessionMeta> {
+    assertSessionId(id)
+    const dir = join(dataDir, 'sessions', id)
+    const next: SessionMeta = { ...(await readMeta(dir)) }
+    if (patch.title !== undefined) {
+      const t = patch.title.trim()
+      if (t) next.title = t
+      else delete next.title
+    }
+    if (patch.group !== undefined) {
+      const g = patch.group.trim()
+      if (g) next.group = g
+      else delete next.group
+    }
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'meta.json'), `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+    return next
   }
 
   async append(payload: EventInput): Promise<SessionEvent> {    const event = { seq: this.seq + 1, at: Date.now(), ...payload } as SessionEvent
@@ -124,10 +175,12 @@ export class Session {
   }
 
   title(): string {
+    const custom = (this.meta.title ?? '').trim()
+    if (custom) return custom
     const first = this.events.find((e) => e.kind === 'user/message')
-    if (!first || first.kind !== 'user/message') return '(empty)'
+    if (!first || first.kind !== 'user/message') return '新对话'
     const t = first.text.replace(/\s+/g, ' ').trim()
-    return t.length > 48 ? `${t.slice(0, 48)}…` : t || '(empty)'
+    return t.length > 48 ? `${t.slice(0, 48)}…` : t || '新对话'
   }
 
   nextTurn(): number {

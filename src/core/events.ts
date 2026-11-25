@@ -43,6 +43,8 @@ export type EventPayload =
       timedOut: boolean
     }
   | { kind: 'turn/end'; turn: number; reason: 'done' | 'max-steps' | 'error' | 'cancelled'; error?: string }
+  | { kind: 'memory/saved'; items: Array<{ id: string; text: string; at: number }> }
+  | { kind: 'memory/undone'; ids: string[] }
   | { kind: 'llm/usage'; turn: number; step: number; prompt: number; completion: number; cacheRead: number; ms: number; model: string }
 
 export interface EventBase {

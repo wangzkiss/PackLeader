@@ -7,6 +7,14 @@
 
 import type { Permission, ToolResult, ToolSchema } from './types.ts'
 
+/** 向用户提问：question + 2-4 个选项；返回选中的那一项，没作答返回 null */
+export interface AskRequest {
+  question: string
+  options: string[]
+}
+
+export type Asker = (req: AskRequest) => Promise<string | null>
+
 export interface ToolContext {
   root: string
   spillDir: string
@@ -14,12 +22,16 @@ export interface ToolContext {
   signal?: AbortSignal
   /** 会话内已读文件（供「先读后写」提示，不强制） */
   readFiles: Set<string>
+  /** 提问通道：GUI 注入；没有时 ask 工具会返回「没有可用通道」 */
+  ask?: Asker
 }
 
 export interface ToolOutcome {
   content: string
   exitCode?: number
   meta?: Record<string, unknown>
+  /** 结构化结果（给界面画专用卡片，比如 todo 的 items） */
+  data?: unknown
 }
 
 export interface Tool {

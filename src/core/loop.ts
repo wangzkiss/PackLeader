@@ -14,8 +14,10 @@ import type { Audit } from './audit.ts'
 import type { ApprovalBroker } from './approval.ts'
 import type { Checkpoints } from './checkpoint.ts'
 import type { Policy } from './policy.ts'
+import { dangerOf } from './policy.ts'
 import type { Session } from './session.ts'
 import type { ToolRegistry } from './tools.ts'
+import { compactMessages } from './compact.ts'
 import type { Attachment, Decision, LlmMessage, ToolCall, ToolResult } from './types.ts'
 import { detectVerifier, runVerifier, type VerifyResult } from './verify.ts'
 import type { OpenAiClient } from '../llm/openai.ts'
@@ -58,6 +60,10 @@ export interface AgentOptions {
   maxVerifyRounds?: number
   /** 验证超时，默认 180s */
   verifyTimeoutMs?: number
+  /** 上下文压缩阈值（估算字符数，默认 240k ≈ 60k token） */
+  maxContextChars?: number
+  /** 提问通道（GUI 注入；没有时 ask 工具会如实说没通道） */
+  ask?: Asker
 }
 
 export interface TurnResult {
@@ -71,10 +77,14 @@ export interface TurnResult {
 // 提到 100 步，仍然有硬上限，不会无限跑。命令行 --max-steps 可覆盖。
 const DEFAULT_MAX_STEPS = 100
 const DEFAULT_MAX_OUTPUT = 64 * 1024
+/** 上下文压缩阈值：估算字符数超了就把早期的工具结果压成摘要 */
+const DEFAULT_MAX_CONTEXT = 240_000
 
 export class Agent {
   private opts: AgentOptions
   private pendingApproval: string | null = null
+  /** 本会话内已授权「同类操作不再问」的 key（tool:目标） */
+  private readonly sessionAllowed = new Set<string>()
   /** 可逐轮设置：GUI 点「停止」时中断当前轮，不需要重建 Agent */
   signal?: AbortSignal
 
@@ -113,7 +123,10 @@ export class Agent {
   }
 
   private messages(): LlmMessage[] {
-    return [{ role: 'system', content: this.systemPrompt() }, ...this.opts.session.deriveMessages()]
+    const history = this.opts.session.deriveMessages()
+    // 长会话别把窗口撑爆：早期工具结果压成摘要，最近几条原样留着
+    const { messages } = compactMessages(history, this.opts.maxContextChars ?? DEFAULT_MAX_CONTEXT)
+    return [{ role: 'system', content: this.systemPrompt() }, ...messages]
   }
 
   /** 截断 + 溢出落盘：这是上下文不炸的关键 */
@@ -181,8 +194,13 @@ export class Agent {
       }
     })()
 
-    // 1) 策略
-    const gate = policy.gate(tool.permission, targets[0])
+    // 1) 策略 + 危险命令升级
+    const cmdText = String(call.args.command ?? call.args.cmd ?? '')
+    const danger = cmdText ? dangerOf(cmdText) : null
+    const allowKey = `${tool.name}:${targets[0] ?? (cmdText.slice(0, 120) || '*')}`
+    let gate = policy.gate(tool.permission, targets[0], cmdText)
+    // 危险命令：full 档也要问一次
+    if (danger) gate = 'ask'
     let decision: Decision | undefined
     let autoApproved = false
     if (gate === 'deny') {
@@ -221,25 +239,35 @@ export class Agent {
       return { result, decision }
     }
 
-    // 2) 审批（一次性）
+    // 2) 审批：本会话授权过的同类操作直接放行，其余问一次
     if (gate === 'ask') {
       const reqId = `ap-${startedAt}-${call.id}`
-      const reason = `${tool.name} 需要写权限`
-      // --yes / PL_APPROVAL=allow 时没经过人，审计要能区分
-      autoApproved = broker.policy !== 'ask'
-      await session.append({ kind: 'approval/asked', reqId, tool: tool.name, reason })
-      this.pendingApproval = reqId
-      decision = await broker.decide({
-        reqId,
-        tool: tool.name,
-        reason,
-        detail: targets[0] ?? JSON.stringify(call.args).slice(0, 300),
-      })
-      this.pendingApproval = null
-      await session.append({ kind: 'approval/decided', reqId, decision, auto: autoApproved || undefined })
-      audit.recordApproval({ sessionId: session.id, reqId, tool: tool.name, reason, decision, at: Date.now() })
+      const reason = danger
+        ? `${tool.name} 命中危险操作：${danger.why}（${danger.match}）`
+        : `${tool.name} 需要写权限`
+      if (this.sessionAllowed.has(allowKey)) {
+        decision = 'allowed-session'
+        autoApproved = true
+        await session.append({ kind: 'approval/decided', reqId, decision, auto: autoApproved || undefined })
+      } else {
+        // --yes / PL_APPROVAL=allow 时没经过人，审计要能区分
+        autoApproved = broker.policy !== 'ask'
+        await session.append({ kind: 'approval/asked', reqId, tool: tool.name, reason })
+        this.pendingApproval = reqId
+        decision = await broker.decide({
+          reqId,
+          tool: tool.name,
+          reason,
+          detail: danger ? `${danger.why}｜${cmdText.slice(0, 300)}` : targets[0] ?? JSON.stringify(call.args).slice(0, 300),
+        })
+        this.pendingApproval = null
+        // 「本会话都允许」：只对这同一个工具 + 同一个目标生效
+        if (decision === 'allowed-session') this.sessionAllowed.add(allowKey)
+        await session.append({ kind: 'approval/decided', reqId, decision, auto: autoApproved || undefined })
+        audit.recordApproval({ sessionId: session.id, reqId, tool: tool.name, reason, decision, at: Date.now() })
+      }
 
-      if (decision !== 'allowed-once') {
+      if (decision !== 'allowed-once' && decision !== 'allowed-session') {
         const why = decision === 'denied' ? '用户拒绝' : decision === 'unavailable' ? '没有可用的审批通道' : '已取消'
         const result: ToolResult = { ok: false, content: `已拒绝（${why}）：${tool.name}`, ms: 0 }
         audit.recordToolCall({
@@ -282,6 +310,7 @@ export class Agent {
           maxOutputBytes: this.opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT,
           signal: this.signal,
           readFiles: new Set(),
+          ask: this.opts.ask,
         },
         call.args,
       )
@@ -294,6 +323,7 @@ export class Agent {
         exitCode: out.exitCode,
         ms: Date.now() - t0,
         meta: out.meta,
+        data: out.data,
       }
     } catch (e) {
       result = { ok: false, content: `工具执行失败：${(e as Error).message}`, ms: Date.now() - t0 }

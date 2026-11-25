@@ -9,6 +9,7 @@ import { mkdir, readdir, readFile } from 'node:fs/promises'
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { redact } from './redact.ts'
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS sessions (
@@ -162,12 +163,12 @@ export class Audit {
         r.step,
         r.callId,
         r.tool,
-        r.argsJson,
+        redact(r.argsJson),
         r.decision ?? null,
         r.status,
         r.ok ? 1 : 0,
         r.exitCode ?? null,
-        r.error ?? null,
+        r.error ? redact(r.error) : null,
         r.ms,
         r.outBytes,
         r.truncated ? 1 : 0,
@@ -205,8 +206,8 @@ export class Audit {
           ms: r.ms,
           out: r.outBytes,
           truncated: Boolean(r.truncated),
-          error: r.error ?? null,
-          args: clip(r.argsJson, 600),
+          error: r.error ? redact(r.error) : null,
+          args: clip(redact(r.argsJson), 600),
         })}\n`,
         'utf8',
       )
@@ -233,7 +234,7 @@ export class Audit {
         r.cacheRead,
         r.ms,
         r.finish,
-        r.error ?? null,
+        r.error ? redact(r.error) : null,
         r.at,
       )
   }

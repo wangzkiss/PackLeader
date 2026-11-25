@@ -22,7 +22,9 @@ import { Agent, type Renderer } from './core/loop.ts'
 import { Policy } from './core/policy.ts'
 import { Session } from './core/session.ts'
 import { ingestFiles } from './core/attach.ts'
-import { loadSettings, maskKey, saveSettings } from './core/settings.ts'
+import { loadSettings, maskKey, saveSettings, visionFrom } from './core/settings.ts'
+import { registerSecret } from './core/redact.ts'
+import type { AskRequest } from './core/tools.ts'
 import { MemoryStore } from './core/memory.ts'
 import type { Attachment, Decision, Mode, ToolCall } from './core/types.ts'
 import { OpenAiClient } from './llm/openai.ts'
@@ -50,6 +52,8 @@ interface Opts {
   noVerify: boolean
   /** 模型能不能看图（决定图片是否作为 image part 发过去） */
   vision: boolean
+  /** vision 是否由命令行/环境变量显式指定（否则以 config.json 为准，缺省开） */
+  visionSet: boolean
 }
 
 function parseArgs(argv: string[]): Opts {
@@ -84,11 +88,38 @@ function parseArgs(argv: string[]): Opts {
     cont: flags.continue === true,
     verify: s('verify') ?? '',
     noVerify: flags['no-verify'] === true,
+    // 命令行 --vision / --no-vision 可以强制；没给就先记"未指定"，等读到 config.json 再定
     vision: flags.vision === true || process.env.PL_VISION === '1',
+    visionSet: flags.vision === true || flags['no-vision'] === true || process.env.PL_VISION !== undefined,
   }
 }
 
 // ---------- 审批 ----------
+
+/** 提问通道：把问题发给界面，等用户点一个选项（跳过则返回 null） */
+class HostAsker {
+  private pending = new Map<string, (v: string | null) => void>()
+
+  ask(req: AskRequest): Promise<string | null> {
+    const reqId = `q-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+    send({ type: 'question', reqId, question: req.question, options: req.options })
+    return new Promise<string | null>((resolve) => this.pending.set(reqId, resolve))
+  }
+
+  answer(reqId: string, value: string | null): void {
+    const r = this.pending.get(reqId)
+    if (!r) return
+    this.pending.delete(reqId)
+    r(value)
+  }
+
+  rejectAll(): void {
+    for (const [k, r] of [...this.pending]) {
+      this.pending.delete(k)
+      r(null)
+    }
+  }
+}
 
 class HostApprover implements Approver {
   private pending = new Map<string, (d: Decision) => void>()
@@ -141,19 +172,23 @@ export function summarizeCall(name: string, args: Record<string, unknown>): stri
 
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv.slice(2))
+  const saved = await loadSettings(opts.dataDir)
   // 没有 key 也要开窗口：第一次用的人是先在界面上填端点/Key 的。
   // 真正拦在 runTask 里（见下），而不是启动时直接死掉。
   if (!opts.apiKey) {
-    const saved = await loadSettings(opts.dataDir)
     if (saved.apiKey) opts.apiKey = saved.apiKey
     if (saved.baseURL) opts.baseURL = saved.baseURL
     if (saved.model) opts.model = saved.model
     if (saved.verify && !opts.noVerify) opts.verify = saved.verify
-    if (saved.vision) opts.vision = true
   }
+  // 看图：命令行/环境变量没显式指定就听 config.json 的，那里也没有就按默认（开）。
+  // 注意这条不能塞进上面的 if：Key 来自环境变量时也得读到用户存过的开关。
+  if (!opts.visionSet) opts.vision = visionFrom(saved)
 
   const { Audit: AuditClass } = await import('./core/audit.ts')
   const audit: Audit = await AuditClass.open(join(opts.dataDir, 'audit.sqlite'))
+  // 把当前 key 登记进脉教器：日志/审计落盘时按字面遮掉它
+  registerSecret(opts.apiKey)
   const checkpoints = new Checkpoints(join(opts.dataDir, 'ckpt'))
   // 记忆按工作目录分文件；切 cwd 时要重建，否则会往上一个仓库的记忆文件里写
   let memory = new MemoryStore(opts.dataDir, opts.root)
@@ -194,6 +229,8 @@ async function main(): Promise<void> {
         ms: result.ms,
         bytes: result.content.length,
         error: result.ok ? '' : result.content.slice(0, 500),
+        // 结构化结果：界面据此画专用卡片（todo → 计划卡）
+        data: result.data,
       }),
     onVerifyStart: (label, round) => send({ type: 'verify-start', label, round }),
     onVerifyEnd: (r, round) =>
@@ -221,6 +258,8 @@ async function main(): Promise<void> {
     return `${head}\n\n当前工作目录已有的记忆（${items.length} 条）：\n${body}${more}`
   }
 
+  const asker = new HostAsker()
+
   const buildAgent = async (): Promise<Agent> =>
     new Agent({
       session,
@@ -235,6 +274,7 @@ async function main(): Promise<void> {
       maxSteps: opts.maxSteps,
       verify: opts.noVerify ? null : opts.verify === '' ? undefined : { label: opts.verify },
       systemPrompt: memoryPrompt(await memory.all()),
+      ask: (req) => asker.ask(req),
     })
 
   let agent = await buildAgent()
@@ -379,14 +419,25 @@ async function main(): Promise<void> {
       case 'approve': {
         // 界面发 decision（allowed-once / denied）；老版本发 allowed:true/false，两种都认
         const dec: Decision =
-          cmd.decision === 'allowed-once' || cmd.allowed === true ? 'allowed-once' : 'denied'
+          cmd.decision === 'allowed-once' || cmd.allowed === true
+            ? 'allowed-once'
+            : cmd.decision === 'allowed-session'
+              ? 'allowed-session'
+              : 'denied'
         approver.decide(String(cmd.reqId ?? ''), dec)
         break
       }
       case 'abort': {
         controller?.abort()
         approver.rejectAll()
+        asker.rejectAll()
         send({ type: 'notice', text: '已中断当前轮' })
+        break
+      }
+      case 'answer': {
+        // ask 工具的答复：value 是用户点中的选项原文，null = 跳过
+        const value = typeof cmd.value === 'string' && cmd.value ? cmd.value : null
+        asker.answer(String(cmd.reqId ?? ''), value)
         break
       }
       case 'mode': {
@@ -443,6 +494,8 @@ async function main(): Promise<void> {
             verify: hasVerify ? verify : undefined,
             vision: hasVision ? Boolean(cmd.vision) : undefined,
           })
+          // 换了 key 也要登记，否则新 key 不会被脱敏
+          registerSecret(opts.apiKey)
           // 验证命令变了要重建 agent，否则还用着旧的
           agent = await buildAgent()
           send({

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { Session } from '../src/core/session.ts'
-import { loadSettings, loadSettingsSync, maskKey, saveSettings, settingsPath } from '../src/core/settings.ts'
+import { DEFAULT_VISION, loadSettings, loadSettingsSync, maskKey, saveSettings, settingsPath, visionFrom } from '../src/core/settings.ts'
 
 const tmp = (): Promise<string> => mkdtemp(join(tmpdir(), 'pl-settings-'))
 
@@ -72,6 +72,33 @@ test('settings: 文件带 BOM 也能读（手改/脚本写都会带）', async (
   assert.equal(s.baseURL, 'http://b/v1')
   assert.equal(s.model, 'm-bom')
   assert.equal(loadSettingsSync(dir).model, 'm-bom')
+})
+
+test('settings: 看图默认开（没写过这个字段时），显式 false 也要能存下来', async () => {
+  const dir = await tmp()
+  // 从没配置过：读出来没有 vision 字段，但按默认算开
+  assert.equal(visionFrom(await loadSettings(dir)), true)
+  assert.equal(visionFrom(loadSettingsSync(dir)), true)
+  assert.equal(DEFAULT_VISION, true)
+
+  // 用户取消勾选：必须真的把 false 写进文件，否则下次启动又被默认开回来
+  const saved = await saveSettings(dir, { vision: false })
+  assert.equal(saved.vision, false)
+  const raw = JSON.parse(await readFile(settingsPath(dir), 'utf8')) as Record<string, unknown>
+  assert.equal(raw.vision, false, 'false 要落盘，不能被当成"没设置过"删掉')
+  assert.equal(visionFrom(await loadSettings(dir)), false)
+
+  // 再勾回来
+  await saveSettings(dir, { vision: true })
+  assert.equal(visionFrom(await loadSettings(dir)), true)
+})
+
+test('settings: 手写成 "vision": false 也能读出来（别被 coerce 丢掉）', async () => {
+  const dir = await tmp()
+  await writeFile(settingsPath(dir), JSON.stringify({ baseURL: 'http://a/v1', vision: false }), 'utf8')
+  const s = await loadSettings(dir)
+  assert.equal(s.vision, false)
+  assert.equal(visionFrom(s), false)
 })
 
 test('settings: maskKey 只露头尾', () => {

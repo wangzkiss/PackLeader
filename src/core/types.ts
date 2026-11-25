@@ -66,10 +66,12 @@ export interface ToolResult {
   spill?: string
   ms: number
   meta?: Record<string, unknown>
+  /** 结构化结果（给界面画专用卡片用，比如计划卡读 todo 的 items） */
+  data?: unknown
 }
 
-/** 审批结果词汇：一次性、无 allow-always */
-export type Decision = 'allowed-once' | 'denied' | 'unavailable' | 'cancelled'
+/** 审批结果词汇：一次性 / 本会话内对同类操作不再问 / 拒绝 / 无通道 / 取消 */
+export type Decision = 'allowed-once' | 'allowed-session' | 'denied' | 'unavailable' | 'cancelled'
 
 /** 运行模式：三档，与 DESIGN.md §6.3 一致 */
 export type Mode = 'read-only' | 'guarded' | 'full'

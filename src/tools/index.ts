@@ -9,6 +9,7 @@ import { createMemoryTools } from './memory.ts'
 import { createRuntimeTools } from './runtime.ts'
 import { createShellTools } from './shell.ts'
 import { createTodoTools } from './todo.ts'
+import { createAskTools } from './ask.ts'
 import { ToolRegistry } from '../core/tools.ts'
 
 export function createDefaultTools(opts: {
@@ -24,6 +25,7 @@ export function createDefaultTools(opts: {
   for (const t of createShellTools({ cwd: opts.root, timeoutMs: opts.shellTimeoutMs })) registry.register(t)
   for (const t of createRuntimeTools({ root: opts.root })) registry.register(t)
   for (const t of createTodoTools()) registry.register(t)
+  for (const t of createAskTools()) registry.register(t)
   const memory = opts.memory ?? (opts.dataDir ? new MemoryStore(opts.dataDir, opts.root) : null)
   if (memory) for (const t of createMemoryTools(memory)) registry.register(t)
   return registry

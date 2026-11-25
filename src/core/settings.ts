@@ -18,9 +18,21 @@ export interface Settings {
   model?: string
   /** 验证命令：留空＝自动识别（npm test / cargo test / go test / pytest） */
   verify?: string
-  /** 模型能不能看图；开了才把图片作为 image part 发过去 */
+  /** 模型能不能看图；开了才把图片作为 image part 发过去。缺省＝开（见 DEFAULT_VISION） */
   vision?: boolean
 }
+
+/**
+ * 看图默认开。
+ *
+ * 理由：现在在用的模型基本都支持视觉，而默认关掉的话，用户拖一张截图进来，
+ * 模型只看到"文件名 + 大小"，答非所问还看不出为什么——这个坑比多传几 KB 图片贵得多。
+ * 真遇到不支持视觉的模型（或想省 token），在设置里取消勾选即可，那个 false 会存进 config.json。
+ */
+export const DEFAULT_VISION = true
+
+/** 读设置里的视觉开关：没写过这个字段就按默认算，别把 undefined 传下去 */
+export const visionFrom = (s: Settings): boolean => (typeof s.vision === 'boolean' ? s.vision : DEFAULT_VISION)
 
 export const settingsPath = (dataDir: string): string => join(dataDir, 'config.json')
 
@@ -64,8 +76,9 @@ export async function saveSettings(dataDir: string, patch: Settings): Promise<Se
   if (patch.model?.trim()) merged.model = patch.model.trim()
   // verify 是唯一「空串也有意义」的字段：空串＝回到自动识别，所以得真删掉
   if (patch.vision !== undefined) {
-    if (patch.vision) merged.vision = true
-    else delete merged.vision
+    // 默认值是 true，所以 false 必须明确写进文件——删掉字段会被当成"没设置过"，
+    // 下次启动又按默认开回来，用户就永远关不掉了
+    merged.vision = patch.vision
   }
   if (patch.verify !== undefined) {
     if (patch.verify.trim()) merged.verify = patch.verify.trim()

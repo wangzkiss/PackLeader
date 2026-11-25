@@ -221,6 +221,8 @@ $xaml = @'
     <Grid Grid.Column="2">
       <Grid.RowDefinitions>
         <RowDefinition Height="Auto"/>
+        <!-- 读秒条：钉在对话区顶部，滚动内容从它下面过（空闲时整行高度为 0） -->
+        <RowDefinition Height="Auto"/>
         <RowDefinition Height="*"/>
         <RowDefinition Height="Auto"/>
       </Grid.RowDefinitions>
@@ -246,24 +248,26 @@ $xaml = @'
         </DockPanel>
       </Border>
 
+      <!-- 读秒条：这一轮在跑时显示「思考中 · 用时 12 秒」，空闲时收起（整行高度归零） -->
+      <Border Grid.Row="1" x:Name="ThinkRow" Visibility="Collapsed" HorizontalAlignment="Left"
+              Margin="24,12,24,0" Background="#141821" BorderBrush="#1FFFFFFF" BorderThickness="1"
+              CornerRadius="6" Padding="8,3">
+        <StackPanel Orientation="Horizontal">
+          <TextBlock Text="✦" Foreground="#8FA6FF" FontSize="10.5" VerticalAlignment="Center" Margin="0,0,6,0"/>
+          <TextBlock x:Name="ThinkText" Text="思考中 · 用时 0 秒" Foreground="#8FA6FF" FontSize="11.5"
+                     FontFamily="Cascadia Mono, Consolas" VerticalAlignment="Center"/>
+        </StackPanel>
+      </Border>
+
       <!-- 会话内容 -->
-      <ScrollViewer Grid.Row="1" x:Name="Scroller" VerticalScrollBarVisibility="Auto" Padding="24,18,18,18">
+      <ScrollViewer Grid.Row="2" x:Name="Scroller" VerticalScrollBarVisibility="Auto" Padding="24,18,18,18">
         <StackPanel x:Name="Transcript" MaxWidth="820" HorizontalAlignment="Left"/>
       </ScrollViewer>
 
       <!-- 输入区 -->
-      <Grid Grid.Row="2" Margin="24,0,24,14">
+      <Grid Grid.Row="3" Margin="24,0,24,14">
         <Border Background="#16181D" BorderBrush="#1FFFFFFF" BorderThickness="1" CornerRadius="12" Padding="14,10,12,8">
           <StackPanel>
-            <!-- 读秒条：这一轮在跑时显示「思考中 · 用时 12 秒」，空闲时收起 -->
-            <Border x:Name="ThinkRow" Visibility="Collapsed" HorizontalAlignment="Left" Margin="0,0,0,8"
-                    Background="#141821" BorderBrush="#1FFFFFFF" BorderThickness="1" CornerRadius="6" Padding="8,3">
-              <StackPanel Orientation="Horizontal">
-                <TextBlock Text="✦" Foreground="#8FA6FF" FontSize="10.5" VerticalAlignment="Center" Margin="0,0,6,0"/>
-                <TextBlock x:Name="ThinkText" Text="思考中 · 用时 0 秒" Foreground="#8FA6FF" FontSize="11.5"
-                           FontFamily="Cascadia Mono, Consolas" VerticalAlignment="Center"/>
-              </StackPanel>
-            </Border>
             <WrapPanel x:Name="AttachList" Orientation="Horizontal" Margin="0,0,0,7" Visibility="Collapsed"/>
           <TextBox x:Name="Input" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="46" MaxHeight="160"
                      Background="Transparent" Foreground="#F9FAFB" BorderThickness="0"
@@ -1434,6 +1438,24 @@ function New-ChoiceCard([string]$title, [string]$desc, [string]$badge = '') {
 
 # 审批卡：照 Kite「模型在问你」的样子 —— 深色卡 + 整块选项（✓ 选中 + 推荐徽标），
 # 选完收起选项、显示「你选了：…」。命令发 decision 字段，host 那边才认得出是允许还是拒绝
+# 选完统一收尾：选中项亮起 + 其余禁用 + 显示「你选了：…」+ 收起选项
+function Finish-Approval($picked, $ctx, [string]$label, [string]$borderColor) {
+  $ctx.done = $true
+  $picked.BorderBrush = (Brush $borderColor)
+  $picked.Background = (Brush '#263450')
+  $picked.Tag.check.Visibility = 'Visible'
+  foreach ($b in @($ctx.yes, $ctx.session, $ctx.no)) {
+    if ($b -ne $picked) {
+      $b.BorderBrush = (Brush '#1FFFFFFF')
+      $b.IsEnabled = $false
+    }
+  }
+  $ctx.chosen.Text = '你选了：' + $label
+  $ctx.chosen.Visibility = 'Visible'
+  $ctx.options.Visibility = 'Collapsed'
+  $ctx.toggle.Content = ([string][char]0x2304) + ' 展开选项'
+}
+
 function Add-ApprovalCard($e) {
   $reqId = [string]$e.reqId
 
@@ -1494,10 +1516,13 @@ function Add-ApprovalCard($e) {
   [System.Windows.Automation.AutomationProperties]::SetAutomationId($optWrap, 'ApprovalOptions')
 
   $yes = New-ChoiceCard '允许一次' '只放行这一次；下次遇到同样的操作还会再问' '推荐'
+  $session = New-ChoiceCard '本会话都允许' '同一个工具 + 同一个目标不再问；换成别的文件/别的命令还会问'
   $no = New-ChoiceCard '拒绝' '这一轮不再执行这条命令，模型要换个做法'
   [System.Windows.Automation.AutomationProperties]::SetAutomationId($yes, 'ApprovalAllow')
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($session, 'ApprovalAllowSession')
   [System.Windows.Automation.AutomationProperties]::SetAutomationId($no, 'ApprovalDeny')
   $optWrap.Children.Add($yes) | Out-Null
+  $optWrap.Children.Add($session) | Out-Null
   $optWrap.Children.Add($no) | Out-Null
   $sp.Children.Add($optWrap) | Out-Null
 
@@ -1517,41 +1542,30 @@ function Add-ApprovalCard($e) {
   $sp.Children.Add($toggle) | Out-Null
 
   # 卡片之间要互相引用，统一挂在一份哈希上（PS 5.1 的事件回调里拿不到外部变量，只能从 Tag 取）
-  $ctx = @{ reqId = $reqId; options = $optWrap; toggle = $toggle; chosen = $chosen; yes = $yes; no = $no; done = $false }
-  foreach ($b in @($yes, $no)) { $b.Tag.ctx = $ctx }
+  $ctx = @{ reqId = $reqId; options = $optWrap; toggle = $toggle; chosen = $chosen; yes = $yes; session = $session; no = $no; done = $false }
+  foreach ($b in @($yes, $session, $no)) { $b.Tag.ctx = $ctx }
   $toggle.Tag = $ctx
 
   $yes.Add_Click({
     param($s, $ev)
     $c = $s.Tag.ctx
     if ($c.done) { return }
-    $c.done = $true
     Send-Host @{ cmd = 'approve'; reqId = $c.reqId; decision = 'allowed-once' }
-    $s.BorderBrush = (Brush '#4F7DF0')
-    $s.Background = (Brush '#263450')
-    $s.Tag.check.Visibility = 'Visible'
-    $c.no.BorderBrush = (Brush '#1FFFFFFF')
-    $c.no.IsEnabled = $false
-    $c.chosen.Text = '你选了：允许一次'
-    $c.chosen.Visibility = 'Visible'
-    $c.options.Visibility = 'Collapsed'
-    $c.toggle.Content = ([string][char]0x2304) + ' 展开选项'
+    Finish-Approval $s $c '允许一次' '#4F7DF0'
+  })
+  $session.Add_Click({
+    param($s, $ev)
+    $c = $s.Tag.ctx
+    if ($c.done) { return }
+    Send-Host @{ cmd = 'approve'; reqId = $c.reqId; decision = 'allowed-session' }
+    Finish-Approval $s $c '本会话都允许' '#4F7DF0'
   })
   $no.Add_Click({
     param($s, $ev)
     $c = $s.Tag.ctx
     if ($c.done) { return }
-    $c.done = $true
     Send-Host @{ cmd = 'approve'; reqId = $c.reqId; decision = 'denied' }
-    $s.BorderBrush = (Brush '#B45454')
-    $s.Background = (Brush '#263450')
-    $s.Tag.check.Visibility = 'Visible'
-    $c.yes.BorderBrush = (Brush '#1FFFFFFF')
-    $c.yes.IsEnabled = $false
-    $c.chosen.Text = '你选了：拒绝'
-    $c.chosen.Visibility = 'Visible'
-    $c.options.Visibility = 'Collapsed'
-    $c.toggle.Content = ([string][char]0x2304) + ' 展开选项'
+    Finish-Approval $s $c '拒绝' '#B45454'
   })
   $toggle.Add_Click({
     param($s, $ev)
@@ -1569,6 +1583,143 @@ function Add-ApprovalCard($e) {
   [System.Windows.Automation.AutomationProperties]::SetAutomationId($card, 'ApprovalCard')
   $Transcript.Children.Add($card) | Out-Null
   $Scroller.ScrollToEnd()
+}
+
+# 提问卡：ask 工具让模型直接问用户一个选择题（样式跟审批卡一致）
+function Add-QuestionCard($e) {
+  $reqId = [string]$e.reqId
+
+  $card = New-Object System.Windows.Controls.Border
+  $card.Background = (Brush '#14171D')
+  $card.BorderBrush = (Brush '#2A2F39')
+  $card.BorderThickness = '1'
+  $card.CornerRadius = '10'
+  $card.Padding = '14,12'
+  $card.Margin = '0,4,0,12'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($card, 'QuestionCard')
+
+  $sp = New-Object System.Windows.Controls.StackPanel
+  $hd = New-Object System.Windows.Controls.DockPanel
+  $tt = New-Text '模型在问你' 12.5 '#E6E8EE' 'SemiBold' 'Segoe UI' 0
+  $tt.VerticalAlignment = 'Center'
+  [System.Windows.Controls.DockPanel]::SetDock($tt, 'Left')
+  $hd.Children.Add($tt) | Out-Null
+  $sp.Children.Add($hd) | Out-Null
+
+  $q = New-Text ([string]$e.question) 12 '#CFD3D6' 'Normal' 'Segoe UI' 0
+  $q.Margin = '0,8,0,0'
+  $q.TextWrapping = 'Wrap'
+  $sp.Children.Add($q) | Out-Null
+
+  $chosen = New-Text '' 11.5 '#C7CBD2' 'Normal' 'Segoe UI' 0
+  $chosen.Margin = '0,8,0,0'
+  $chosen.TextWrapping = 'Wrap'
+  $chosen.Visibility = 'Collapsed'
+  $sp.Children.Add($chosen) | Out-Null
+
+  $optWrap = New-Object System.Windows.Controls.StackPanel
+  $optWrap.Margin = '0,6,0,0'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($optWrap, 'QuestionOptions')
+
+  $ctx = @{ reqId = $reqId; options = $optWrap; chosen = $chosen; buttons = @(); done = $false }
+  $idx = 0
+  foreach ($opt in @($e.options)) {
+    if ($null -eq $opt) { continue }
+    $label = [string]$opt
+    $b = New-ChoiceCard $label ''
+    [System.Windows.Automation.AutomationProperties]::SetAutomationId($b, ('QuestionOption' + $idx))
+    $b.Tag.ctx = $ctx
+    $b.Tag.label = $label
+    $b.Tag.check.Text = [string][char]0x2713
+    $b.Add_Click({
+      param($s, $ev)
+      $c = $s.Tag.ctx
+      if ($c.done) { return }
+      $c.done = $true
+      Send-Host @{ cmd = 'answer'; reqId = $c.reqId; value = [string]$s.Tag.label }
+      $s.BorderBrush = (Brush '#4F7DF0')
+      $s.Background = (Brush '#263450')
+      $s.Tag.check.Visibility = 'Visible'
+      foreach ($x in $c.buttons) {
+        if ($x -ne $s) {
+          $x.BorderBrush = (Brush '#1FFFFFFF')
+          $x.IsEnabled = $false
+        }
+      }
+      $c.chosen.Text = '你选择了：' + [string]$s.Tag.label
+      $c.chosen.Visibility = 'Visible'
+      $c.options.Visibility = 'Collapsed'
+    })
+    $ctx.buttons += $b
+    $optWrap.Children.Add($b) | Out-Null
+    $idx++
+  }
+  $sp.Children.Add($optWrap) | Out-Null
+
+  $card.Child = $sp
+  $Transcript.Children.Add($card) | Out-Null
+  $Scroller.ScrollToEnd()
+}
+
+# 计划卡：todo_write 的结构化结果画成一张「执行方案」清单（同一条任务反复写就原地更新）
+function Update-TodoCard($items) {
+  $arr = @($items)
+  if (-not $script:todoCard -or $null -eq $script:todoCard.card.Parent) {
+    $card = New-Object System.Windows.Controls.Border
+    $card.Background = (Brush '#12141A')
+    $card.BorderBrush = (Brush '#1FFFFFFF')
+    $card.BorderThickness = '1'
+    $card.CornerRadius = '8'
+    $card.Padding = '12,10'
+    $card.Margin = '0,4,0,10'
+    [System.Windows.Automation.AutomationProperties]::SetAutomationId($card, 'TodoCard')
+
+    $sp = New-Object System.Windows.Controls.StackPanel
+    $hd = New-Object System.Windows.Controls.DockPanel
+    $tt = New-Text '执行方案' 11.5 '#9BA3B4' 'SemiBold' 'Segoe UI' 0
+    [System.Windows.Controls.DockPanel]::SetDock($tt, 'Left')
+    $hd.Children.Add($tt) | Out-Null
+    $cnt = New-Text '' 10.5 '#6F7684' 'Normal' 'Segoe UI' 0
+    $cnt.HorizontalAlignment = 'Right'
+    $hd.Children.Add($cnt) | Out-Null
+    $sp.Children.Add($hd) | Out-Null
+    $body = New-Object System.Windows.Controls.StackPanel
+    $body.Margin = '0,6,0,0'
+    $sp.Children.Add($body) | Out-Null
+    $card.Child = $sp
+
+    $script:todoCard = @{ card = $card; body = $body; count = $cnt }
+    $Transcript.Children.Add($card) | Out-Null
+  }
+
+  $script:todoCard.body.Children.Clear()
+  $done = 0
+  foreach ($it in $arr) {
+    if ($null -eq $it) { continue }
+    $ok = [bool]$it.done
+    if ($ok) { $done++ }
+    $row = New-Object System.Windows.Controls.DockPanel
+    $row.Margin = '0,2,0,2'
+    $mk = $([string][char]0x2713)
+    $mc = '#4ADE80'
+    if (-not $ok) {
+      $mk = [string][char]0x25CB
+      $mc = '#6B7280'
+    }
+    $mark = New-Text $mk 11 $mc 'Normal' 'Segoe UI' 0
+    $mark.Width = 16
+    $mark.VerticalAlignment = 'Top'
+    [System.Windows.Controls.DockPanel]::SetDock($mark, 'Left')
+    $row.Children.Add($mark) | Out-Null
+    $tc = '#C7CBD2'
+    if ($ok) { $tc = '#5B626D' }
+    $tx = New-Text ([string]$it.text) 11.5 $tc 'Normal' 'Segoe UI' 0
+    $tx.TextWrapping = 'Wrap'
+    if ($ok) { $tx.TextDecorations = [System.Windows.TextDecorations]::Strikethrough }
+    $row.Children.Add($tx) | Out-Null
+    $script:todoCard.body.Children.Add($row) | Out-Null
+  }
+  $script:todoCard.count.Text = "$done/$($arr.Count)"
 }
 
 function Format-Ago($ms) {
@@ -1834,6 +1985,7 @@ function Set-Sessions($items) {
 
 function Clear-Transcript {
   $Transcript.Children.Clear()
+  $script:todoCard = $null
   $script:currentAssistant = $null
   $script:pendingText.Clear() | Out-Null
   $script:reasonNode = $null
@@ -1979,6 +2131,7 @@ $script:assistantBody = $null
 $script:pendingText = New-Object System.Text.StringBuilder
 $script:toolRows = @{}
 $script:verifyRows = @{}
+$script:todoCard = $null
 $script:tickSeen = $false
 $script:modelName = $Model
 $script:modelChoices = @()
@@ -1993,7 +2146,8 @@ $script:historyIdx = 0
 $script:cfgBaseURL = ''
 $script:cfgKeyMasked = ''
 $script:verifyCmd = ''
-$script:visionOn = $false
+# 看图默认开（和 src/core/settings.ts 的 DEFAULT_VISION 一致）；host 的 ready 事件会带来真实值
+$script:visionOn = $true
 $script:logsDir = ''
 $script:hasKey = $true
 
@@ -2974,6 +3128,10 @@ function Handle-Event([string]$line) {
         if ($msg.Length -gt 40) { $msg = $msg.Substring(0, 40) + '…' }
         Set-ToolLineDone ([string]$e.id) "✕  $msg" $false
       }
+      # todo_write 的结果里带结构化清单：画成计划卡（同一条任务重复写就原地更新）
+      if ([string]$e.name -eq 'todo_write' -and $e.data -and $e.data.items) {
+        Update-TodoCard $e.data.items
+      }
       $script:currentAssistant = $null
       $Scroller.ScrollToEnd()
     }
@@ -3010,6 +3168,7 @@ function Handle-Event([string]$line) {
       $Scroller.ScrollToEnd()
     }
     'approval' { Close-ToolGroup; Add-ApprovalCard $e }
+    'question' { Close-ToolGroup; Add-QuestionCard $e }
     'notice' { Close-ToolGroup; Add-SystemLine ([string]$e.text) '#9BA3B4' }
     'error' {
       Add-SystemLine ("错误：" + $e.message) '#F87171'

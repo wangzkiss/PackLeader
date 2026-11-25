@@ -33,7 +33,11 @@ export function createTodoTools(): Tool[] {
       const raw = Array.isArray(args.items) ? (args.items as Array<Record<string, unknown>>) : []
       items = raw.map((r) => ({ text: String(r.text ?? ''), done: r.done === true }))
       const body = items.map((i) => `${i.done ? '[x]' : '[ ]'} ${i.text}`).join('\n')
-      return { content: `待办 ${items.filter((i) => i.done).length}/${items.length}\n${body}` }
+      return {
+        content: `待办 ${items.filter((i) => i.done).length}/${items.length}\n${body}`,
+        // 界面拿这个画计划卡（勾选样式），不当普通工具输出渲染
+        data: { items },
+      }
     },
   }
   return [todo]

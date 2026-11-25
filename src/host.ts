@@ -5,10 +5,10 @@
  *   stdin  ← 命令（每行一个 JSON）
  *   stdout → 事件（每行一个 JSON）
  *
- * 命令：task / approve / abort / mode / model / config / cwd / new-session / delete-session /
+ * 命令：task / approve / abort / mode / model / config / load-config / cwd / new-session / delete-session /
  *       list-sessions / load-session / rename-session / group-session / ping
  * 事件：ready / turn-start / step / text / reasoning / assistant-end / tool-start / tool-end /
- *       approval / usage / turn-end / sessions / config / notice / error
+ *       approval / usage / turn-end / sessions / config / config-loaded / notice / error
  *
  * GUI 只做渲染，不碰 agent 逻辑；协议是纯 JSON 行，前端换成 WPF / 浏览器 / 终端都不用改核心。
  */
@@ -496,6 +496,38 @@ async function main(): Promise<void> {
           void saveSettings(opts.dataDir, { model: m }).catch(() => {})
           send({ type: 'model', model: m })
         }
+        break
+      }
+      case 'load-config': {
+        // 设置文件可能在进程运行期间被手动编辑。打开设置时重新读取磁盘，
+        // 同步更新当前客户端和 agent，让修改无需重启或再点一次保存就生效。
+        const saved = await loadSettings(opts.dataDir)
+        if (saved.baseURL) {
+          opts.baseURL = saved.baseURL
+          llm.cfg.baseURL = saved.baseURL
+        }
+        if (saved.apiKey) {
+          opts.apiKey = saved.apiKey
+          llm.cfg.apiKey = saved.apiKey
+          registerSecret(saved.apiKey)
+        }
+        if (saved.model) {
+          opts.model = saved.model
+          llm.cfg.model = saved.model
+        }
+        opts.verify = saved.verify ?? ''
+        opts.vision = visionFrom(saved)
+        agent = await buildAgent()
+        send({
+          type: 'config-loaded',
+          baseURL: opts.baseURL,
+          model: llm.cfg.model,
+          apiKeyMasked: maskKey(opts.apiKey),
+          hasKey: Boolean(opts.apiKey),
+          verify: opts.verify,
+          vision: opts.vision,
+          logsDir: audit.logsDir,
+        })
         break
       }
       case 'config': {

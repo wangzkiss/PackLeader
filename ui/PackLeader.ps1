@@ -321,8 +321,14 @@ $xaml = @'
     <!-- 设置面板：做成遮罩层而不是第二个窗口，省掉嵌套消息循环那堆坑 -->
     <Grid x:Name="SettingsOverlay" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#B8000000">
       <Border Width="452" Background="#16181D" BorderBrush="#26FFFFFF" BorderThickness="1" CornerRadius="12"
-              HorizontalAlignment="Center" VerticalAlignment="Center" Padding="22,18,22,16">
-        <StackPanel>
+              HorizontalAlignment="Center" VerticalAlignment="Stretch" Margin="0,20" Padding="22,18,22,16">
+        <Grid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+          <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <StackPanel Margin="0,0,8,0">
           <TextBlock Text="模型设置" Foreground="#F9FAFB" FontSize="14.5" FontWeight="SemiBold"/>
           <TextBlock Text="填 OpenAI 兼容的端点地址和 Key，保存后立刻生效，并写进数据目录的 config.json。"
                      Foreground="#7C838E" FontSize="11" Margin="0,5,0,16" TextWrapping="Wrap"/>
@@ -373,16 +379,18 @@ $xaml = @'
           <TextBlock Text="每次调用工具追加一行 jsonl（轮次/步号/工具/参数/审批/成败/耗时），排查复杂任务卡在哪一步就看它。"
                      Foreground="#5B626D" FontSize="10.5" Margin="0,5,0,0" TextWrapping="Wrap"/>
 
-          <TextBlock x:Name="CfgError" Text="" Foreground="#F87171" FontSize="11" Margin="0,10,0,0" TextWrapping="Wrap"/>
+              <TextBlock x:Name="CfgError" Text="" Foreground="#F87171" FontSize="11" Margin="0,10,0,0" TextWrapping="Wrap"/>
+            </StackPanel>
+          </ScrollViewer>
 
-          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
+          <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,8,0">
             <Button x:Name="CfgCancel" Content="取消" Height="28" Padding="14,0" Cursor="Hand" FontSize="11.5"
                     Background="Transparent" Foreground="#ADB2B8" BorderBrush="#1FFFFFFF" BorderThickness="1"
                     Margin="0,0,8,0"/>
             <Button x:Name="CfgSave" Content="保存" Height="28" Padding="18,0" Cursor="Hand" FontSize="11.5"
                     FontWeight="SemiBold" Background="#2B5CFF" Foreground="White" BorderThickness="0"/>
           </StackPanel>
-        </StackPanel>
+        </Grid>
       </Border>
     </Grid>
 
@@ -2916,7 +2924,7 @@ $window.Add_Drop({
 
 
 # ---------------------------------------------------------------- 设置面板
-function Open-Settings {
+function Sync-SettingsForm {
   $CfgUrl.Text = $(if ($script:cfgBaseURL) { $script:cfgBaseURL } else { '' })
   $CfgKey.Text = ''
   $CfgModel.Text = $script:modelName
@@ -2932,7 +2940,14 @@ function Open-Settings {
     $CfgKeyHint.Text = '还没有设置 Key，填一个才能开始对话。'
   }
   $CfgError.Text = ''
+}
+
+function Open-Settings {
+  Sync-SettingsForm
   $SettingsOverlay.Visibility = 'Visible'
+  # config.json 可能被用户或脚本手动修改。每次打开都让 host 从磁盘重读并立刻应用，
+  # 收到 config-loaded 后再用最新值刷新一次表单。
+  Send-Host @{ cmd = 'load-config' }
   $CfgUrl.Focus() | Out-Null
   $CfgUrl.CaretIndex = $CfgUrl.Text.Length
 }
@@ -3212,6 +3227,21 @@ function Handle-Event([string]$line) {
       Update-ModelPill ([string]$e.model)
       Close-Settings
       Add-SystemLine ("已切换模型：" + $e.model + " @ " + $e.baseURL) '#4ADE80'
+    }
+    'config-loaded' {
+      $script:cfgBaseURL = [string]$e.baseURL
+      $script:cfgKeyMasked = [string]$e.apiKeyMasked
+      $script:verifyCmd = [string]$e.verify
+      $script:visionOn = [bool]$e.vision
+      if ($e.logsDir) { $script:logsDir = [string]$e.logsDir }
+      $script:modelName = [string]$e.model
+      $script:hasKey = [bool]$e.hasKey
+      Update-ModelPill ([string]$e.model)
+      if ($SettingsOverlay.Visibility -eq 'Visible') {
+        Sync-SettingsForm
+        $CfgUrl.Focus() | Out-Null
+        $CfgUrl.CaretIndex = $CfgUrl.Text.Length
+      }
     }
     'models' {
       $script:fetching = $false

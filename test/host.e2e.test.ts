@@ -4,7 +4,7 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { mkdtemp, readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import assert from 'node:assert/strict'
@@ -76,7 +76,7 @@ class HostProc {
   }
 }
 
-async function setup(): Promise<{ host: HostProc; root: string; llm: Awaited<ReturnType<typeof startFakeLlm>>; close: () => Promise<void> }> {
+async function setup(): Promise<{ host: HostProc; root: string; dataDir: string; llm: Awaited<ReturnType<typeof startFakeLlm>>; close: () => Promise<void> }> {
   const root = await mkdtemp(join(tmpdir(), 'pl-host-ws-'))
   const dataDir = await mkdtemp(join(tmpdir(), 'pl-host-data-'))
   const llm = await startFakeLlm([
@@ -95,8 +95,31 @@ async function setup(): Promise<{ host: HostProc; root: string; llm: Awaited<Ret
     '--model',
     'demo-model',
   ])
-  return { host, root, llm, close: async () => { await host.close(); await llm.close() } }
+  return { host, root, dataDir, llm, close: async () => { await host.close(); await llm.close() } }
 }
+
+test('host: load-config reloads hand-edited settings and applies them to the running client', async () => {
+  const s = await setup()
+  try {
+    await s.host.next('ready')
+    await writeFile(
+      join(s.dataDir, 'config.json'),
+      JSON.stringify({ baseURL: 'https://edited.example/v1', apiKey: 'sk-edited-key', model: 'edited-model', verify: 'npm test', vision: false }),
+      'utf8',
+    )
+
+    s.host.send({ cmd: 'load-config' })
+    const loaded = await s.host.next('config-loaded')
+    assert.equal(loaded.baseURL, 'https://edited.example/v1')
+    assert.equal(loaded.model, 'edited-model')
+    assert.equal(loaded.apiKeyMasked, 'sk-e…-key')
+    assert.equal(loaded.hasKey, true)
+    assert.equal(loaded.verify, 'npm test')
+    assert.equal(loaded.vision, false)
+  } finally {
+    await s.close()
+  }
+})
 
 test('host: task → 审批 → 放行 → 写入落盘 → turn-end', async () => {
   const s = await setup()

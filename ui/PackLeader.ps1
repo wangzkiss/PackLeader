@@ -221,9 +221,9 @@ $xaml = @'
     <Grid Grid.Column="2">
       <Grid.RowDefinitions>
         <RowDefinition Height="Auto"/>
-        <!-- 读秒条：钉在对话区顶部，滚动内容从它下面过（空闲时整行高度为 0） -->
-        <RowDefinition Height="Auto"/>
         <RowDefinition Height="*"/>
+        <!-- 读秒条：坐在输入框正上方、会话区之外（空闲时整行高度为 0） -->
+        <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
       </Grid.RowDefinitions>
 
@@ -248,9 +248,9 @@ $xaml = @'
         </DockPanel>
       </Border>
 
-      <!-- 读秒条：这一轮在跑时显示「思考中 · 用时 12 秒」，空闲时收起（整行高度归零） -->
-      <Border Grid.Row="1" x:Name="ThinkRow" Visibility="Collapsed" HorizontalAlignment="Left"
-              Margin="24,12,24,0" Background="#141821" BorderBrush="#1FFFFFFF" BorderThickness="1"
+      <!-- 读秒条：这一轮在跑时贴在输入框上方显示「思考中 · 用时 12 秒」，空闲时收起（整行高度归零） -->
+      <Border Grid.Row="2" x:Name="ThinkRow" Visibility="Collapsed" HorizontalAlignment="Left"
+              Margin="24,0,24,8" Background="#141821" BorderBrush="#1FFFFFFF" BorderThickness="1"
               CornerRadius="6" Padding="8,3">
         <StackPanel Orientation="Horizontal">
           <TextBlock Text="✦" Foreground="#8FA6FF" FontSize="10.5" VerticalAlignment="Center" Margin="0,0,6,0"/>
@@ -259,9 +259,9 @@ $xaml = @'
         </StackPanel>
       </Border>
 
-      <!-- 会话内容 -->
-      <ScrollViewer Grid.Row="2" x:Name="Scroller" VerticalScrollBarVisibility="Auto" Padding="24,18,18,18">
-        <StackPanel x:Name="Transcript" MaxWidth="820" HorizontalAlignment="Left"/>
+      <!-- 会话内容：宽度随窗口走，不再压 820 上限 -->
+      <ScrollViewer Grid.Row="1" x:Name="Scroller" VerticalScrollBarVisibility="Auto" Padding="24,18,24,18">
+        <StackPanel x:Name="Transcript"/>
       </ScrollViewer>
 
       <!-- 输入区 -->

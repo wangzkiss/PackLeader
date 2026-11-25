@@ -10,6 +10,7 @@ import { join } from 'node:path'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { startFakeLlm } from './fake-llm.ts'
+import { Session } from '../src/core/session.ts'
 
 const HOST = join(import.meta.dirname, '..', 'src', 'host.ts')
 
@@ -118,6 +119,62 @@ test('host: load-config reloads hand-edited settings and applies them to the run
     assert.equal(loaded.vision, false)
   } finally {
     await s.close()
+  }
+})
+
+test('host: ready sends a question index and history-slice returns only the requested turn', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pl-history-ws-'))
+  const dataDir = await mkdtemp(join(tmpdir(), 'pl-history-data-'))
+  const savedSession = await Session.create(dataDir, {
+    cwd: root,
+    model: 'demo-model',
+    baseURL: 'http://127.0.0.1',
+    mode: 'guarded',
+    version: '0.1.0',
+  })
+  await savedSession.append({ kind: 'user/message', text: '定位慢查询' })
+  await savedSession.append({ kind: 'assistant/message', text: '先检查索引', reasoning: '', toolCalls: [], ms: 10, finish: 'stop' })
+  await savedSession.append({ kind: 'turn/start', turn: 1 })
+  await savedSession.append({ kind: 'user/message', text: '然后检查缓存' })
+  await savedSession.append({ kind: 'assistant/message', text: '检查缓存命中率', reasoning: '', toolCalls: [], ms: 10, finish: 'stop' })
+  const llm = await startFakeLlm([{ text: '完成' }])
+  const host = new HostProc([
+    '--cwd', root,
+    '--data-dir', dataDir,
+    '--resume', savedSession.id,
+    '--base-url', llm.url,
+    '--api-key', 'sk-x',
+    '--model', 'demo-model',
+  ])
+  try {
+    const ready = await host.next('ready')
+    assert.equal(ready.historyCount, 6)
+    assert.equal(ready.events, undefined, 'ready must not transmit the full conversation')
+    const questions = ready.questions as Array<{ eventIndex: number; text: string }>
+    assert.deepEqual(questions.map((q) => ({ eventIndex: q.eventIndex, text: q.text })), [
+      { eventIndex: 1, text: '定位慢查询' },
+      { eventIndex: 4, text: '然后检查缓存' },
+    ])
+
+    host.send({ cmd: 'history-slice', session: savedSession.id, requestId: 1, mode: 'tail' })
+    const slice = await host.next('history-slice')
+    assert.equal(slice.requestId, 1)
+    assert.equal(slice.from, 3)
+    assert.deepEqual((slice.events as Array<{ kind: string }>).map((event) => event.kind), ['turn/start', 'user/message', 'assistant/message'])
+
+    host.send({ cmd: 'history-slice', session: savedSession.id, requestId: 2, mode: 'around', target: 1 })
+    const around = await host.next('history-slice')
+    assert.equal(around.from, 1)
+    assert.equal(around.jumpTo, 1)
+    assert.deepEqual((around.events as Array<{ kind: string }>).map((event) => event.kind), ['user/message', 'assistant/message'])
+
+    host.send({ cmd: 'history-slice', session: savedSession.id, requestId: 3, mode: 'before', cursor: 3 })
+    const before = await host.next('history-slice')
+    assert.equal(before.from, 1)
+    assert.deepEqual((before.events as Array<{ kind: string }>).map((event) => event.kind), ['user/message', 'assistant/message'])
+  } finally {
+    await host.close()
+    await llm.close()
   }
 })
 

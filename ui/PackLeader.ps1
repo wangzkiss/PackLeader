@@ -259,10 +259,20 @@ $xaml = @'
         </StackPanel>
       </Border>
 
-      <!-- 会话内容：宽度随窗口走，不再压 820 上限 -->
-      <ScrollViewer Grid.Row="1" x:Name="Scroller" VerticalScrollBarVisibility="Auto" Padding="24,18,24,18">
-        <StackPanel x:Name="Transcript"/>
-      </ScrollViewer>
+      <!-- 会话内容 + 提问缩略索引。索引独立于历史控件，未加载的提问也能直接跳转。 -->
+      <Grid Grid.Row="1">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="18"/>
+        </Grid.ColumnDefinitions>
+        <ScrollViewer Grid.Column="0" x:Name="Scroller" VerticalScrollBarVisibility="Auto" Padding="24,18,16,18">
+          <StackPanel x:Name="Transcript"/>
+        </ScrollViewer>
+        <Border Grid.Column="1" Width="12" Margin="0,12,3,12" Background="#0DFFFFFF" CornerRadius="6"
+                ToolTip="提问索引：点击标记跳到对应问题">
+          <Canvas x:Name="QuestionIndexCanvas" ClipToBounds="True"/>
+        </Border>
+      </Grid>
 
       <!-- 输入区 -->
       <Grid Grid.Row="3" Margin="24,0,24,14">
@@ -609,14 +619,20 @@ $Transcript = $window.FindName('Transcript')
 # 回放旧历史时要往「临时面板」里画（画完一次性插到顶部），平时就是 Transcript
 $script:renderHost = $Transcript
 $Scroller = $window.FindName('Scroller')
+$QuestionIndexCanvas = $window.FindName('QuestionIndexCanvas')
 # 滑到顶就自动补一批更早的记录（点顶部那一行也一样）。
 # 补的内容插在上方、视口会往下跳，Load-OlderHistory 里会补回去。
 $Scroller.Add_ScrollChanged({
   param($s, $e)
-  if ($script:loadingOlder -or $script:replayAt -le 0) { return }
+  if ($script:historyLoading -or $script:historyBefore -le 0) { return }
+  if ($e.VerticalChange -ge -0.5) { return }
   if ($e.VerticalOffset -gt 0.5) { return }
-  $script:loadingOlder = $true
-  try { Load-OlderHistory } finally { $script:loadingOlder = $false }
+  Load-OlderHistory
+})
+$Scroller.Add_PreviewMouseWheel({
+  param($s, $e)
+  if ($e.Delta -le 0 -or $s.VerticalOffset -gt 0.5 -or $script:historyLoading -or $script:historyBefore -le 0) { return }
+  Load-OlderHistory
 })
 $InputBox = $window.FindName('Input')
 $SendBtn = $window.FindName('SendBtn')
@@ -868,6 +884,10 @@ function Add-UserMessage([string]$text, [object]$files = $null) {
   }
   Set-CopyMenu $sp @{ text = "你：$text" }
   Append-CopyLog "你：$text"
+  $script:lastUserElement = $sp
+  if ($null -ne $script:renderEventIndex -and $script:renderEventIndex -ge 0) {
+    $script:userElements[[int]$script:renderEventIndex] = $sp
+  }
   $script:currentAssistant = $null
 }
 
@@ -2017,86 +2037,168 @@ function Set-Sessions($items) {
   Update-SideFit
 }
 
-# ---------------------------------------------------------------- 历史回放（分批）
-# 一个 400 轮的会话有 4000+ 条事件，一次性全建成 UI 元素要十几秒：构建约 9 秒，
-# 之后 Transcript（普通 StackPanel，没有虚拟化）还要把四五千个元素全部量一遍，又是十几秒。
-# 所以切会话先画最后一批（默认 10 轮），往上滚或点顶部那一行再一批一批补。
+# ---------------------------------------------------------------- 按需加载历史 + 提问索引
 $script:replayEvents = @()
 $script:replayAt = 0
 $script:replayHasUser = $false
 $script:replayEnd = $null
 $script:moreRow = $null
-$script:loadingOlder = $false
-$script:replayBatchTurns = 10
+$script:replayRenderJob = $null
+$script:historyLoading = $false
+$script:historyRequestId = 0
+$script:historyCount = 0
+$script:historyQuestions = @()
+$script:historyBefore = 0
+$script:pendingJump = -1
+$script:renderEventIndex = -1
+$script:userElements = @{}
 
-# 从 $end 往回数 $turns 个 turn/start，返回这一批的起点：切在整轮边界上，
-# 不然一批可能从某条回答中间开始，工具行也对不上它的调用。
-function Get-ReplayStart([object[]]$evs, [int]$end, [int]$turns) {
-  $seen = 0
-  for ($i = $end - 1; $i -ge 0; $i--) {
-    if ($evs[$i].kind -eq 'turn/start') {
-      $seen++
-      if ($seen -gt $turns) { return $i + 1 }
+# 画一个历史事件。初次切换会话时会分多个 UI 时间片调用，避免一口气创建几百个控件卡住窗口。
+function Render-ReplayEvent($ev) {
+  if ($ev.kind -eq 'user/message') { Add-UserMessage ([string]$ev.text) $ev.files; $script:replayHasUser = $true }
+  elseif ($ev.kind -eq 'assistant/message') {
+    # 历史里的思考过程也要能看，默认收起成一行摘要
+    if ($ev.reasoning) {
+      $rn = Add-ReasoningBlock
+      $rn.Body.Text = [string]$ev.reasoning
+      $rn.Secs = [math]::Round(([double]$ev.ms) / 1000.0, 1)
+      Complete-Reasoning
+    }
+    if ($ev.text) {
+      if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
+      Render-Markdown $script:assistantBody ([string]$ev.text)
+      $script:currentAssistant = $null
     }
   }
-  return 0
+  elseif ($ev.kind -eq 'tool/call') {
+    $sum = ''
+    if ($ev.call.args) { $sum = ($ev.call.args | ConvertTo-Json -Compress -Depth 4) }
+    $st = Add-ToolLine ([string]$ev.call.name) $sum
+    $script:toolRows[[string]$ev.call.id] = $st
+  }
+  elseif ($ev.kind -eq 'tool/result') {
+    $st = $script:toolRows[[string]$ev.callId]
+    if ($st) {
+      if ($ev.ok) { Set-ToolLineDone ([string]$ev.callId) "✓  $($ev.ms)ms" $true }
+      else { Set-ToolLineDone ([string]$ev.callId) '✕  失败' $false }
+    }
+  }
+  elseif ($ev.kind -eq 'memory/saved') {
+    Add-MemoryCard $ev.items | Out-Null
+  }
+  elseif ($ev.kind -eq 'memory/undone') {
+    Set-MemoryUndone @($ev.ids)
+  }
 }
 
-# 把 [from, to) 这段事件画到一个独立面板里（不直接往 Transcript 里塞）
-function Render-ReplayRange([int]$from, [int]$to) {
+# 索引位置只依赖完整事件数，不依赖已经渲染了多少控件。
+function Draw-QuestionIndex {
+  if (-not $QuestionIndexCanvas) { return }
+  $QuestionIndexCanvas.Children.Clear()
+  $h = $QuestionIndexCanvas.ActualHeight
+  if ($h -le 0 -or $script:historyCount -le 0) { return }
+  foreach ($q in @($script:historyQuestions)) {
+    $dot = New-Object System.Windows.Shapes.Ellipse
+    $dot.Width = 5
+    $dot.Height = 5
+    $dot.Fill = (Brush '#8FA6FF')
+    $dot.Opacity = 0.75
+    $dot.Cursor = 'Hand'
+    $dot.ToolTip = [string]$q.text
+    $dot.Tag = [int]$q.eventIndex
+    [System.Windows.Controls.Canvas]::SetLeft($dot, 3)
+    [System.Windows.Controls.Canvas]::SetTop($dot, [math]::Max(0, [math]::Min($h - 5, ($q.eventIndex / [double]$script:historyCount) * $h)))
+    $dot.Add_MouseLeftButtonUp({ param($s, $e) Jump-ToQuestion ([int]$s.Tag) })
+    $QuestionIndexCanvas.Children.Add($dot) | Out-Null
+  }
+}
+
+$QuestionIndexCanvas.Add_SizeChanged({ Draw-QuestionIndex })
+
+function Send-HistoryRequest([string]$mode, [int]$cursor = 0, [int]$target = 0) {
+  if ($script:historyLoading) { return }
+  $script:historyLoading = $true
+  $script:historyRequestId++
+  Send-Host @{ cmd = 'history-slice'; session = $script:sessionId; requestId = $script:historyRequestId; mode = $mode; cursor = $cursor; target = $target }
+}
+
+function Start-HistoryRender($e) {
+  $mode = [string]$e.mode
+  if ($mode -eq 'around' -or $mode -eq 'tail') {
+    Clear-Transcript
+    $script:historyLoading = $true
+    $script:replayHasUser = $false
+    $script:replayEnd = $null
+    $script:userElements = @{}
+    $script:historyBefore = [int]$e.from
+    $Scroller.ScrollToTop()
+  }
+  $from = [int]$e.from
+  $events = @($e.events)
+  if ($events.Count -eq 0) { $script:historyLoading = $false; return }
   $panel = New-Object System.Windows.Controls.StackPanel
+  if ($mode -eq 'before') {
+    $insertAt = 0
+    if ($script:moreRow -and $Transcript.Children.IndexOf($script:moreRow) -eq 0) { $insertAt = 1 }
+    $Transcript.Children.Insert($insertAt, $panel)
+    $script:replayRenderJob = @{ events = $events; from = $from; next = 0; panel = $panel; mode = $mode }
+  } else {
+    $Transcript.Children.Add($panel) | Out-Null
+    $script:replayRenderJob = @{ events = $events; from = $from; next = 0; panel = $panel; mode = $mode; jumpTo = $e.jumpTo }
+  }
+  $script:replayEvents = $events
+  $script:replayAt = $from
+}
+
+function Continue-ReplayRender {
+  $job = $script:replayRenderJob
+  if (-not $job) { return }
+  $chunkOffset = $Scroller.VerticalOffset
+  $chunkExtent = if ($job.mode -eq 'before') { $Scroller.ExtentHeight } else { 0 }
   $prevHost = $script:renderHost
-  $script:renderHost = $panel
+  $script:renderHost = $job.panel
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
   try {
-    for ($i = $from; $i -lt $to; $i++) {
-      $ev = $script:replayEvents[$i]
-      if ($ev.kind -eq 'user/message') { Add-UserMessage ([string]$ev.text) $ev.files; $script:replayHasUser = $true }
-      elseif ($ev.kind -eq 'assistant/message') {
-        # 历史里的思考过程也要能看，默认收起成一行摘要
-        if ($ev.reasoning) {
-          $rn = Add-ReasoningBlock
-          $rn.Body.Text = [string]$ev.reasoning
-          $rn.Secs = [math]::Round(([double]$ev.ms) / 1000.0, 1)
-          Complete-Reasoning
-        }
-        if ($ev.text) {
-          if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
-          Render-Markdown $script:assistantBody ([string]$ev.text)
-          $script:currentAssistant = $null
-        }
-      }
-      elseif ($ev.kind -eq 'tool/call') {
-        $sum = ''
-        if ($ev.call.args) { $sum = ($ev.call.args | ConvertTo-Json -Compress -Depth 4) }
-        $st = Add-ToolLine ([string]$ev.call.name) $sum
-        $script:toolRows[[string]$ev.call.id] = $st
-      }
-      elseif ($ev.kind -eq 'tool/result') {
-        $st = $script:toolRows[[string]$ev.callId]
-        if ($st) {
-          if ($ev.ok) { Set-ToolLineDone ([string]$ev.callId) "✓  $($ev.ms)ms" $true }
-          else { Set-ToolLineDone ([string]$ev.callId) '✕  失败' $false }
-        }
-      }
-      elseif ($ev.kind -eq 'memory/saved') {
-        # 历史里的记忆也回放出来，可以照样撤销
-        Add-MemoryCard $ev.items | Out-Null
-      }
-      elseif ($ev.kind -eq 'memory/undone') {
-        Set-MemoryUndone @($ev.ids)
-      }
+    while ([int]$job.next -lt $job.events.Count -and $sw.ElapsedMilliseconds -lt 12) {
+      $script:renderEventIndex = [int]$job.from + [int]$job.next
+      Render-ReplayEvent $job.events[[int]$job.next]
+      $job.next = [int]$job.next + 1
     }
-    # 一批画完必须把工具分组断掉：否则下一批的工具行会加进这一批已经插到界面上的组里
-    Close-ToolGroup
-    $script:currentAssistant = $null
   } finally {
+    $script:renderEventIndex = -1
     $script:renderHost = $prevHost
   }
-  return $panel
+  if ($job.mode -eq 'before') {
+    $Scroller.UpdateLayout()
+    $delta = $Scroller.ExtentHeight - [double]$chunkExtent
+    if ($delta -gt 0) { $Scroller.ScrollToVerticalOffset($chunkOffset + $delta) }
+  }
+  if ([int]$job.next -lt $job.events.Count) { return }
+
+  Close-ToolGroup
+  $script:currentAssistant = $null
+  $script:replayRenderJob = $null
+  if ($job.mode -eq 'before') {
+    $script:historyBefore = [int]$job.from
+  } else {
+    $script:historyBefore = [int]$job.from
+    if ($null -ne $job.jumpTo -and $script:userElements.ContainsKey([int]$job.jumpTo)) {
+      $script:userElements[[int]$job.jumpTo].BringIntoView()
+    } elseif ($job.mode -eq 'tail') {
+      $Scroller.ScrollToEnd()
+    }
+  }
+  $script:historyLoading = $false
+  Update-ReplayMore
+  if ($script:pendingJump -ge 0) {
+    $target = $script:pendingJump
+    $script:pendingJump = -1
+    Jump-ToQuestion $target
+  }
 }
 
 function Update-ReplayMore {
-  if ($script:replayAt -gt 0) {
+  if ($script:historyBefore -gt 0) {
     if (-not $script:moreRow) {
       $b = New-Object System.Windows.Controls.Button
       $b.HorizontalAlignment = 'Center'
@@ -2115,7 +2217,7 @@ function Update-ReplayMore {
       $b.Add_Click({ param($s, $e) Load-OlderHistory })
       $script:moreRow = $b
     }
-    $script:moreRow.Content = "↑ 显示更早的记录（还有 $($script:replayAt) 条事件）"
+    $script:moreRow.Content = '↑ 显示更早的对话'
     if ($Transcript.Children.IndexOf($script:moreRow) -lt 0) {
       $Transcript.Children.Insert(0, $script:moreRow) | Out-Null
     }
@@ -2127,7 +2229,7 @@ function Update-ReplayMore {
   }
   if ($script:replayEnd) { return }
   if ($script:replayHasUser) {
-    $end = New-Text "— 以上为历史记录 · $($script:replayEvents.Count) 条事件 —" 10 '#4B5158' 'Normal' 'Segoe UI' 0
+    $end = New-Text "— 以上为历史记录 · $($script:historyCount) 条事件 —" 10 '#4B5158' 'Normal' 'Segoe UI' 0
     $script:replayEnd = $end
     $Transcript.Children.Add($end) | Out-Null
   } else {
@@ -2136,33 +2238,26 @@ function Update-ReplayMore {
 }
 
 # 画一批：$older=$true 时往顶部插（用户往上翻），否则追加到末尾（刚切过去）
-function Render-ReplayBatch([bool]$older) {
-  if ($script:replayAt -le 0) { return $false }
-  $from = Get-ReplayStart $script:replayEvents $script:replayAt $script:replayBatchTurns
-  $panel = Render-ReplayRange $from $script:replayAt
-  $script:replayAt = $from
-  $at = 0
-  if ($older -and $script:moreRow -and $Transcript.Children.IndexOf($script:moreRow) -ge 0) {
-    $at = $Transcript.Children.IndexOf($script:moreRow) + 1
-  }
-  $Transcript.Children.Insert($at, $panel)
-  Update-ReplayMore
-  return $true
-}
-
 # 往上补一批。插完要把视口留在原来看到的地方：顶部突然多出内容时
 # ScrollViewer 的偏移量是按顶部算的，不补一下画面会往下跳一屏。
 function Load-OlderHistory {
-  if ($script:replayAt -le 0) { return }
-  $before = $Scroller.VerticalOffset
-  $extentBefore = $Scroller.ExtentHeight
-  if (-not (Render-ReplayBatch $true)) { return }
-  $Scroller.UpdateLayout()
-  $delta = $Scroller.ExtentHeight - $extentBefore
-  if ($delta -gt 0) { $Scroller.ScrollToVerticalOffset($before + $delta) }
+  if ($script:historyBefore -le 0 -or $script:historyLoading) { return }
+  Send-HistoryRequest 'before' $script:historyBefore
+}
+
+function Jump-ToQuestion([int]$eventIndex) {
+  if ($script:userElements.ContainsKey($eventIndex)) {
+    $script:userElements[$eventIndex].BringIntoView()
+    return
+  }
+  if ($script:historyLoading) { $script:pendingJump = $eventIndex; return }
+  Send-HistoryRequest 'around' 0 $eventIndex
 }
 
 function Clear-Transcript {
+  $script:replayRenderJob = $null
+  $script:historyLoading = $false
+  $script:userElements = @{}
   $Transcript.Children.Clear()
   $script:todoCard = $null
   $script:currentAssistant = $null
@@ -3081,6 +3176,12 @@ function Handle-Event([string]$line) {
       # 界面上留着上一个会话的内容、底部还显示「停止」
       if ($script:busy) { Set-Busy $false }
       $script:sessionId = [string]$e.session
+      $script:historyCount = [int]$e.historyCount
+      $script:historyQuestions = @($e.questions)
+      $script:historyBefore = 0
+      $script:historyLoading = $false
+      $script:pendingJump = -1
+      Draw-QuestionIndex
       $script:modelName = [string]$e.model
       $script:cfgBaseURL = [string]$e.baseURL
       $script:cfgKeyMasked = [string]$e.apiKeyMasked
@@ -3098,17 +3199,19 @@ function Handle-Event([string]$line) {
 
       if (-not $script:busy) {
         Clear-Transcript
-        # 回放分批：先画最后一批（默认 10 轮），往上滚或点顶部那一行再补更早的
-        $script:replayEvents = @($e.events)
-        $script:replayAt = $script:replayEvents.Count
+        # 首屏只读取最后一轮，往上滚动或点击右侧提问索引时再按需加载。
+        $script:replayEvents = @()
+        $script:replayAt = 0
         $script:replayHasUser = $false
         $script:replayEnd = $null
         $script:moreRow = $null
-        Render-ReplayBatch $false | Out-Null
-        $Scroller.ScrollToEnd()
+        Send-HistoryRequest 'tail'
       }
-      $window.UpdateLayout()
       Send-Host @{ cmd = 'list-sessions' }
+    }
+    'history-slice' {
+      if ([string]$e.session -ne $script:sessionId -or [int]$e.requestId -ne $script:historyRequestId) { return }
+      Start-HistoryRender $e
     }
     'reasoning' {
       Close-ToolGroup
@@ -3458,6 +3561,7 @@ $timer.Add_Tick({
       if ($null -eq $l) { break }
       if ($l.Trim()) { Log ("stderr: " + $l) }
     }
+    Continue-ReplayRender
     if ($script:pendingText.Length -gt 0 -and $script:currentAssistant) {
       $script:currentAssistant.Text += $script:pendingText.ToString()
       $script:pendingText.Clear() | Out-Null

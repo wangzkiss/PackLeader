@@ -6,9 +6,9 @@
  *   stdout → 事件（每行一个 JSON）
  *
  * 命令：task / approve / abort / mode / model / config / load-config / cwd / new-session / delete-session /
- *       list-sessions / load-session / rename-session / group-session / ping
+ *       list-sessions / load-session / history-slice / rename-session / group-session / ping
  * 事件：ready / turn-start / step / text / reasoning / assistant-end / tool-start / tool-end /
- *       approval / usage / turn-end / sessions / config / config-loaded / notice / error
+ *       approval / usage / turn-end / sessions / history-slice / config / config-loaded / notice / error
  *
  * GUI 只做渲染，不碰 agent 逻辑；协议是纯 JSON 行，前端换成 WPF / 浏览器 / 终端都不用改核心。
  */
@@ -279,6 +279,13 @@ async function main(): Promise<void> {
 
   let agent = await buildAgent()
 
+  const questionPositions = (): Array<{ eventIndex: number; seq: number; text: string; at: number }> =>
+    session.events.flatMap((event, eventIndex) =>
+      event.kind === 'user/message' && !event.text.startsWith('[自动验证]')
+        ? [{ eventIndex, seq: event.seq, text: event.text.replace(/\s+/g, ' ').trim().slice(0, 100), at: event.at }]
+        : [],
+    )
+
   const state = (): Record<string, unknown> => ({
     type: 'ready',
     session: session.id,
@@ -292,7 +299,8 @@ async function main(): Promise<void> {
     maxSteps: opts.maxSteps,
     verify: opts.verify,
     vision: opts.vision,
-    events: session.events,
+    historyCount: session.events.length,
+    questions: questionPositions(),
     // 工具调用日志目录：界面上「设置」里直接显示出来，方便按日志改
     logsDir: audit.logsDir,
   })
@@ -681,6 +689,55 @@ async function main(): Promise<void> {
         } catch (e) {
           send({ type: 'error', message: `打开会话失败：${(e as Error).message}` })
         }
+        break
+      }
+      case 'history-slice': {
+        const requestId = Number(cmd.requestId ?? 0)
+        const requestedSession = String(cmd.session ?? '')
+        if (requestedSession !== session.id) break
+        const mode = String(cmd.mode ?? 'tail')
+        const cursor = Math.max(0, Math.min(session.events.length, Number(cmd.cursor ?? session.events.length)))
+        const target = Math.max(0, Math.min(session.events.length - 1, Number(cmd.target ?? 0)))
+        const questions = questionPositions().map((q) => q.eventIndex)
+        const questionBefore = (limit: number): number => {
+          for (let i = questions.length - 1; i >= 0; i--) if (questions[i]! < limit) return questions[i]!
+          return 0
+        }
+        const turnStart = (question: number): number => {
+          for (let i = question; i >= 0; i--) if (session.events[i]?.kind === 'turn/start') return i
+          return question
+        }
+        let from = 0
+        let to = session.events.length
+        let jumpTo: number | undefined
+        if (mode === 'before') {
+          to = cursor
+          from = turnStart(questionBefore(to))
+        } else if (mode === 'after') {
+          from = cursor
+          const question = questions.find((index) => index >= from)
+          const next = question === undefined ? undefined : questions.find((index) => index > question)
+          to = next === undefined ? session.events.length : turnStart(next)
+        } else if (mode === 'around') {
+          const question = questionBefore(target + 1)
+          from = turnStart(question)
+          const next = questions.find((index) => index > question)
+          to = next === undefined ? session.events.length : turnStart(next)
+          jumpTo = question
+        } else {
+          const question = questions.length ? questions[questions.length - 1]! : 0
+          from = turnStart(question)
+        }
+        send({
+          type: 'history-slice',
+          session: session.id,
+          requestId,
+          mode,
+          from,
+          to,
+          jumpTo,
+          events: session.events.slice(from, to),
+        })
         break
       }
       case 'ping':

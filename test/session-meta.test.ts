@@ -9,13 +9,18 @@ async function fresh(): Promise<string> {
   return mkdtemp(join(tmpdir(), 'pl-meta-'))
 }
 
-test('session meta: 没发过消息的会话默认叫「新对话」', async () => {
+test('session meta: 没发过消息的会话默认叫「新对话」，但不进会话列表', async () => {
   const dataDir = await fresh()
   const s = await Session.create(dataDir, { cwd: dataDir, model: 'm', baseURL: 'u', mode: 'guarded', version: '0' })
   assert.equal(s.title(), '新对话')
+  // 空壳会话不该占列表一行：删掉当前会话后 host 会立刻新建一个空会话接着用，
+  // 它也出现的话，用户看到的就是"删掉一个新对话、又冒出一个新对话"
+  assert.equal((await Session.list(dataDir)).length, 0)
+
+  await s.append({ kind: 'user/message', text: '第一条' })
   const list = await Session.list(dataDir)
   assert.equal(list.length, 1)
-  assert.equal(list[0]!.title, '新对话')
+  assert.equal(list[0]!.title, '第一条')
   assert.equal(list[0]!.group, '')
 })
 

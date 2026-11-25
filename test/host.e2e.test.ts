@@ -237,6 +237,33 @@ test('host: 拒绝审批 → 不写入；read-only 档连审批都不弹', async
   }
 })
 
+test('host: 删掉当前会话不会在列表里再冒出一个「新对话」', async () => {
+  const s = await setup()
+  try {
+    const ready = await s.host.next('ready')
+    const first = String(ready.session)
+    // 空壳会话（还没发消息）本身就不该出现在列表里
+    s.host.send({ cmd: 'list-sessions' })
+    assert.deepEqual((await s.host.next('sessions')).items, [])
+
+    s.host.send({ cmd: 'task', text: '创建 a.txt' })
+    const ap = await s.host.next('approval')
+    s.host.send({ cmd: 'approve', reqId: ap.reqId, decision: 'allowed-once' })
+    await s.host.next('turn-end')
+    s.host.send({ cmd: 'list-sessions' })
+    const before = (await s.host.next('sessions')).items as Array<{ id: string }>
+    assert.deepEqual(before.map((it) => it.id), [first], '发过消息的会话才进列表')
+
+    // 删掉当前会话：host 会换一个新的空会话接着用，但它不该出现在列表里
+    s.host.send({ cmd: 'delete-session', id: first })
+    assert.notEqual(String((await s.host.next('ready')).session), first)
+    const after = await s.host.next('sessions')
+    assert.deepEqual(after.items, [], '删掉之后列表应该真的空了，而不是又冒出一个新对话')
+  } finally {
+    await s.close()
+  }
+})
+
 test('host: 未知命令回 error，ping 回 pong，sessions 可列', async () => {
   const s = await setup()
   try {

@@ -74,9 +74,9 @@ test('cli: --repl 可被管道驱动（多命令按序执行，EOF 正常退出�
   )
   assert.equal(r.code, 0, r.err)
   assert.match(r.out, /\/exit/)
-  // 启动时就建了会话，所以这里列出的是"当前这个 0 轮的会话"
-  assert.match(r.out, /会话\s+\(/)
-  assert.match(r.out, /s-\S+\s+0 轮/)
+  // 启动时就建了会话，但没发过消息的空壳会话不算一条对话，所以列表是空的
+  assert.match(r.out, /还没有任何会话/)
+  assert.doesNotMatch(r.out, /s-\S+\s+0 轮/)
   assert.match(r.out, /输入结束，退出/)
 })
 

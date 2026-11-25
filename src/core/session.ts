@@ -39,6 +39,8 @@ const summaryCache = new Map<
     group: string
     updatedAt: number
     turns: number
+    /** 有内容才进列表：空壳会话（只写了 session/start，或干脆还没落盘）不算一"条"对话 */
+    visible: boolean
   }
 >()
 
@@ -148,7 +150,9 @@ export class Session {
           ((hit.meta === null && meta === null) ||
             (hit.meta !== null && meta !== null && hit.meta.mtimeMs === meta.mtimeMs && hit.meta.size === meta.size))
         if (hit && sameJsonl && sameMeta) {
-          out.push({ id, title: hit.title, group: hit.group, updatedAt: hit.updatedAt, turns: hit.turns })
+          if (hit.visible) {
+            out.push({ id, title: hit.title, group: hit.group, updatedAt: hit.updatedAt, turns: hit.turns })
+          }
           continue
         }
         const s = await Session.open(dataDir, id)
@@ -159,6 +163,11 @@ export class Session {
           updatedAt: s.events.length ? s.events[s.events.length - 1]!.at : 0,
           turns: s.events.filter((e) => e.kind === 'turn/start').length,
         }
+        // 只有 session/start 的空会话不进列表：删掉当前会话后 host 会立刻新建一个空会话接着用，
+        // 要是它也占一行，界面上就变成"删掉一个新对话、又冒出一个新对话"。
+        // 给了标题/分组的（老数据、手工 meta.json）仍然留着，免得把用户明确命名过的会话藏起来。
+        const visible =
+          s.events.some((e) => e.kind === 'user/message') || Boolean((s.meta.title ?? '').trim()) || Boolean(item.group)
         summaryCache.set(id, {
           jsonl,
           meta,
@@ -166,8 +175,9 @@ export class Session {
           group: item.group,
           updatedAt: item.updatedAt,
           turns: item.turns,
+          visible,
         })
-        out.push(item)
+        if (visible) out.push(item)
       } catch {
         /* 忽略损坏会话 */
       }

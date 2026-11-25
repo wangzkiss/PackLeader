@@ -122,14 +122,16 @@ $xaml = @'
       </Setter>
     </Style>
   </Window.Resources>
-  <Grid>
+  <Grid x:Name="RootGrid">
     <Grid.ColumnDefinitions>
-      <ColumnDefinition Width="252"/>
-      <ColumnDefinition Width="*"/>
+      <!-- 列 0 = 左侧栏（宽度可拖）；列 1 = 分隔条；列 2 = 右侧对话区 -->
+      <ColumnDefinition Width="252" MinWidth="180"/>
+      <ColumnDefinition Width="6"/>
+      <ColumnDefinition Width="*" MinWidth="420"/>
     </Grid.ColumnDefinitions>
 
     <!-- ================= 左侧栏 ================= -->
-    <Border Grid.Column="0" Background="#0B0D11" BorderBrush="#12FFFFFF" BorderThickness="0,0,1,0">
+    <Border Grid.Column="0" Background="#0B0D11">
       <Grid>
         <Grid.RowDefinitions>
           <RowDefinition Height="Auto"/>
@@ -185,7 +187,28 @@ $xaml = @'
     </Border>
 
     <!-- ================= 右侧 ================= -->
-    <Grid Grid.Column="1">
+    <GridSplitter x:Name="SideSplitter" Grid.Column="1" Width="6" HorizontalAlignment="Stretch"
+                  VerticalAlignment="Stretch" ResizeBehavior="PreviousAndNext" ResizeDirection="Columns"
+                  ShowsPreview="False" Background="Transparent" Cursor="SizeWE"
+                  ToolTip="拖动调整左右宽度（双击复位）">
+      <GridSplitter.Template>
+        <ControlTemplate TargetType="GridSplitter">
+          <Border Background="Transparent">
+            <Rectangle x:Name="ln" Width="1" HorizontalAlignment="Center" Fill="#12FFFFFF"/>
+          </Border>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsMouseOver" Value="True">
+              <Setter TargetName="ln" Property="Fill" Value="#4A8AB4FF"/>
+            </Trigger>
+            <Trigger Property="IsDragging" Value="True">
+              <Setter TargetName="ln" Property="Fill" Value="#8AB4FF"/>
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </GridSplitter.Template>
+    </GridSplitter>
+
+    <Grid Grid.Column="2">
       <Grid.RowDefinitions>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="*"/>
@@ -265,7 +288,7 @@ $xaml = @'
     </Grid>
 
     <!-- 设置面板：做成遮罩层而不是第二个窗口，省掉嵌套消息循环那堆坑 -->
-    <Grid x:Name="SettingsOverlay" Grid.ColumnSpan="2" Visibility="Collapsed" Background="#B8000000">
+    <Grid x:Name="SettingsOverlay" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#B8000000">
       <Border Width="452" Background="#16181D" BorderBrush="#26FFFFFF" BorderThickness="1" CornerRadius="12"
               HorizontalAlignment="Center" VerticalAlignment="Center" Padding="22,18,22,16">
         <StackPanel>
@@ -321,7 +344,7 @@ $xaml = @'
 
     <!-- 删除类操作的确认框：用窗口内的深色浮层，不用系统 MessageBox
          —— 后者是白底系统字，在这套深色界面里像从别的程序弹出来的 -->
-    <Grid x:Name="ConfirmOverlay" Grid.ColumnSpan="2" Visibility="Collapsed" Background="#B8000000">
+    <Grid x:Name="ConfirmOverlay" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#B8000000">
       <Border Width="420" Background="#16181D" BorderBrush="#26FFFFFF" BorderThickness="1" CornerRadius="12"
               HorizontalAlignment="Center" VerticalAlignment="Center" Padding="22,20,22,18">
         <StackPanel>
@@ -341,7 +364,7 @@ $xaml = @'
     </Grid>
 
     <!-- 图片预览：点缩略图弹大图，点背景 / × / Esc 都能关 -->
-    <Grid x:Name="ImagePreview" Grid.ColumnSpan="2" Visibility="Collapsed" Background="#F2000000">
+    <Grid x:Name="ImagePreview" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#F2000000">
       <Grid.RowDefinitions>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="*"/>
@@ -353,8 +376,10 @@ $xaml = @'
         <TextBlock x:Name="PreviewName" Text="" Foreground="#ADB2B8" FontSize="11.5" VerticalAlignment="Center"
                    TextTrimming="CharacterEllipsis" TextWrapping="NoWrap" Margin="0,0,12,0"/>
       </DockPanel>
-      <Image x:Name="PreviewImage" Grid.Row="1" Margin="20,8,20,20" Stretch="Uniform"
-             HorizontalAlignment="Center" VerticalAlignment="Center"/>
+      <Border Grid.Row="1" Margin="20,8,20,20" Background="#0B0E12" BorderBrush="#6B7484" BorderThickness="1"
+              HorizontalAlignment="Center" VerticalAlignment="Center">
+        <Image x:Name="PreviewImage" Stretch="Uniform"/>
+      </Border>
     </Grid>
   </Grid>
 </Window>
@@ -407,6 +432,8 @@ $ConfirmTitle = $window.FindName('ConfirmTitle')
 $ConfirmText = $window.FindName('ConfirmText')
 $ConfirmYes = $window.FindName('ConfirmYes')
 $ConfirmNo = $window.FindName('ConfirmNo')
+$SideSplitter = $window.FindName('SideSplitter')
+$SideCol = $window.FindName('RootGrid').ColumnDefinitions[0]
 
 # ---------------------------------------------------------------- 画东西的小工具
 function Brush([string]$hex) {
@@ -466,7 +493,7 @@ function Add-UserMessage([string]$text, [object]$files = $null) {
       if ($fp -and (Test-ImagePath $fp)) {
         $box = New-Object System.Windows.Controls.StackPanel
         $box.Orientation = 'Horizontal'
-        $thumb = New-ImageThumb $fp 40
+        $thumb = New-ImageThumb $fp 56
         if ($thumb) { $box.Children.Add($thumb) | Out-Null }
         $meta = New-Object System.Windows.Controls.StackPanel
         $meta.VerticalAlignment = 'Center'
@@ -1189,7 +1216,7 @@ function New-FlatTemplate {
   if ($script:flatTpl) { return $script:flatTpl }
   $xaml = @'
 <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
-  <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="6" Padding="{TemplateBinding Padding}">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="6" Padding="{TemplateBinding Padding}">
     <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
   </Border>
   <ControlTemplate.Triggers>
@@ -1298,7 +1325,7 @@ function Test-ImagePath([string]$path) {
   return @('.png', '.jpg', '.jpeg', '.webp', '.gif') -contains $ext
 }
 
-# 缩略图：DecodePixelHeight 只解到 120px 高，几百 MB 的截图也不会把整张读进内存。
+# 缩略图：DecodePixelHeight 只解到 168px 高，几百 MB 的截图也不会把整张读进内存。
 # 坑：必须先设 CacheOption=OnLoad 再给 StreamSource，EndInit 时才会真的解码；
 # 顺序反过来（先给流、再设 OnLoad）会变成延迟解码，流一关就解不出来，
 # 最后 Image 的宽是 0——附件条上只剩文件名，缩略图根本不显示（实测）。
@@ -1309,21 +1336,25 @@ function New-ImageThumb([string]$path, [double]$h = 40) {
     $bi = New-Object System.Windows.Media.Imaging.BitmapImage
     $bi.BeginInit()
     $bi.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
-    $bi.DecodePixelHeight = 120
+    $bi.DecodePixelHeight = 168
     $bi.StreamSource = $ms
     $bi.EndInit()
     $img = New-Object System.Windows.Controls.Image
     $img.Source = $bi
     $img.Height = $h
-    $img.MaxWidth = 160
+    $img.MaxWidth = 140
     $img.Stretch = 'Uniform'
     # 缩略图包一层无边框按钮：Image 本身不参与 UIA 的 Invoke，包成按钮既好点也好测
     $btn = New-Object System.Windows.Controls.Button
     $btn.Content = $img
-    $btn.Padding = '0'
+    # 缩略图外面套一圈浅色边框：粘的是深色界面截图时，缩略图本身也是深色的，
+    # 没有边框就和附件条底色糊成一片，看起来像“根本没生成缩略图”（用户实测踩过）
+    $btn.Padding = '3'
     $btn.Margin = '0,0,7,0'
-    $btn.BorderThickness = '0'
-    $btn.Background = [System.Windows.Media.Brushes]::Transparent
+    $btn.Template = (New-FlatTemplate)
+    $btn.BorderThickness = '1'
+    $btn.BorderBrush = (Brush '#6B7484')
+    $btn.Background = (Brush '#343C48')
     $btn.VerticalAlignment = 'Center'
     $btn.Cursor = 'Hand'
     $btn.ToolTip = '点开看大图'
@@ -1361,7 +1392,7 @@ function Update-AttachList {
     $sp.Orientation = 'Horizontal'
     # 图片给缩略图：粘完截图要能一眼看出贴的是哪张，只给个文件名等于没预览
     if (Test-ImagePath $f) {
-      $thumb = New-ImageThumb $f 40
+      $thumb = New-ImageThumb $f 56
       if ($thumb) { $sp.Children.Add($thumb) | Out-Null }
     }
     $txt = New-Object System.Windows.Controls.StackPanel
@@ -1422,18 +1453,68 @@ $AttachBtn.Add_Click({
 # 粘贴：Clipboard 里是图片或文件时收成附件。
 # WPF 的 TextBox 只认文本格式，截图/文件在它眼里“没东西可粘”——Ctrl+V 毫无反应，也不报错。
 # 所以自己在 PreviewKeyDown 里看一眼剪贴板，当成附件收下，再吃掉这次按键。
+# 剪贴板位图落盘：CF_DIB 里的 alpha 字节常常是 0（截屏工具不填），原样编码就是全透明 PNG，
+# 缩略图/预览看着一片白，发给模型的也是白板。这里把 alpha 统一补成 255，RGB 原样保留。
+if (-not ('PLClipImage' -as [type])) {
+  Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+  Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+  Add-Type -ReferencedAssemblies ([System.Drawing.Bitmap].Assembly.Location) -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
+
+public static class PLClipImage {
+  public static void SaveOpaque(Bitmap src, string path) {
+    int w = src.Width, h = src.Height;
+    var rect = new Rectangle(0, 0, w, h);
+    using (var dst = new Bitmap(w, h, PixelFormat.Format32bppArgb)) {
+      var sd = src.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+      int stride = sd.Stride;
+      int bytes = stride * h;
+      var buf = new byte[bytes];
+      Marshal.Copy(sd.Scan0, buf, 0, bytes);
+      src.UnlockBits(sd);
+      bool anyAlpha = false;
+      for (int i = 3; i < bytes; i += 4) { if (buf[i] != 0) { anyAlpha = true; break; } }
+      if (!anyAlpha) { for (int i = 3; i < bytes; i += 4) buf[i] = 255; }
+      var dd = dst.LockBits(rect, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+      Marshal.Copy(buf, 0, dd.Scan0, bytes);
+      dst.UnlockBits(dd);
+      dst.Save(path, ImageFormat.Png);
+    }
+  }
+}
+'@
+}
 function Save-ClipboardImage {
-  $img = $null
-  try { $img = [System.Windows.Clipboard]::GetImage() } catch { return $null }
-  if (-not $img) { return $null }
   # 落成临时 png：附件入库是按文件路径拷的，剪贴板里的位图没路径
   $dir = Join-Path $env:TEMP 'packleader-paste'
   New-Item -ItemType Directory -Force -Path $dir | Out-Null
   $path = Join-Path $dir ('paste-{0}.png' -f (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
-  $enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
-  $enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($img)) | Out-Null
-  $fs = [System.IO.File]::Create($path)
-  try { $enc.Save($fs) } finally { $fs.Close() }
+  # 剪贴板里直接带 PNG 流时原样落盘，最保真。多数截图工具不放这个格式，会走下面的回退。
+  try {
+    $png = [System.Windows.Clipboard]::GetData('PNG')
+    $bytes = $null
+    if ($png -is [System.IO.MemoryStream]) { $bytes = $png.ToArray() }
+    elseif ($png -is [byte[]]) { $bytes = $png }
+    if ($bytes -and $bytes.Length -gt 8) {
+      [System.IO.File]::WriteAllBytes($path, $bytes)
+      return $path
+    }
+  } catch { }
+  # 回退：GetImage 拿回来的位图 alpha 常常整张是 0（RGB 内容还在），
+  # 直接编码就存成全透明图 —— 缩略图、预览、发给模型的都是白板。保存前把 alpha 补成 255。
+  $bmp = $null
+  try { $bmp = [System.Windows.Forms.Clipboard]::GetImage() } catch { return $null }
+  if (-not $bmp) { return $null }
+  try {
+    [PLClipImage]::SaveOpaque($bmp, $path)
+  } catch {
+    return $null
+  } finally {
+    $bmp.Dispose()
+  }
   return $path
 }
 
@@ -1947,6 +2028,54 @@ $timer.Add_Tick({
   }
 })
 
+# ---------------- 左侧栏宽度：可拖动，记住上次的宽度 ----------------
+# 存在数据目录（和 config.json 同一个地方），不塞进配置里免得污染模型设置
+$script:layoutFile = Join-Path $DataDir 'ui-layout.json'
+$script:sideDefault = 252
+$script:sideMin = 180
+
+function Get-SideMax {
+  $w = $window.ActualWidth
+  if ($w -le 0) { $w = $window.Width }
+  # 右边给对话区留 420（它的 MinWidth）+ 6（分隔条）
+  return [math]::Max($script:sideMin + 1, $w - 426)
+}
+
+function Set-SideWidth([double]$w) {
+  if ($w -lt $script:sideMin) { $w = $script:sideMin }
+  $max = Get-SideMax
+  if ($w -gt $max) { $w = $max }
+  $SideCol.Width = (New-Object System.Windows.GridLength $w)
+}
+
+function Save-SideWidth {
+  try {
+    $w = [math]::Round($SideCol.ActualWidth)
+    if ($w -lt $script:sideMin) { return }
+    # 合并写：以后这个文件里放别的东西（比如高度）也不会互相覆盖
+    $obj = @{}
+    if (Test-Path -LiteralPath $script:layoutFile) {
+      try {
+        $old = Get-Content -Raw -LiteralPath $script:layoutFile | ConvertFrom-Json
+        foreach ($p in $old.PSObject.Properties) { $obj[$p.Name] = $p.Value }
+      } catch { }
+    }
+    $obj['sideWidth'] = [int]$w
+    [System.IO.File]::WriteAllText($script:layoutFile, ($obj | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding $false))
+  } catch { Log ('保存左侧栏宽度失败: ' + ($_ | Out-String)) }
+}
+
+function Restore-SideWidth {
+  $w = 0
+  try {
+    if (Test-Path -LiteralPath $script:layoutFile) {
+      $o = Get-Content -Raw -LiteralPath $script:layoutFile | ConvertFrom-Json
+      if ($o -and $null -ne $o.sideWidth) { $w = [double]$o.sideWidth }
+    }
+  } catch { Log ('读左侧栏宽度失败: ' + ($_ | Out-String)) }
+  if ($w -ge $script:sideMin) { Set-SideWidth $w } else { Set-SideWidth $script:sideDefault }
+}
+
 $window.Add_Loaded({
   Log '窗口 Loaded'
   # 深色标题栏：WPF 默认给的是白色系统 chrome，和深色底不搭。
@@ -1962,14 +2091,24 @@ $window.Add_Loaded({
   Set-ModeVisual $Mode
   $SubTitle.Text = $Mode
   Clear-Transcript
+  Restore-SideWidth
   $timer.Start()
   $InputBox.Focus() | Out-Null
   # 自测入口：设置 PL_GUI_TASK 会自动发第一条任务（也方便截图验证）
   if ($env:PL_GUI_TASK) { Start-Turn $env:PL_GUI_TASK }
 })
 
+# 分隔条：拖完记住宽度；双击复位到默认
+$SideSplitter.Add_DragCompleted({ Save-SideWidth })
+$SideSplitter.Add_MouseDoubleClick({
+  Set-SideWidth $script:sideDefault
+  Save-SideWidth
+})
+
 $window.Add_Closing({
   Log '窗口 Closing'
+  try { Save-SideWidth } catch { }
+
   $timer.Stop()
   try { $proc.StandardInput.Close() } catch { }
   Start-Sleep -Milliseconds 150

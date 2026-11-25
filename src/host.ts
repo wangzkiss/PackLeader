@@ -43,6 +43,9 @@ interface Opts {
   maxSteps: number
   session?: string
   cont: boolean
+  /** 验证命令：空串＝自动识别项目 */
+  verify: string
+  noVerify: boolean
 }
 
 function parseArgs(argv: string[]): Opts {
@@ -75,6 +78,8 @@ function parseArgs(argv: string[]): Opts {
     maxSteps: Number(s('max-steps') ?? 40) || 40,
     session: s('resume'),
     cont: flags.continue === true,
+    verify: s('verify') ?? '',
+    noVerify: flags['no-verify'] === true,
   }
 }
 
@@ -138,6 +143,7 @@ async function main(): Promise<void> {
     if (saved.apiKey) opts.apiKey = saved.apiKey
     if (saved.baseURL) opts.baseURL = saved.baseURL
     if (saved.model) opts.model = saved.model
+    if (saved.verify && !opts.noVerify) opts.verify = saved.verify
   }
 
   const { Audit: AuditClass } = await import('./core/audit.ts')
@@ -181,6 +187,18 @@ async function main(): Promise<void> {
         bytes: result.content.length,
         error: result.ok ? '' : result.content.slice(0, 500),
       }),
+    onVerifyStart: (label, round) => send({ type: 'verify-start', label, round }),
+    onVerifyEnd: (r, round) =>
+      send({
+        type: 'verify-end',
+        label: r.label,
+        round,
+        ok: r.ok,
+        exitCode: r.exitCode,
+        ms: r.ms,
+        timedOut: r.timedOut,
+        output: r.output.slice(0, 3000),
+      }),
   }
 
   const buildAgent = (): Agent =>
@@ -195,6 +213,7 @@ async function main(): Promise<void> {
       dataDir: opts.dataDir,
       renderer,
       maxSteps: opts.maxSteps,
+      verify: opts.noVerify ? null : opts.verify === '' ? undefined : { label: opts.verify },
     })
 
   let agent = buildAgent()
@@ -210,6 +229,7 @@ async function main(): Promise<void> {
     apiKeyMasked: maskKey(opts.apiKey),
     hasKey: Boolean(opts.apiKey),
     maxSteps: opts.maxSteps,
+    verify: opts.verify,
     events: session.events,
   })
 
@@ -315,6 +335,9 @@ async function main(): Promise<void> {
         const baseURL = String(cmd.baseURL ?? '').trim()
         const apiKey = String(cmd.apiKey ?? '').trim()
         const model = String(cmd.model ?? '').trim()
+        // verify 允许被"清空成自动识别"，所以单独判断有没有传这个字段
+        const hasVerify = Object.prototype.hasOwnProperty.call(cmd, 'verify')
+        const verify = String(cmd.verify ?? '').trim()
         if (baseURL) {
           opts.baseURL = baseURL
           llm.cfg.baseURL = baseURL
@@ -331,9 +354,24 @@ async function main(): Promise<void> {
           send({ type: 'error', message: 'API Key 不能为空' })
           break
         }
+        if (hasVerify) opts.verify = verify
         try {
-          await saveSettings(opts.dataDir, { baseURL: opts.baseURL, apiKey: opts.apiKey, model: llm.cfg.model })
-          send({ type: 'config', baseURL: opts.baseURL, model: llm.cfg.model, apiKeyMasked: maskKey(opts.apiKey), saved: true })
+          await saveSettings(opts.dataDir, {
+            baseURL: opts.baseURL,
+            apiKey: opts.apiKey,
+            model: llm.cfg.model,
+            verify: hasVerify ? verify : undefined,
+          })
+          // 验证命令变了要重建 agent，否则还用着旧的
+          agent = buildAgent()
+          send({
+            type: 'config',
+            baseURL: opts.baseURL,
+            model: llm.cfg.model,
+            apiKeyMasked: maskKey(opts.apiKey),
+            verify: opts.verify,
+            saved: true,
+          })
         } catch (e) {
           send({ type: 'error', message: `配置已生效，但没写进磁盘：${(e as Error).message}` })
         }

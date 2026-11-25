@@ -68,11 +68,15 @@
 
 小而关键，决定"敢不敢让它动真项目"。
 
-**2.1 验证闭环（1 天）**
-- 记录本轮是否写过文件；若写过，且项目里能识别出验证命令（`package.json` 的 `scripts.test` / `pytest` / `cargo test` / `go test`），
-  要求收尾前必须跑一次；没跑就在 `turn/end` 标 `unverified`，并在答案末尾提示"未验证"
-- 改动：`loop.ts`（写标记 + 收尾检查）、`factory`/prompt、`audit.ts`（`verified` 列）、CLI 提示
-- 验收：e2e 测试里"只改不测"的一轮被标 `unverified`；真实跑 dogfood 时自动执行 `node --test`
+**2.1 验证闭环（1 天）— 已完成（2026-11-25）**
+- 实现方式比原计划更进一步：不是"标记未验证"，而是**收尾前自动跑一次，红了把输出回灌给模型让它自己修**
+  （最多 1 轮重试，`maxVerifyRounds` 可调）
+- 触发条件：本轮有 `write`/`edit` 成功落盘；纯读的轮次不跑。识别不出测试入口就跳过并说明原因
+- 认项目：`package.json` 的 `scripts.test`（按 lockfile 选 npm/pnpm/yarn）、`Cargo.toml`、`go.mod`、`pytest.ini` 等
+- 改动：新增 `core/verify.ts`、`loop.ts`（外层验证轮 + `verify/*` 事件）、CLI/GUI 渲染、`--verify` / `--no-verify`
+- 验收（都跑过）：假模型的 e2e 断言"失败一次→回灌→通过一次"；真实模型跑 `pl-demo` 时
+  `npm test` 先 `✗ 失败 exit 1`、回灌后 `✓ 通过`；没改文件的轮次不触发验证
+- 踩到的坑：PowerShell 写的 `package.json` 带 BOM，`JSON.parse` 抛异常会被误判成"没有测试入口"（已修 + 有测试）
 
 **2.2 Ctrl+C 中断（0.5 天）**
 - 当前中断等于杀进程，会话最后一条可能没落盘。改为：SIGINT → `AbortController.abort()` →

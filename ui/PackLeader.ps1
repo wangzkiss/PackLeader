@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
   PackLeader 桌面窗口（WPF / PowerShell 5.1 / .NET Framework 4.8，都是 Windows 自带）
 
@@ -236,6 +236,13 @@ $xaml = @'
                    BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center" FontSize="11.5"
                    FontFamily="Cascadia Mono, Consolas"/>
 
+          <TextBlock Text="验证命令（可选）" Foreground="#ADB2B8" FontSize="11" Margin="0,13,0,5"/>
+          <TextBox x:Name="CfgVerify" Height="30" Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF"
+                   BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center" FontSize="11.5"
+                   FontFamily="Cascadia Mono, Consolas"/>
+          <TextBlock Text="改完文件后自动跑它，失败会把输出回灌给模型让它自己修。留空＝自动识别（npm test / cargo test / go test / pytest）。"
+                     Foreground="#5B626D" FontSize="10.5" Margin="0,5,0,0" TextWrapping="Wrap"/>
+
           <TextBlock x:Name="CfgError" Text="" Foreground="#F87171" FontSize="11" Margin="0,10,0,0" TextWrapping="Wrap"/>
 
           <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
@@ -281,6 +288,7 @@ $CfgUrl = $window.FindName('CfgUrl')
 $CfgKey = $window.FindName('CfgKey')
 $CfgKeyHint = $window.FindName('CfgKeyHint')
 $CfgModel = $window.FindName('CfgModel')
+$CfgVerify = $window.FindName('CfgVerify')
 $CfgError = $window.FindName('CfgError')
 $CfgCancel = $window.FindName('CfgCancel')
 $CfgSave = $window.FindName('CfgSave')
@@ -379,8 +387,48 @@ function Add-ToolRow([string]$name, [string]$summary) {
   return $status
 }
 
-function Add-SystemLine([string]$text, [string]$color = '#7C838E') {
-  $tb = New-Text $text 11 $color 'Normal' 'Segoe UI' 10
+function Add-VerifyRow([string]$label, [int]$round) {
+  $outer = New-Object System.Windows.Controls.Border
+  $outer.Background = (Brush '#12141A')
+  $outer.BorderBrush = (Brush '#0FFFFFFF')
+  $outer.BorderThickness = '1'
+  $outer.CornerRadius = '6'
+  $outer.Padding = '9,5'
+  $outer.Margin = '0,0,0,5'
+  $outer.HorizontalAlignment = 'Left'
+  $outer.MaxWidth = 720
+
+  $dp = New-Object System.Windows.Controls.DockPanel
+  $status = New-Text '验证中…' 10.5 '#7C838E' 'Normal' 'Cascadia Mono, Consolas' 0
+  $status.VerticalAlignment = 'Center'
+  [System.Windows.Controls.DockPanel]::SetDock($status, 'Right')
+  $dp.Children.Add($status) | Out-Null
+
+  $icon = New-Text '🧪' 11 '#7C838E' 'Normal' 'Segoe UI Emoji, Segoe UI' 0
+  $icon.VerticalAlignment = 'Center'
+  $icon.Margin = '0,0,6,0'
+  [System.Windows.Controls.DockPanel]::SetDock($icon, 'Left')
+  $dp.Children.Add($icon) | Out-Null
+
+  $name = $(if ($round -gt 1) { "验证（第 $round 次）" } else { '验证' })
+  $nameTb = New-Text $name 11 '#9BA3B4' 'SemiBold' 'Segoe UI' 0
+  $nameTb.VerticalAlignment = 'Center'
+  $nameTb.Margin = '0,0,8,0'
+  [System.Windows.Controls.DockPanel]::SetDock($nameTb, 'Left')
+  $dp.Children.Add($nameTb) | Out-Null
+
+  $cmdTb = New-Text $label 11 '#CFD3D6' 'Normal' 'Cascadia Mono, Consolas' 0
+  $cmdTb.TextTrimming = 'CharacterEllipsis'
+  $cmdTb.TextWrapping = 'NoWrap'
+  $cmdTb.VerticalAlignment = 'Center'
+  $dp.Children.Add($cmdTb) | Out-Null
+
+  $outer.Child = $dp
+  $Transcript.Children.Add($outer) | Out-Null
+  return @{ Status = $status; Border = $outer }
+}
+
+function Add-SystemLine([string]$text, [string]$color = '#7C838E') {  $tb = New-Text $text 11 $color 'Normal' 'Segoe UI' 10
   $tb.HorizontalAlignment = 'Left'
   $Transcript.Children.Add($tb) | Out-Null
 }
@@ -644,6 +692,7 @@ function Clear-Transcript {
   $script:currentAssistant = $null
   $script:pendingText.Clear() | Out-Null
   $script:toolRows = @{}
+$script:verifyRows = @{}
 }
 
 function Add-EmptyState {
@@ -774,6 +823,7 @@ $script:currentAssistant = $null
 $script:assistantBody = $null
 $script:pendingText = New-Object System.Text.StringBuilder
 $script:toolRows = @{}
+$script:verifyRows = @{}
 $script:tickSeen = $false
 $script:modelName = $Model
 $script:sessionId = ''
@@ -782,6 +832,7 @@ $script:history = New-Object System.Collections.ArrayList
 $script:historyIdx = 0
 $script:cfgBaseURL = ''
 $script:cfgKeyMasked = ''
+$script:verifyCmd = ''
 $script:hasKey = $true
 
 # ---------------------------------------------------------------- 设置面板
@@ -789,6 +840,7 @@ function Open-Settings {
   $CfgUrl.Text = $(if ($script:cfgBaseURL) { $script:cfgBaseURL } else { '' })
   $CfgKey.Text = ''
   $CfgModel.Text = $script:modelName
+  $CfgVerify.Text = $script:verifyCmd
   if ($script:hasKey) {
     $CfgKeyHint.Text = "已设置（$($script:cfgKeyMasked)）；留空表示保持不变。"
   } else {
@@ -813,7 +865,7 @@ function Save-Settings {
   if (-not $url.StartsWith('http')) { $CfgError.Text = '端点地址要以 http:// 或 https:// 开头'; return }
   if (-not $key -and -not $script:hasKey) { $CfgError.Text = 'API Key 不能为空'; return }
   $CfgError.Text = ''
-  $payload = @{ cmd = 'config'; baseURL = $url; model = $model }
+  $payload = @{ cmd = 'config'; baseURL = $url; model = $model; verify = $CfgVerify.Text.Trim() }
   if ($key) { $payload.apiKey = $key }
   Send-Host $payload
 }
@@ -867,6 +919,7 @@ function Handle-Event([string]$line) {
       $script:modelName = [string]$e.model
       $script:cfgBaseURL = [string]$e.baseURL
       $script:cfgKeyMasked = [string]$e.apiKeyMasked
+      $script:verifyCmd = [string]$e.verify
       $script:hasKey = [bool]$e.hasKey
       $WorkspaceLabel.Text = [string]$e.cwd
       $ModelBox.Text = [string]$e.model
@@ -954,6 +1007,36 @@ function Handle-Event([string]$line) {
       $script:currentAssistant = $null
       $Scroller.ScrollToEnd()
     }
+    'verify-start' {
+      $script:currentAssistant = $null
+      $r = Add-VerifyRow ([string]$e.label) ([int]$e.round)
+      $script:verifyRows[[string]$e.round] = $r
+      $Scroller.ScrollToEnd()
+    }
+    'verify-end' {
+      $r = $script:verifyRows[[string]$e.round]
+      if ($r) {
+        $sec = [math]::Round([double]$e.ms / 1000, 1)
+        if ($e.ok) {
+          $r.Status.Text = "✓ 通过 · $sec s"
+          $r.Status.Foreground = (Brush '#4ADE80')
+          $r.Border.BorderBrush = (Brush '#2644C07A')
+        } else {
+          $r.Status.Text = "✗ 失败 · exit $($e.exitCode) · $sec s"
+          $r.Status.Foreground = (Brush '#F87171')
+          $r.Border.BorderBrush = (Brush '#33F87171')
+          # 失败时给最后几行，够看出哪条挂了；整段留在会话日志里
+          $lines = ([string]$e.output) -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 4
+          foreach ($l in $lines) {
+            $t = $l.Trim()
+            if ($t.Length -gt 150) { $t = $t.Substring(0, 150) + '…' }
+            Add-SystemLine ("    " + $t) '#A88A8A'
+          }
+        }
+      }
+      $script:currentAssistant = $null
+      $Scroller.ScrollToEnd()
+    }
     'approval' { Add-ApprovalCard $e }
     'notice' { Add-SystemLine ([string]$e.text) '#9BA3B4' }
     'error' {
@@ -964,6 +1047,7 @@ function Handle-Event([string]$line) {
     'config' {
       $script:cfgBaseURL = [string]$e.baseURL
       $script:cfgKeyMasked = [string]$e.apiKeyMasked
+      if ($null -ne $e.verify) { $script:verifyCmd = [string]$e.verify }
       $script:modelName = [string]$e.model
       $script:hasKey = $true
       $ModelBox.Text = [string]$e.model
@@ -1012,7 +1096,7 @@ $StopBtn.Add_Click({ Send-Host @{ cmd = 'abort' } })
 $SettingsBtn.Add_Click({ Open-Settings })
 $CfgCancel.Add_Click({ Close-Settings })
 $CfgSave.Add_Click({ Save-Settings })
-foreach ($box in @($CfgUrl, $CfgKey, $CfgModel)) {
+foreach ($box in @($CfgUrl, $CfgKey, $CfgModel, $CfgVerify)) {
   $box.Add_PreviewKeyDown({
     param($s, $e)
     if ($e.Key -eq [System.Windows.Input.Key]::Return) { $e.Handled = $true; Save-Settings }

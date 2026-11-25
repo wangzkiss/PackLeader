@@ -10,7 +10,7 @@ node scripts/demo.ts       # 离线 demo，不需要 API Key
 ```
 
 - 设计方案：[DESIGN.md](DESIGN.md)（架构、包裁剪、体积测算、里程碑）
-- 当前状态：**M0–M5 已完成**，36 个测试全绿，**已在真实模型 + 5.5 GB 真实仓库上验证**（见下节）
+- 当前状态：**M0–M5 已完成**，48 个测试全绿，**已在真实模型 + 5.5 GB 真实仓库上验证**（见下节）
 
 ---
 
@@ -138,6 +138,34 @@ node src/cli.ts undo --turn 3
 桌面上用界面配置，两边不打架。界面上 Key 输入框永远留空、只显示 `sk-p…3456` 这种掩码，
 回填明文这件事本身就不做。
 
+### 验证闭环
+
+改完文件不算完，**跑过测试才算**。这一轮只要 `write`/`edit` 成功落盘，收尾前 agent 会自己跑一遍项目测试：
+
+```
+  ⚙ edit src/math.mjs
+    ✓ 1ms
+  🧪 验证 npm test
+    ✗ 失败 exit 1 · 0.6s
+    │ ✖ mul 应该是乘法
+  ⚙ read test/math.test.mjs
+  ⚙ edit src/math.mjs
+  🧪 验证 npm test (第 2 次)
+    ✓ 通过 0.6s
+```
+
+失败的输出会作为一条消息回灌给模型，让它自己对着红字修——不是把报告甩给你。
+
+规则：
+
+- **只在这一轮真的写了文件时才跑**，纯读的轮次不浪费时间
+- 认项目：`package.json` 的 `scripts.test`（按 lockfile 选 npm / pnpm / yarn）、`Cargo.toml`、`go.mod`、`pytest.ini`；认不出就跳过并说明原因，绝不瞎跑一条错的命令
+- 默认只重试 **1 轮**（`maxVerifyRounds` 可调），防止"永远红 → 无限修"烧钱；超时 180s，输出留头 2KB + 尾 6KB
+- 关掉：`--no-verify`；指定命令：`--verify "node --test"`；界面上设置面板里也能填（留空＝自动识别）
+
+上面的输出是真跑出来的：只让它修 `add`、并且明说"别动 mul"，它照做了；自动验证发现 `mul` 的测试也是红的，
+把输出回灌后它去读了测试文件，把 `mul` 改成乘法——顺手也告诉了你"你让我别动，但不改测试永远红"。
+
 ### 删除会话
 
 悬停会话行出现 `×` → 确认 → 删掉 `sessions/<id>/` 和 `ckpt/<id>/` 两处（只删一处会留悬空引用）。
@@ -150,6 +178,10 @@ node src/cli.ts undo --turn 3
 模型设置面板（第一次启动、或点右上角「设置」时出现）：
 
 ![模型设置](docs/settings.png)
+
+验证闭环在窗口里的样子（`🧪 验证 npm test ✓ 通过`）：
+
+![验证闭环](docs/verify.png)
 
 会话删除（悬停会话行出现 `×`）：
 
@@ -333,7 +365,7 @@ src/
 npm test     # 或 node --disable-warning=ExperimentalWarning --test "test/*.test.ts"
 ```
 
-32 个测试，覆盖：
+48 个测试，覆盖：
 
 - 会话恢复（含损坏半行、截断结果的说明文本）
 - 文件工具与路径越界、`{a,b}` 大括号 glob、`path` 限定范围

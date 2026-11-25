@@ -65,6 +65,15 @@ test('settings: 非字符串字段被忽略（手改坏了也不会把 undefined
   assert.equal(s.model, undefined)
 })
 
+test('settings: 文件带 BOM 也能读（手改/脚本写都会带）', async () => {
+  const dir = await tmp()
+  await writeFile(settingsPath(dir), '\uFEFF{"baseURL":"http://b/v1","model":"m-bom"}', 'utf8')
+  const s = await loadSettings(dir)
+  assert.equal(s.baseURL, 'http://b/v1')
+  assert.equal(s.model, 'm-bom')
+  assert.equal(loadSettingsSync(dir).model, 'm-bom')
+})
+
 test('settings: maskKey 只露头尾', () => {
   assert.equal(maskKey(''), '')
   assert.equal(maskKey('short'), '****')

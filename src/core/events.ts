@@ -30,6 +30,18 @@ export type EventPayload =
       ms: number
     }
   | { kind: 'step/end'; turn: number; step: number; toolCalls: number }
+  | { kind: 'verify/start'; turn: number; round: number; label: string }
+  | {
+      kind: 'verify/end'
+      turn: number
+      round: number
+      label: string
+      ok: boolean
+      exitCode: number
+      ms: number
+      output: string
+      timedOut: boolean
+    }
   | { kind: 'turn/end'; turn: number; reason: 'done' | 'max-steps' | 'error' | 'cancelled'; error?: string }
   | { kind: 'llm/usage'; turn: number; step: number; prompt: number; completion: number; cacheRead: number; ms: number; model: string }
 

@@ -7,6 +7,7 @@
 
 import type { Renderer } from '../core/loop.ts'
 import type { ToolCall, ToolResult } from '../core/types.ts'
+import type { VerifyResult } from '../core/verify.ts'
 
 const useColor = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR
 
@@ -130,6 +131,35 @@ export class CliRenderer implements Renderer {
   onNotice(text: string): void {
     this.emit('notice', { text })
     if (!this.opts.json) out(yellow(`\n  ! ${text}\n`))
+  }
+
+  onVerifyStart(label: string, round: number): void {
+    this.emit('verify/start', { label, round })
+    if (this.opts.json) return
+    if (this.streaming) {
+      out('\n')
+      this.streaming = false
+    }
+    out(`  ${dim('🧪')} ${bold('验证')} ${gray(label)}${round > 1 ? dim(` (第 ${round} 次)`) : ''}\n`)
+  }
+
+  onVerifyEnd(r: VerifyResult, round: number): void {
+    this.emit('verify/end', {
+      label: r.label,
+      round,
+      ok: r.ok,
+      exitCode: r.exitCode,
+      ms: r.ms,
+      timedOut: r.timedOut,
+      output: r.output.slice(0, 4000),
+    })
+    if (this.opts.json) return
+    const mark = r.ok ? green('✓ 通过') : red('✗ 失败')
+    out(`    ${mark} ${gray(`${r.exitCode === 0 ? '' : `exit ${r.exitCode} · `}${(r.ms / 1000).toFixed(1)}s`)}\n`)
+    if (!r.ok) {
+      // 失败时给几行，够看出是哪条测试炸了；整段留在日志里
+      for (const l of r.output.split('\n').slice(0, 8)) out(dim(`    │ ${l.slice(0, 160)}`) + '\n')
+    }
   }
 
   banner(meta: { model: string; mode: string; root: string; session: string; version: string }): void {

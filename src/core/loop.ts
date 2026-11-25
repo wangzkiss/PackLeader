@@ -17,6 +17,7 @@ import type { Policy } from './policy.ts'
 import type { Session } from './session.ts'
 import type { ToolRegistry } from './tools.ts'
 import type { Decision, LlmMessage, ToolCall, ToolResult } from './types.ts'
+import { detectVerifier, runVerifier, type VerifyResult } from './verify.ts'
 import type { OpenAiClient } from '../llm/openai.ts'
 
 export interface Renderer {
@@ -27,6 +28,8 @@ export interface Renderer {
   onAssistantEnd?(text: string): void
   onToolStart?(call: ToolCall): void
   onToolEnd?(call: ToolCall, result: ToolResult): void
+  onVerifyStart?(label: string, round: number): void
+  onVerifyEnd?(r: VerifyResult, round: number): void
   onNotice?(text: string): void
 }
 
@@ -44,6 +47,17 @@ export interface AgentOptions {
   maxOutputBytes?: number
   systemPrompt?: string
   signal?: AbortSignal
+  /**
+   * 验证闭环：改过文件后自动跑的项目测试。
+   *  - undefined：自动识别（detectVerifier）
+   *  - null：关掉
+   *  - {label}：用指定的命令
+   */
+  verify?: { label: string } | null
+  /** 验证失败后最多让它自己修几轮（默认 1，够用又不至于上头） */
+  maxVerifyRounds?: number
+  /** 验证超时，默认 180s */
+  verifyTimeoutMs?: number
 }
 
 export interface TurnResult {
@@ -322,13 +336,22 @@ export class Agent {
     let steps = 0
     let totalCalls = 0
 
+    // 验证闭环用的状态
+    const maxVerifyRounds = this.opts.maxVerifyRounds ?? 1
+    const touched = new Set<string>()
+    let verifyRound = 0
+    let stepBase = 0
+
     try {
-      for (let step = 1; step <= maxSteps; step++) {
-        if (this.signal?.aborted) {
-          reason = 'cancelled'
-          break
-        }
-        steps = step
+      for (;;) {
+        for (let i = 1; i <= maxSteps; i++) {
+          // step 编号跨验证轮次连续递增，日志里不会出现两个 step 1
+          const step = stepBase + i
+          if (this.signal?.aborted) {
+            reason = 'cancelled'
+            break
+          }
+          steps = step
         await session.append({ kind: 'step/start', turn, step })
         renderer?.onStepStart?.(step)
 
@@ -385,6 +408,11 @@ export class Agent {
           totalCalls++
           await session.append({ kind: 'tool/call', turn, step, call })
           const { result } = await this.executeTool(call, turn, step)
+          // 只有真的写成功了才算"改过文件"，后面据此决定要不要跑验证
+          if (result.ok && (call.name === 'write' || call.name === 'edit')) {
+            const p = (call.args as Record<string, unknown> | undefined)?.path
+            if (typeof p === 'string' && p) touched.add(p)
+          }
           await session.append({
             kind: 'tool/result',
             callId: call.id,
@@ -399,7 +427,7 @@ export class Agent {
         }
         await session.append({ kind: 'step/end', turn, step, toolCalls: res.toolCalls.length })
 
-        if (step === maxSteps) {
+        if (i === maxSteps) {
           reason = 'max-steps'
           renderer?.onNotice?.(`已达单轮步数上限（${maxSteps}），让模型基于现有信息收尾`)
           // 收尾：不给工具，逼它把已经看到的东西整理成答案（生产 agent 的常见做法）
@@ -454,6 +482,15 @@ export class Agent {
           renderer?.onAssistantEnd?.(wrap.text)
           if (wrap.text) finalText = wrap.text
         }
+        }
+
+        // ---- 验证闭环：这一轮改过文件，就在收尾前跑一遍项目测试 ----
+        stepBase += maxSteps
+        if (reason !== 'done' || this.signal?.aborted) break
+        const v = await this.maybeVerify(turn, touched, verifyRound, maxVerifyRounds)
+        if (!v.retry) break
+        verifyRound++
+        if (v.message) await session.append({ kind: 'user/message', text: v.message })
       }
     } catch (e) {
       reason = this.signal?.aborted ? 'cancelled' : 'error'
@@ -469,6 +506,68 @@ export class Agent {
       renderer?.onNotice?.(`已达单轮步数上限（${maxSteps}），本轮停止`)
     }
     return { text: finalText, steps, toolCalls: totalCalls, reason }
+  }
+
+  /**
+   * 跑一次验证，并把结论决定成"继续修"还是"收尾"。
+   * 只在真改过文件、且认得出测试入口时才动手。
+   */
+  private async maybeVerify(
+    turn: number,
+    touched: Set<string>,
+    round: number,
+    maxVerifyRounds: number,
+  ): Promise<{ retry: boolean; message?: string }> {
+    const { session, renderer, policy } = this.opts
+    if (this.opts.verify === null) return { retry: false }
+    if (touched.size === 0) return { retry: false }
+
+    const verifier = this.opts.verify ?? detectVerifier(policy.root)
+    if (!verifier) {
+      if (round === 0) {
+        renderer?.onNotice?.(
+          '这一轮改了文件，但没认出项目的测试入口（package.json 的 test script / Cargo.toml / go.mod / pytest），跳过自动验证',
+        )
+      }
+      return { retry: false }
+    }
+
+    renderer?.onVerifyStart?.(verifier.label, round + 1)
+    await session.append({ kind: 'verify/start', turn, round: round + 1, label: verifier.label })
+    const r = await runVerifier(verifier, {
+      root: policy.root,
+      timeoutMs: this.opts.verifyTimeoutMs,
+      signal: this.signal,
+    })
+    await session.append({
+      kind: 'verify/end',
+      turn,
+      round: round + 1,
+      label: verifier.label,
+      ok: r.ok,
+      exitCode: r.exitCode,
+      ms: r.ms,
+      output: r.output,
+      timedOut: r.timedOut,
+    })
+    renderer?.onVerifyEnd?.(r, round + 1)
+    if (r.ok) return { retry: false }
+
+    if (round >= maxVerifyRounds) {
+      renderer?.onNotice?.(`验证仍未通过（已让它自己修 ${round} 次），停在这里，失败输出留给你判断`)
+      return { retry: false }
+    }
+
+    const why = r.timedOut ? `超时 ${Math.round(r.ms / 1000)}s` : `退出码 ${r.exitCode}`
+    return {
+      retry: true,
+      message:
+        `[自动验证] 你改完文件后，我跑了 \`${verifier.label}\`，结果是失败（${why}）。\n` +
+        '请按下面的输出把它修好，然后给出最终回答；不要只说"应该没问题"。\n\n' +
+        '```\n' +
+        r.output.slice(0, 6000) +
+        '\n```',
+    }
   }
 
   syncAudit(): void {

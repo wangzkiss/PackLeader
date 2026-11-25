@@ -18,6 +18,8 @@ export interface Settings {
   model?: string
   /** 验证命令：留空＝自动识别（npm test / cargo test / go test / pytest） */
   verify?: string
+  /** 模型能不能看图；开了才把图片作为 image part 发过去 */
+  vision?: boolean
 }
 
 export const settingsPath = (dataDir: string): string => join(dataDir, 'config.json')
@@ -30,6 +32,7 @@ function coerce(raw: unknown): Settings {
     const v = obj[k]
     if (typeof v === 'string' && v.trim()) out[k] = v.trim()
   }
+  if (typeof obj.vision === 'boolean') out.vision = obj.vision
   return out
 }
 
@@ -60,6 +63,10 @@ export async function saveSettings(dataDir: string, patch: Settings): Promise<Se
   if (patch.apiKey?.trim()) merged.apiKey = patch.apiKey.trim()
   if (patch.model?.trim()) merged.model = patch.model.trim()
   // verify 是唯一「空串也有意义」的字段：空串＝回到自动识别，所以得真删掉
+  if (patch.vision !== undefined) {
+    if (patch.vision) merged.vision = true
+    else delete merged.vision
+  }
   if (patch.verify !== undefined) {
     if (patch.verify.trim()) merged.verify = patch.verify.trim()
     else delete merged.verify

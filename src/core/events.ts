@@ -7,12 +7,12 @@
  *  - 审批是审计事件（approval/asked → approval/decided），模型看不到过程
  */
 
-import type { Decision, ToolCall } from './types.ts'
+import type { Attachment, Decision, ToolCall } from './types.ts'
 
 export type EventPayload =
   | { kind: 'session/start'; id: string; cwd: string; model: string; baseURL: string; mode: string; version: string }
   | { kind: 'turn/start'; turn: number }
-  | { kind: 'user/message'; text: string }
+  | { kind: 'user/message'; text: string; files?: Attachment[] }
   | { kind: 'step/start'; turn: number; step: number }
   | { kind: 'assistant/message'; text: string; reasoning: string; toolCalls: ToolCall[]; ms: number; finish: string | null }
   | { kind: 'tool/call'; turn: number; step: number; call: ToolCall }

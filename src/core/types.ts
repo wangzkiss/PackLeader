@@ -22,8 +22,28 @@ export interface ToolCall {
 export interface LlmMessage {
   role: Role
   content: string
+  /**
+   * 图片（只给支持视觉的模型用）。base64 不带前缀，mime 单独存，
+   * 因为落盘到事件日志时要能原样读回来。
+   */
+  images?: ImagePart[]
   toolCalls?: ToolCall[]
   toolCallId?: string
+}
+
+export interface ImagePart {
+  mime: string
+  dataBase64: string
+}
+
+/** 用户带进来的附件：拷贝到数据目录后只记路径，不把内容塞进日志 */
+export interface Attachment {
+  name: string
+  path: string
+  bytes: number
+  mime: string
+  /** 文本类附件已把内容拼进消息正文，这里标一下，回头知道为什么模型"没读文件也看得到" */
+  inlined?: boolean
 }
 
 export interface ToolSchema {

@@ -22,14 +22,24 @@ param(
   [string]$Model = $env:PL_GUI_MODEL
 )
 
+
 $ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$OutputEncoding = [System.Text.Encoding]::UTF8
+# 没有控制台时会话里没有 stdout（启动器是 WinExe，spawn 后子进程无控制台）：
+# 在这里设 OutputEncoding 会抛 IOException，而 trap 那时还没生效，报错会变成"找不到 Log"，
+# 真正的错因被吃掉。所以这一句必须容错。
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+try { $OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 $script:guiLog = Join-Path $env:TEMP 'packleader-ui.log'
-"{0:o} start" -f (Get-Date) | Set-Content -Path $script:guiLog -Encoding UTF8
-function Log([string]$m) { Add-Content -Path $script:guiLog -Value ("{0:HH:mm:ss} {1}" -f (Get-Date), $m) -Encoding UTF8 }
-trap { Log ("异常: " + ($_ | Out-String)); throw }
+# 启动早期就得能落盘：trap 里不能再依赖 Log（它自己可能就是没生效的那个）
+$script:boot = {
+  param([string]$m)
+  try { [System.IO.File]::AppendAllText($script:guiLog, ("{0:HH:mm:ss.fff} {1}`r`n" -f (Get-Date), $m), (New-Object System.Text.UTF8Encoding $false)) } catch { }
+}
+[System.IO.File]::WriteAllText($script:guiLog, "", (New-Object System.Text.UTF8Encoding $false))
+& $script:boot "boot ps=$($PSVersionTable.PSVersion)"
+function Log([string]$m) { & $script:boot $m }
+trap { if ($script:boot) { & $script:boot ("异常: " + ($_ | Out-String)) } else { try { [System.IO.File]::AppendAllText((Join-Path $env:TEMP 'packleader-ui.log'), ("early: " + ($_ | Out-String)), (New-Object System.Text.UTF8Encoding $false)) } catch { } }; throw }
 
 if (-not $Cwd) { $Cwd = (Get-Location).Path }
 if (-not $Mode) { $Mode = 'guarded' }
@@ -189,12 +199,16 @@ $xaml = @'
       <Grid Grid.Row="2" Margin="24,0,24,14">
         <Border Background="#16181D" BorderBrush="#1FFFFFFF" BorderThickness="1" CornerRadius="12" Padding="14,10,12,8">
           <StackPanel>
-            <TextBox x:Name="Input" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="46" MaxHeight="160"
+            <WrapPanel x:Name="AttachList" Orientation="Horizontal" Margin="0,0,0,7" Visibility="Collapsed"/>
+          <TextBox x:Name="Input" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="46" MaxHeight="160"
                      Background="Transparent" Foreground="#F9FAFB" BorderThickness="0"
                      VerticalScrollBarVisibility="Auto" FontSize="13.5" FontFamily="Segoe UI"
                      CaretBrush="#F9FAFB" SelectionBrush="#2B5CFF" Padding="0"/>
             <DockPanel Margin="0,6,0,0">
-              <TextBlock x:Name="Hint" DockPanel.Dock="Left" Text="Enter 发送 · Shift+Enter 换行"
+              <Button x:Name="AttachBtn" DockPanel.Dock="Left" Content="+ 附件" Height="26" Padding="9,0"
+                      Cursor="Hand" FontSize="11.5" Margin="0,0,10,0"
+                      Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF" BorderThickness="1"/>
+              <TextBlock x:Name="Hint" DockPanel.Dock="Left" Text="Enter 发送 · Shift+Enter 换行 · 也可以直接拖文件进来"
                          Foreground="#5B626D" FontSize="10.5" VerticalAlignment="Center"/>
               <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" HorizontalAlignment="Right">
                 <TextBlock x:Name="UsageText" Text="" Foreground="#5B626D" FontSize="10.5"
@@ -232,9 +246,19 @@ $xaml = @'
           <TextBlock x:Name="CfgKeyHint" Text="" Foreground="#5B626D" FontSize="10.5" Margin="0,5,0,0" TextWrapping="Wrap"/>
 
           <TextBlock Text="模型名" Foreground="#ADB2B8" FontSize="11" Margin="0,13,0,5"/>
-          <TextBox x:Name="CfgModel" Height="30" Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF"
-                   BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center" FontSize="11.5"
-                   FontFamily="Cascadia Mono, Consolas"/>
+          <DockPanel>
+            <Button x:Name="CfgFetch" DockPanel.Dock="Right" Content="拉取" Height="30" Padding="12,0" Cursor="Hand"
+                    FontSize="11.5" Margin="8,0,0,0" Background="Transparent" Foreground="#8AB4FF"
+                    BorderBrush="#4D8AB4FF" BorderThickness="1"/>
+            <TextBox x:Name="CfgModel" Height="30" Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF"
+                     BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center" FontSize="11.5"
+                     FontFamily="Cascadia Mono, Consolas"/>
+          </DockPanel>
+          <WrapPanel x:Name="ModelChips" Orientation="Horizontal" Margin="0,7,0,0" Visibility="Collapsed"/>
+          <TextBlock x:Name="ModelHint" Text="" Foreground="#5B626D" FontSize="10.5" Margin="0,6,0,0" TextWrapping="Wrap"/>
+
+          <CheckBox x:Name="CfgVision" Content="模型支持看图（图片会作为图片发过去，不是只给路径）"
+                    Foreground="#CFD3D6" FontSize="11" Margin="0,13,0,0"/>
 
           <TextBlock Text="验证命令（可选）" Foreground="#ADB2B8" FontSize="11" Margin="0,13,0,5"/>
           <TextBox x:Name="CfgVerify" Height="30" Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF"
@@ -251,6 +275,27 @@ $xaml = @'
                     Margin="0,0,8,0"/>
             <Button x:Name="CfgSave" Content="保存" Height="28" Padding="18,0" Cursor="Hand" FontSize="11.5"
                     FontWeight="SemiBold" Background="#2B5CFF" Foreground="White" BorderThickness="0"/>
+          </StackPanel>
+        </StackPanel>
+      </Border>
+    </Grid>
+
+    <!-- 删除类操作的确认框：用窗口内的深色浮层，不用系统 MessageBox
+         —— 后者是白底系统字，在这套深色界面里像从别的程序弹出来的 -->
+    <Grid x:Name="ConfirmOverlay" Grid.ColumnSpan="2" Visibility="Collapsed" Background="#B8000000">
+      <Border Width="420" Background="#16181D" BorderBrush="#26FFFFFF" BorderThickness="1" CornerRadius="12"
+              HorizontalAlignment="Center" VerticalAlignment="Center" Padding="22,20,22,18">
+        <StackPanel>
+          <TextBlock x:Name="ConfirmTitle" Text="" Foreground="#F9FAFB" FontSize="14" FontWeight="SemiBold"
+                     TextWrapping="Wrap"/>
+          <TextBlock x:Name="ConfirmText" Text="" Foreground="#ADB2B8" FontSize="11.5" Margin="0,8,0,0"
+                     TextWrapping="Wrap" LineHeight="18"/>
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+            <Button x:Name="ConfirmNo" Content="取消" Height="28" Padding="14,0" Cursor="Hand" FontSize="11.5"
+                    Background="Transparent" Foreground="#ADB2B8" BorderBrush="#1FFFFFFF" BorderThickness="1"
+                    Margin="0,0,8,0"/>
+            <Button x:Name="ConfirmYes" Content="删除" Height="28" Padding="18,0" Cursor="Hand" FontSize="11.5"
+                    FontWeight="SemiBold" Background="#F87171" Foreground="#1A0B0B" BorderThickness="0"/>
           </StackPanel>
         </StackPanel>
       </Border>
@@ -292,6 +337,17 @@ $CfgVerify = $window.FindName('CfgVerify')
 $CfgError = $window.FindName('CfgError')
 $CfgCancel = $window.FindName('CfgCancel')
 $CfgSave = $window.FindName('CfgSave')
+$CfgFetch = $window.FindName('CfgFetch')
+$CfgVision = $window.FindName('CfgVision')
+$ModelChips = $window.FindName('ModelChips')
+$ModelHint = $window.FindName('ModelHint')
+$AttachBtn = $window.FindName('AttachBtn')
+$AttachList = $window.FindName('AttachList')
+$ConfirmOverlay = $window.FindName('ConfirmOverlay')
+$ConfirmTitle = $window.FindName('ConfirmTitle')
+$ConfirmText = $window.FindName('ConfirmText')
+$ConfirmYes = $window.FindName('ConfirmYes')
+$ConfirmNo = $window.FindName('ConfirmNo')
 
 # ---------------------------------------------------------------- 画东西的小工具
 function Brush([string]$hex) {
@@ -320,14 +376,37 @@ function Add-Container([double]$mb = 14) {
   return $sp
 }
 
-function Add-UserMessage([string]$text) {
+function Add-UserMessage([string]$text, [object]$files = $null) {
   $sp = Add-Container 20
   $label = New-Text '你' 10.5 '#6B7280' 'Normal' 'Segoe UI' 4
   $sp.Children.Add($label) | Out-Null
-  $body = New-Text $text 14 '#F9FAFB' 'Normal' 'Segoe UI' 0
-  $body.LineHeight = 23
-  $body.LineStackingStrategy = 'BlockLineHeight'
-  $sp.Children.Add($body) | Out-Null
+  if ($text.Trim()) {
+    $body = New-Text $text 14 '#F9FAFB' 'Normal' 'Segoe UI' 0
+    $body.LineHeight = 23
+    $body.LineStackingStrategy = 'BlockLineHeight'
+    $sp.Children.Add($body) | Out-Null
+  }
+  # 附件：只显示名字和大小，不显示数据目录里那一长串路径
+  $list = @($files)
+  if ($list.Count -gt 0) {
+    $wrap = New-Object System.Windows.Controls.WrapPanel
+    $wrap.Orientation = 'Horizontal'
+    $wrap.Margin = '0,6,0,0'
+    foreach ($f in $list) {
+      $nm = if ($f.name) { [string]$f.name } else { [System.IO.Path]::GetFileName([string]$f) }
+      $sz = if ($null -ne $f.bytes) { Format-FileSize ([double]$f.bytes) } else { '' }
+      $b = New-Object System.Windows.Controls.Border
+      $b.Background = (Brush '#1F242C')
+      $b.BorderBrush = (Brush '#1FFFFFFF')
+      $b.BorderThickness = '1'
+      $b.CornerRadius = '6'
+      $b.Padding = '8,4,8,4'
+      $b.Margin = '0,0,6,6'
+      $b.Child = (New-Text $(if ($sz) { "$nm · $sz" } else { $nm }) 10.5 '#9AA1AC')
+      $wrap.Children.Add($b) | Out-Null
+    }
+    $sp.Children.Add($wrap) | Out-Null
+  }
   $script:currentAssistant = $null
 }
 
@@ -660,10 +739,10 @@ function Set-Sessions($items) {
     $del.Add_Click({
       param($s, $ev)
       $ev.Handled = $true
-      $r = [System.Windows.MessageBox]::Show("删除会话「$stitle」？`n`n会删掉它的会话日志和 checkpoint，不能恢复。", 'PackLeader', 'YesNo', 'Warning')
-      if ($r -eq [System.Windows.MessageBoxResult]::Yes) {
-        Send-Host @{ cmd = 'delete-session'; id = $sid }
-      }
+      Show-Confirm -title "删除会话「$stitle」？" `
+                   -text "会删掉它的会话日志和 checkpoint，不能恢复。会话里的附件文件也会一起删。" `
+                   -yesText '删除' `
+                   -onYes { Send-Host @{ cmd = 'delete-session'; id = $sid } }.GetNewClosure()
     }.GetNewClosure())
     $del.Add_MouseEnter({ $this.Foreground = (Brush '#F87171') }.GetNewClosure())
     $del.Add_MouseLeave({ $this.Foreground = (Brush '#6B7280') }.GetNewClosure())
@@ -833,7 +912,119 @@ $script:historyIdx = 0
 $script:cfgBaseURL = ''
 $script:cfgKeyMasked = ''
 $script:verifyCmd = ''
+$script:visionOn = $false
 $script:hasKey = $true
+
+# ---------------------------------------------------------------- 确认框
+# 为什么不用 MessageBox：它画的是系统白底，和这套深色界面完全不搭（用户原话：样式不统一）。
+# 这里是窗口内的浮层，回调式：点"删除"才执行，点取消什么也不做。
+$script:confirmRun = $null
+
+function Show-Confirm {
+  param([string]$title, [string]$text, [string]$yesText = '确定', [scriptblock]$onYes)
+  $ConfirmTitle.Text = $title
+  $ConfirmText.Text = $text
+  $ConfirmYes.Content = $yesText
+  $script:confirmRun = $onYes
+  $ConfirmOverlay.Visibility = 'Visible'
+  $ConfirmYes.Focus() | Out-Null
+}
+
+function Hide-Confirm {
+  $ConfirmOverlay.Visibility = 'Collapsed'
+  $script:confirmRun = $null
+}
+
+$ConfirmNo.Add_Click({ Hide-Confirm })
+$ConfirmYes.Add_Click({
+  $run = $script:confirmRun
+  Hide-Confirm
+  if ($run) { & $run }
+})
+
+# ---------------------------------------------------------------- 附件
+$script:attachFiles = New-Object System.Collections.ArrayList
+
+function Format-FileSize([double]$n) {
+  if ($n -lt 1024) { return "$([int]$n) B" }
+  if ($n -lt 1048576) { return "$([math]::Round($n / 1024)) KB" }
+  return "$([math]::Round($n / 1048576, 1)) MB"
+}
+
+function Update-AttachList {
+  $AttachList.Children.Clear()
+  if ($script:attachFiles.Count -eq 0) {
+    $AttachList.Visibility = 'Collapsed'
+    return
+  }
+  $AttachList.Visibility = 'Visible'
+  foreach ($f in @($script:attachFiles)) {
+    $size = 0
+    try { $size = (Get-Item -LiteralPath $f -ErrorAction Stop).Length } catch { }
+    $b = New-Object System.Windows.Controls.Border
+    $b.Background = (Brush '#1F242C')
+    $b.BorderBrush = (Brush '#1FFFFFFF')
+    $b.BorderThickness = '1'
+    $b.CornerRadius = '6'
+    $b.Padding = '8,4,5,4'
+    $b.Margin = '0,0,6,6'
+    $sp = New-Object System.Windows.Controls.StackPanel
+    $sp.Orientation = 'Horizontal'
+    $name = [System.IO.Path]::GetFileName($f)
+    $label = New-Text -text ("{0} · {1}" -f $name, (Format-FileSize $size)) -size 10.5 -color '#CFD3D6'
+    $label.VerticalAlignment = 'Center'
+    $sp.Children.Add($label) | Out-Null
+    $x = New-Object System.Windows.Controls.Button
+    $x.Content = '×'
+    $x.Width = 16
+    $x.Height = 16
+    $x.Margin = '6,0,0,0'
+    $x.FontSize = 11
+    $x.Cursor = 'Hand'
+    $x.BorderThickness = '0'
+    $x.Background = [System.Windows.Media.Brushes]::Transparent
+    $x.Foreground = (Brush '#7C838E')
+    $x.VerticalAlignment = 'Center'
+    $x.ToolTip = '移除'
+    $x.Add_Click({ $script:attachFiles.Remove($f); Update-AttachList }.GetNewClosure())
+    $sp.Children.Add($x) | Out-Null
+    $b.Child = $sp
+    $AttachList.Children.Add($b) | Out-Null
+  }
+}
+
+function Add-Attachments([object]$paths) {
+  foreach ($p in @($paths)) {
+    $path = [string]$p
+    if (-not $path) { continue }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+    if ($script:attachFiles -contains $path) { continue }
+    $script:attachFiles.Add($path) | Out-Null
+  }
+  Update-AttachList
+}
+
+$AttachBtn.Add_Click({
+  $dlg = New-Object Microsoft.Win32.OpenFileDialog
+  $dlg.Multiselect = $true
+  $dlg.Title = '选择要发给模型的文件'
+  $dlg.Filter = '所有文件 (*.*)|*.*'
+  if ($dlg.ShowDialog()) { Add-Attachments $dlg.FileNames }
+})
+
+# 拖拽：TextBox 自己会吞掉 Drop，所以把它的 AllowDrop 关掉，统一由窗口收
+$window.AllowDrop = $true
+$InputBox.AllowDrop = $false
+$InputBox.Add_DragOver({ param($s, $e) if ($e.Data -and $e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) { $e.Effects = 'Copy' } }.GetNewClosure())
+$window.Add_DragOver({ param($s, $e) if ($e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) { $e.Effects = 'Copy'; $e.Handled = $true } })
+$window.Add_Drop({
+  param($s, $e)
+  if ($e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) {
+    Add-Attachments $e.Data.GetData([System.Windows.DataFormats]::FileDrop)
+    $e.Handled = $true
+  }
+})
+
 
 # ---------------------------------------------------------------- 设置面板
 function Open-Settings {
@@ -841,6 +1032,10 @@ function Open-Settings {
   $CfgKey.Text = ''
   $CfgModel.Text = $script:modelName
   $CfgVerify.Text = $script:verifyCmd
+  $CfgVision.IsChecked = [bool]$script:visionOn
+  $ModelChips.Children.Clear()
+  $ModelChips.Visibility = 'Collapsed'
+  $ModelHint.Text = '点「拉取」从端点列出可用模型。'
   if ($script:hasKey) {
     $CfgKeyHint.Text = "已设置（$($script:cfgKeyMasked)）；留空表示保持不变。"
   } else {
@@ -865,7 +1060,7 @@ function Save-Settings {
   if (-not $url.StartsWith('http')) { $CfgError.Text = '端点地址要以 http:// 或 https:// 开头'; return }
   if (-not $key -and -not $script:hasKey) { $CfgError.Text = 'API Key 不能为空'; return }
   $CfgError.Text = ''
-  $payload = @{ cmd = 'config'; baseURL = $url; model = $model; verify = $CfgVerify.Text.Trim() }
+  $payload = @{ cmd = 'config'; baseURL = $url; model = $model; verify = $CfgVerify.Text.Trim(); vision = [bool]$CfgVision.IsChecked }
   if ($key) { $payload.apiKey = $key }
   Send-Host $payload
 }
@@ -894,19 +1089,23 @@ function Set-Busy([bool]$on) {
 }
 
 function Start-Turn([string]$text) {
-  if ($script:busy -or -not $text.Trim()) { return }
+  $files = @($script:attachFiles)
+  if ($script:busy -or (-not $text.Trim() -and $files.Count -eq 0)) { return }
   # 输入历史：连续重复的不重复记，指针归到末尾
   $trimmed = $text.Trim()
-  if ($script:history.Count -eq 0 -or [string]$script:history[$script:history.Count - 1] -ne $trimmed) {
+  if ($trimmed -and ($script:history.Count -eq 0 -or [string]$script:history[$script:history.Count - 1] -ne $trimmed)) {
     [void]$script:history.Add($trimmed)
   }
   $script:historyIdx = $script:history.Count
-  Add-UserMessage $text
+  Add-UserMessage $text $files
   $InputBox.Text = ''
+  $script:attachFiles.Clear()
+  Update-AttachList
   $script:currentAssistant = $null
   $script:pendingText.Clear() | Out-Null
   Set-Busy $true
-  Send-Host @{ cmd = 'task'; text = $text }
+  if ($files.Count) { Send-Host @{ cmd = 'task'; text = $text; files = $files } }
+  else { Send-Host @{ cmd = 'task'; text = $text } }
   $Scroller.ScrollToEnd()
 }
 
@@ -920,6 +1119,7 @@ function Handle-Event([string]$line) {
       $script:cfgBaseURL = [string]$e.baseURL
       $script:cfgKeyMasked = [string]$e.apiKeyMasked
       $script:verifyCmd = [string]$e.verify
+      $script:visionOn = [bool]$e.vision
       $script:hasKey = [bool]$e.hasKey
       $WorkspaceLabel.Text = [string]$e.cwd
       $ModelBox.Text = [string]$e.model
@@ -933,7 +1133,7 @@ function Handle-Event([string]$line) {
         Clear-Transcript
         $hasUser = $false
         foreach ($ev in $e.events) {
-          if ($ev.kind -eq 'user/message') { Add-UserMessage ([string]$ev.text); $hasUser = $true }
+          if ($ev.kind -eq 'user/message') { Add-UserMessage ([string]$ev.text) $ev.files; $hasUser = $true }
           elseif ($ev.kind -eq 'assistant/message') {
             if ($ev.text) {
               if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
@@ -1048,11 +1248,41 @@ function Handle-Event([string]$line) {
       $script:cfgBaseURL = [string]$e.baseURL
       $script:cfgKeyMasked = [string]$e.apiKeyMasked
       if ($null -ne $e.verify) { $script:verifyCmd = [string]$e.verify }
+      if ($null -ne $e.vision) { $script:visionOn = [bool]$e.vision }
       $script:modelName = [string]$e.model
       $script:hasKey = $true
       $ModelBox.Text = [string]$e.model
       Close-Settings
       Add-SystemLine ("已切换模型：" + $e.model + " @ " + $e.baseURL) '#4ADE80'
+    }
+    'models' {
+      # 端点里真实存在的模型：点一个就填进「模型名」
+      $ModelChips.Children.Clear()
+      $items = @($e.items)
+      if ($items.Count -eq 0) {
+        $ModelHint.Foreground = (Brush '#F87171')
+        $ModelHint.Text = '端点没返回任何模型（检查地址要不要带 /v1）'
+      } else {
+        $ModelHint.Foreground = (Brush '#7C838E')
+        $ModelHint.Text = "共 $($items.Count) 个，点一下填进上面的框"
+        $ModelChips.Visibility = 'Visible'
+        foreach ($id in $items) {
+          $btn = New-Object System.Windows.Controls.Button
+          $btn.Content = [string]$id
+          $btn.FontSize = 10.5
+          $btn.FontFamily = 'Cascadia Mono, Consolas'
+          $btn.Padding = '8,3,8,3'
+          $btn.Margin = '0,0,6,6'
+          $btn.Cursor = 'Hand'
+          $btn.BorderThickness = '1'
+          $btn.BorderBrush = (Brush '#1FFFFFFF')
+          $btn.Background = (Brush '#1A1D24')
+          $btn.Foreground = (Brush '#CFD3D6')
+          $modelId = [string]$id
+          $btn.Add_Click({ $CfgModel.Text = $modelId }.GetNewClosure())
+          $ModelChips.Children.Add($btn) | Out-Null
+        }
+      }
     }
     'usage' {
       $p = [int]$e.prompt; $c = [int]$e.completion; $cr = [int]$e.cacheRead
@@ -1094,6 +1324,16 @@ $StopBtn.Add_Click({ Send-Host @{ cmd = 'abort' } })
 
 # 设置面板
 $SettingsBtn.Add_Click({ Open-Settings })
+
+# 拉取模型：用对话框里当前填的地址和 Key（Key 留空就让 host 用已保存的那个）
+$CfgFetch.Add_Click({
+  & $script:boot '拉取模型: 点击'
+  $ModelChips.Children.Clear()
+  $ModelChips.Visibility = 'Collapsed'
+  $ModelHint.Foreground = (Brush '#7C838E')
+  $ModelHint.Text = '拉取中…'
+  Send-Host @{ cmd = 'list-models'; baseURL = $CfgUrl.Text.Trim(); apiKey = $CfgKey.Text.Trim() }
+})
 $CfgCancel.Add_Click({ Close-Settings })
 $CfgSave.Add_Click({ Save-Settings })
 foreach ($box in @($CfgUrl, $CfgKey, $CfgModel, $CfgVerify)) {

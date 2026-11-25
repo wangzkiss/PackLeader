@@ -192,7 +192,7 @@ async function cmdGui(cfg: Config): Promise<void> {
 
   // PowerShell 5.1 只把「带 BOM 的 UTF-8」当 UTF-8，否则中文全变乱码并破坏引号。
   // 与其要求编辑器保存成 BOM，不如启动时生成一份带 BOM 的临时副本（源码编码再怎么变都不影响）。
-  const text = (await readFile(ps1, 'utf8')).replace(/^\uFEFF/, '')
+  const text = (await readFile(ps1, 'utf8')).replace(/^\uFEFF+/, '')
   const tempScript = join(tmpdir(), `packleader-ui-${process.pid}.ps1`)
   await writeFile(tempScript, `\uFEFF${text}`, 'utf8')
 

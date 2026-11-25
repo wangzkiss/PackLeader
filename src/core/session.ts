@@ -9,6 +9,7 @@
  */
 
 import { appendFile, mkdir, readFile, readdir, rm, stat } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { EventInput, SessionEvent } from './events.ts'
 import type { LlmMessage } from './types.ts'
@@ -106,6 +107,8 @@ export class Session {
     if (!/^s-[a-z0-9]+-[a-z0-9]+$/.test(id)) throw new Error(`非法会话 id：${id}`)
     await rm(join(dataDir, 'sessions', id), { recursive: true, force: true })
     await rm(join(dataDir, 'ckpt', id), { recursive: true, force: true })
+    // 附件也归会话：留着就是孤儿文件，用户还会以为"删干净了"
+    await rm(join(dataDir, 'files', id), { recursive: true, force: true })
   }
 
   async append(payload: EventInput): Promise<SessionEvent> {    const event = { seq: this.seq + 1, at: Date.now(), ...payload } as SessionEvent
@@ -137,8 +140,20 @@ export class Session {
   deriveMessages(): LlmMessage[] {
     const out: LlmMessage[] = []
     for (const e of this.events) {
-      if (e.kind === 'user/message') out.push({ role: 'user', content: e.text })
-      else if (e.kind === 'assistant/message')
+      if (e.kind === 'user/message') {
+        // 图片存在 attachment 目录里，请求前才读成 base64：日志里不存二进制
+        const images = (e.files ?? [])
+          .filter((f) => f.mime.startsWith('image/'))
+          .map((f) => {
+            try {
+              return { mime: f.mime, dataBase64: readFileSync(f.path).toString('base64') }
+            } catch {
+              return null
+            }
+          })
+          .filter((x): x is { mime: string; dataBase64: string } => x !== null)
+        out.push({ role: 'user', content: e.text, ...(images.length ? { images } : {}) })
+      } else if (e.kind === 'assistant/message')
         out.push({ role: 'assistant', content: e.text, toolCalls: e.toolCalls.length ? e.toolCalls : undefined })
       else if (e.kind === 'tool/result')
         out.push({

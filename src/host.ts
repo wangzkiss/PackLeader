@@ -21,8 +21,9 @@ import { Checkpoints } from './core/checkpoint.ts'
 import { Agent, type Renderer } from './core/loop.ts'
 import { Policy } from './core/policy.ts'
 import { Session } from './core/session.ts'
+import { ingestFiles } from './core/attach.ts'
 import { loadSettings, maskKey, saveSettings } from './core/settings.ts'
-import type { Decision, Mode, ToolCall } from './core/types.ts'
+import type { Attachment, Decision, Mode, ToolCall } from './core/types.ts'
 import { OpenAiClient } from './llm/openai.ts'
 import { createDefaultTools } from './tools/index.ts'
 import type { Audit } from './core/audit.ts'
@@ -46,6 +47,8 @@ interface Opts {
   /** 验证命令：空串＝自动识别项目 */
   verify: string
   noVerify: boolean
+  /** 模型能不能看图（决定图片是否作为 image part 发过去） */
+  vision: boolean
 }
 
 function parseArgs(argv: string[]): Opts {
@@ -80,6 +83,7 @@ function parseArgs(argv: string[]): Opts {
     cont: flags.continue === true,
     verify: s('verify') ?? '',
     noVerify: flags['no-verify'] === true,
+    vision: flags.vision === true || process.env.PL_VISION === '1',
   }
 }
 
@@ -144,6 +148,7 @@ async function main(): Promise<void> {
     if (saved.baseURL) opts.baseURL = saved.baseURL
     if (saved.model) opts.model = saved.model
     if (saved.verify && !opts.noVerify) opts.verify = saved.verify
+    if (saved.vision) opts.vision = true
   }
 
   const { Audit: AuditClass } = await import('./core/audit.ts')
@@ -169,7 +174,7 @@ async function main(): Promise<void> {
   else session = await Session.create(opts.dataDir, meta())
 
   const renderer: Renderer = {
-    onTurnStart: (_turn, text) => send({ type: 'turn-start', text }),
+    onTurnStart: (_turn, text, files) => send({ type: 'turn-start', text, files: files ?? [] }),
     onStepStart: (step) => send({ type: 'step', step }),
     onText: (delta) => send({ type: 'text', delta }),
     onReasoning: (delta) => send({ type: 'reasoning', delta }),
@@ -230,6 +235,7 @@ async function main(): Promise<void> {
     hasKey: Boolean(opts.apiKey),
     maxSteps: opts.maxSteps,
     verify: opts.verify,
+    vision: opts.vision,
     events: session.events,
   })
 
@@ -255,7 +261,7 @@ async function main(): Promise<void> {
     return { calls, prompt, completion, cacheRead }
   }
 
-  const runTask = async (text: string): Promise<void> => {
+  const runTask = async (text: string, files?: Attachment[]): Promise<void> => {
     if (running) {
       send({ type: 'error', message: '上一轮还没结束（可先点停止）' })
       return
@@ -269,7 +275,7 @@ async function main(): Promise<void> {
     agent.signal = controller.signal
     const t0 = Date.now()
     try {
-      const r = await agent.runTurn(text)
+      const r = await agent.runTurn(text, files)
       send({ type: 'turn-end', reason: r.reason, ms: Date.now() - t0, text: r.text })
     } catch (e) {
       send({ type: 'error', message: (e as Error).message })
@@ -297,8 +303,48 @@ async function main(): Promise<void> {
     switch (cmd.cmd) {
       case 'task': {
         const text = String(cmd.text ?? '').trim()
+        const paths = Array.isArray(cmd.files) ? (cmd.files as unknown[]).filter((x): x is string => typeof x === 'string') : []
+        const run = async (): Promise<void> => {
+          let prompt = text
+          let files: Attachment[] | undefined
+          if (paths.length) {
+            // 附件先入库再开轮：拷贝失败/被删就让模型知道，而不是静默少一个文件
+            const ing = await ingestFiles(opts.dataDir, session.id, paths, { vision: opts.vision })
+            if (ing.attachments.length) {
+              prompt = `${text}\n\n${ing.text}`
+              files = ing.attachments
+            } else {
+              prompt = `${text}\n\n[附件] 指定的 ${paths.length} 个文件都没读到（可能已被删除或没有权限）`
+            }
+          }
+          await runTask(prompt, files)
+        }
         // 关键：不能 await —— 否则执行期间读不到 stdin，approve/abort 永远进不来（死锁）
-        if (text) current = runTask(text).finally(() => { current = undefined })
+        if (text || paths.length) current = run().finally(() => { current = undefined })
+        break
+      }
+      case 'list-models': {
+        const baseURL = String(cmd.baseURL ?? '').trim() || opts.baseURL
+        const apiKey = String(cmd.apiKey ?? '').trim() || opts.apiKey
+        if (!apiKey) {
+          send({ type: 'error', message: '先填 API Key，再拉取模型列表', needsSetup: true })
+          break
+        }
+        try {
+          const r = await fetch(`${baseURL.replace(/\/+$/, '')}/models`, {
+            headers: { authorization: `Bearer ${apiKey}` },
+            signal: AbortSignal.timeout(15_000),
+          })
+          const body = (await r.json().catch(() => ({}))) as { data?: Array<{ id?: string }>; error?: { message?: string } }
+          if (!r.ok) {
+            send({ type: 'error', message: `拉取失败（HTTP ${r.status}）：${body.error?.message ?? '端点没有返回模型列表'}` })
+            break
+          }
+          const items = (body.data ?? []).map((m) => String(m.id ?? '')).filter(Boolean).sort()
+          send({ type: 'models', items })
+        } catch (e) {
+          send({ type: 'error', message: `拉取模型失败：${(e as Error).message}` })
+        }
         break
       }
       case 'approve': {
@@ -338,6 +384,7 @@ async function main(): Promise<void> {
         // verify 允许被"清空成自动识别"，所以单独判断有没有传这个字段
         const hasVerify = Object.prototype.hasOwnProperty.call(cmd, 'verify')
         const verify = String(cmd.verify ?? '').trim()
+        const hasVision = Object.prototype.hasOwnProperty.call(cmd, 'vision')
         if (baseURL) {
           opts.baseURL = baseURL
           llm.cfg.baseURL = baseURL
@@ -355,12 +402,14 @@ async function main(): Promise<void> {
           break
         }
         if (hasVerify) opts.verify = verify
+        if (hasVision) opts.vision = Boolean(cmd.vision)
         try {
           await saveSettings(opts.dataDir, {
             baseURL: opts.baseURL,
             apiKey: opts.apiKey,
             model: llm.cfg.model,
             verify: hasVerify ? verify : undefined,
+            vision: hasVision ? Boolean(cmd.vision) : undefined,
           })
           // 验证命令变了要重建 agent，否则还用着旧的
           agent = buildAgent()
@@ -370,6 +419,7 @@ async function main(): Promise<void> {
             model: llm.cfg.model,
             apiKeyMasked: maskKey(opts.apiKey),
             verify: opts.verify,
+            vision: opts.vision,
             saved: true,
           })
         } catch (e) {

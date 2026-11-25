@@ -16,12 +16,12 @@ import type { Checkpoints } from './checkpoint.ts'
 import type { Policy } from './policy.ts'
 import type { Session } from './session.ts'
 import type { ToolRegistry } from './tools.ts'
-import type { Decision, LlmMessage, ToolCall, ToolResult } from './types.ts'
+import type { Attachment, Decision, LlmMessage, ToolCall, ToolResult } from './types.ts'
 import { detectVerifier, runVerifier, type VerifyResult } from './verify.ts'
 import type { OpenAiClient } from '../llm/openai.ts'
 
 export interface Renderer {
-  onTurnStart?(turn: number, text: string): void
+  onTurnStart?(turn: number, text: string, files?: Attachment[]): void
   onStepStart?(step: number): void
   onReasoning?(chunk: string): void
   onText?(chunk: string): void
@@ -322,14 +322,14 @@ export class Agent {
     return { result, decision }
   }
 
-  async runTurn(userText: string): Promise<TurnResult> {
+  async runTurn(userText: string, files?: Attachment[]): Promise<TurnResult> {
     const { session, llm, renderer, audit, policy, tools } = this.opts
     const turn = session.nextTurn()
     const maxSteps = this.opts.maxSteps ?? DEFAULT_MAX_STEPS
 
     await session.append({ kind: 'turn/start', turn })
-    await session.append({ kind: 'user/message', text: userText })
-    renderer?.onTurnStart?.(turn, userText)
+    await session.append({ kind: 'user/message', text: userText, ...(files?.length ? { files } : {}) })
+    renderer?.onTurnStart?.(turn, userText, files)
 
     let finalText = ''
     let reason: TurnResult['reason'] = 'done'

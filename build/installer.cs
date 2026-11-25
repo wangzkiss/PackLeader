@@ -1,4 +1,4 @@
-// PackLeader 安装包（自解压 + 注册卸载项）。
+﻿// PackLeader 安装包（自解压 + 注册卸载项）。
 // 负载以 payload.bin 资源形式嵌进 exe，编译时用 /resource:payload.bin,payload.bin 传进来。
 // 单文件、无第三方依赖、用 in-box 的 csc.exe 编译，产物几百 KB。
 using System;

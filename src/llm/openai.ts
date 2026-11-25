@@ -41,7 +41,7 @@ export interface ChatResult {
 
 interface WireMessage {
   role: string
-  content: string | null
+  content: string | null | Array<Record<string, unknown>>
   tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>
   tool_call_id?: string
 }
@@ -67,6 +67,20 @@ export class OpenAiClient {
         }
       }
       if (m.role === 'tool') return { role: 'tool', content: m.content, tool_call_id: m.toolCallId ?? '' }
+      // 带图片时 content 变成 parts 数组（OpenAI 多模态格式）；没有图片就还是纯字符串，
+      // 这样老网关/老模型的行为完全不变
+      if (m.role === 'user' && m.images?.length) {
+        return {
+          role: 'user',
+          content: [
+            { type: 'text', text: m.content },
+            ...m.images.map((img) => ({
+              type: 'image_url',
+              image_url: { url: `data:${img.mime};base64,${img.dataBase64}` },
+            })),
+          ],
+        }
+      }
       return { role: m.role, content: m.content }
     })
   }

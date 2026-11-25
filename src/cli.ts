@@ -251,6 +251,20 @@ async function cmdDoctor(cfg: Config, flags: Record<string, string | boolean>): 
   }
   rows.push({ name: 'data-dir', ok: dataOk, detail: dataDetail })
 
+  // 审计库：只是投影，坏了不挡路，但要让人看见（open 会执行建表 DDL，等于验证了可写）
+  let auditOk = false
+  let auditDetail = join(cfg.dataDir, 'audit.sqlite')
+  try {
+    const { Audit } = await import('./core/audit.ts')
+    const audit = await Audit.open(join(cfg.dataDir, 'audit.sqlite'))
+    auditOk = audit.enabled
+    auditDetail = audit.enabled ? `${audit.path}（写失败不影响会话）` : `${audit.path} 不可用，仍靠 JSONL 日志`
+    audit.close()
+  } catch (e) {
+    auditDetail = `${auditDetail} — ${(e as Error).message}`
+  }
+  rows.push({ name: 'audit', ok: auditOk, detail: auditDetail })
+
   const rootOk = existsSync(cfg.root)
   rows.push({ name: 'workspace', ok: rootOk, detail: `${cfg.root}${rootOk ? '' : '（不存在）'}` })
 

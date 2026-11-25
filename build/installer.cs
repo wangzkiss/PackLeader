@@ -53,11 +53,28 @@ static class Installer
     static int Main(string[] args)
     {
         bool silent = Has(args, "/S") || Has(args, "/silent");
-        if (Has(args, "--uninstall") || Has(args, "/uninstall"))
+        bool purge = Has(args, "--purge") || Has(args, "/purge");
+
+        // 卸载意图有两个来源：
+        //   1) 命令行带 --uninstall —— 注册表 UninstallString 就是这么调的
+        //   2) 自己被复制成 Uninstall.exe 之后被双击 —— 一个参数都没有
+        // 只认参数的话，双击 Uninstall.exe 会掉进"安装界面"，这就是之前的 bug。
+        bool byName = Path.GetFileNameWithoutExtension(Application.ExecutablePath)
+            .StartsWith("Uninstall", StringComparison.OrdinalIgnoreCase);
+
+        if (Has(args, "--uninstall") || Has(args, "/uninstall") || byName)
         {
-            Uninstall(silent);
+            if (silent)
+            {
+                Uninstall(true, purge);
+                return 0;
+            }
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.Run(new UninstallForm());
             return 0;
         }
+
         if (silent)
         {
             bool ok = Run(true, delegate(int pct, string msg) { if (msg != null) Console.WriteLine(msg); });
@@ -248,13 +265,14 @@ static class Installer
     }
 
     // ---------------------------------------------------------------- 卸载
-    static void Uninstall(bool silent)
+    /// <summary>返回删掉的文件数；用户取消返回 -1</summary>
+    public static int Uninstall(bool silent, bool purgeData)
     {
         if (!silent)
         {
-            DialogResult r = MessageBox.Show("要卸载 PackLeader 吗？\r\n\r\n会删除程序文件、快捷方式和卸载项，不会动你自己的项目目录和会话记录。",
+            DialogResult r = MessageBox.Show("要卸载 PackLeader 吗？\r\n\r\n会删除程序文件、快捷方式和卸载项，不会动你自己的项目目录。",
                 AppName, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-            if (r != DialogResult.Yes) return;
+            if (r != DialogResult.Yes) return -1;
         }
         try { if (File.Exists(StartMenuLnk)) File.Delete(StartMenuLnk); } catch { }
         try { if (File.Exists(DesktopLnk)) File.Delete(DesktopLnk); } catch { }
@@ -264,12 +282,13 @@ static class Installer
         // 为什么不用 `rd /s /q` 延迟整目录：如果用户在几秒内重装，那条延迟命令会
         // 把新装进去的文件一起删掉（实测过，装完只剩 PackLeader.exe）。
         string self = Application.ExecutablePath;
+        int removed = 0;
         try
         {
             foreach (string f in Directory.GetFiles(TargetDir, "*", SearchOption.AllDirectories))
             {
                 if (PathsEqual(f, self)) continue;
-                try { File.Delete(f); } catch { }
+                try { File.Delete(f); removed++; } catch { }
             }
             foreach (string d in Directory.GetDirectories(TargetDir, "*", SearchOption.AllDirectories))
             {
@@ -278,18 +297,65 @@ static class Installer
         }
         catch { }
 
-        // 自己删不掉自己：交给 cmd 退出后再删，且 rd 不带 /s —— 目录非空时它会失败，
-        // 这样即使和重装撞上也不会误删。
+        if (purgeData) PurgeData();
+
+        // 自己删不掉自己。静默卸载到这里就可以排删除；有界面时不能排，
+        // 因为用户还会盯着「已卸载」看一会儿，那时 exe 被占用，del 必然失败
+        // （实测：点完卸载不关窗，目录和 Uninstall.exe 都会留下来）。
+        // 界面路径改在 FormClosed 里调 ScheduleSelfDelete()。
+        if (silent) ScheduleSelfDelete();
+        if (!silent) MessageBox.Show("已卸载。", AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+        return removed;
+    }
+
+    /// <summary>
+    /// 退出后再删自己 + 删目录。
+    ///
+    /// 为什么不是"ping 几秒再 del"：用户卸载完会盯着「已卸载」看一会儿，那几秒早就过去了，
+    /// exe 还占着，del 必然失败（实测过：点完卸载不关窗，目录和 Uninstall.exe 都留着）。
+    /// 所以交给一个旁观进程 Wait-Process，等本进程真退出了再动手。
+    /// 另外工作目录必须设到别处：自己的 cwd 就是安装目录，rd 删不掉"当前目录"。
+    /// </summary>
+    public static void ScheduleSelfDelete()
+    {
+        string self = Application.ExecutablePath;
+        int pid = System.Diagnostics.Process.GetCurrentProcess().Id;
+        bool selfInside = self.StartsWith(TargetDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("Wait-Process -Id ").Append(pid).Append(" -ErrorAction SilentlyContinue;");
+        sb.Append(" Start-Sleep -Milliseconds 500;");
+        if (selfInside) sb.Append(" Remove-Item -LiteralPath '").Append(self).Append("' -Force -ErrorAction SilentlyContinue;");
+        sb.Append(" Remove-Item -LiteralPath '").Append(TargetDir).Append("' -Recurse -Force -ErrorAction SilentlyContinue;");
+
         try
         {
-            string cmd = "/c ping -n 3 127.0.0.1 >nul & del /f /q \"" + self + "\" 2>nul & rd \"" + TargetDir + "\" 2>nul & ping -n 2 127.0.0.1 >nul & rd \"" + TargetDir + "\" 2>nul";
-            System.Diagnostics.ProcessStartInfo psi = new System.Diagnostics.ProcessStartInfo("cmd.exe", cmd);
+            System.Diagnostics.ProcessStartInfo psi = new System.Diagnostics.ProcessStartInfo(
+                "powershell.exe",
+                "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command \"" + sb.ToString() + "\"");
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
+            psi.WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.System);
             System.Diagnostics.Process.Start(psi);
         }
         catch { }
-        if (!silent) MessageBox.Show("已卸载。", AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+    /// <summary>会话日志、审计库、checkpoint、config.json（含 API Key）都在这里</summary>
+    public static string[] DataDirs()
+    {
+        return new string[]
+        {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), AppName),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".packleader"),
+        };
+    }
+
+    static void PurgeData()
+    {
+        foreach (string dir in DataDirs())
+        {
+            try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
+        }
     }
 }
 
@@ -418,6 +484,129 @@ class SetupForm : Form
                     _go.Enabled = true;
                     _desktop.Enabled = true;
                 }
+            });
+        });
+    }
+}
+
+// -------------------------------------------------------------------- 卸载界面
+/// <summary>
+/// 双击 Uninstall.exe 时看到的就是这个。
+/// 以前没有它：同一个 exe 没参数就画安装界面，用户点「卸载」看到的却是「安装」。
+/// </summary>
+class UninstallForm : Form
+{
+    Label _status = new Label();
+    CheckBox _purge = new CheckBox();
+    Button _go = new Button();
+    Button _close = new Button();
+    bool _done;
+    bool _removed;
+
+    public UninstallForm()
+    {
+        Text = "PackLeader 卸载程序";
+        ClientSize = new Size(560, 250);
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+        BackColor = Color.FromArgb(15, 17, 21);
+        ForeColor = Color.FromArgb(249, 250, 251);
+        Font = new Font("Segoe UI", 9f);
+
+        Label title = new Label();
+        title.Text = "卸载 PackLeader";
+        title.Font = new Font("Segoe UI", 17f, FontStyle.Bold);
+        title.ForeColor = Color.FromArgb(249, 250, 251);
+        title.SetBounds(24, 18, 460, 34);
+        Controls.Add(title);
+
+        Label sub = new Label();
+        sub.Text = "会删除程序文件、开始菜单/桌面快捷方式和注册表卸载项。你的项目目录不受影响。";
+        sub.ForeColor = Color.FromArgb(124, 131, 142);
+        sub.SetBounds(26, 52, 508, 20);
+        Controls.Add(sub);
+
+        Label where = new Label();
+        where.Text = "安装位置";
+        where.ForeColor = Color.FromArgb(173, 178, 184);
+        where.SetBounds(26, 90, 60, 20);
+        Controls.Add(where);
+
+        Label path = new Label();
+        path.Text = Installer.TargetDir;
+        path.ForeColor = Color.FromArgb(207, 211, 214);
+        path.SetBounds(88, 90, 448, 20);
+        Controls.Add(path);
+
+        _purge.Text = "同时删除会话记录和配置（含 API Key，删了恢复不了）";
+        _purge.ForeColor = Color.FromArgb(207, 211, 214);
+        _purge.SetBounds(26, 118, 460, 22);
+        Controls.Add(_purge);
+
+        _status.Text = "会话数据默认留在 " + Installer.DataDirs()[1] + "，不勾选就不动它。";
+        _status.ForeColor = Color.FromArgb(124, 131, 142);
+        _status.SetBounds(26, 146, 508, 40);
+        Controls.Add(_status);
+
+        _go.Text = "卸载";
+        _go.SetBounds(352, 204, 88, 30);
+        _go.BackColor = Color.FromArgb(43, 92, 255);
+        _go.ForeColor = Color.White;
+        _go.FlatStyle = FlatStyle.Flat;
+        _go.FlatAppearance.BorderSize = 0;
+        _go.Click += delegate { StartUninstall(); };
+        Controls.Add(_go);
+
+        _close.Text = "关闭";
+        _close.SetBounds(446, 204, 88, 30);
+        _close.FlatStyle = FlatStyle.Flat;
+        _close.BackColor = Color.FromArgb(28, 31, 38);
+        _close.ForeColor = Color.FromArgb(207, 211, 214);
+        _close.FlatAppearance.BorderColor = Color.FromArgb(60, 64, 72);
+        _close.Click += delegate { Close(); };
+        Controls.Add(_close);
+
+        // 窗口关掉之后才轮到删自己（这时 exe 才真的没人占用）
+        FormClosed += delegate { if (_removed) Installer.ScheduleSelfDelete(); };
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        DarkChrome.Apply(Handle);
+    }
+
+    void StartUninstall()
+    {
+        if (_done) { Close(); return; }
+        _go.Enabled = false;
+        _close.Enabled = false;
+        _purge.Enabled = false;
+        bool purgeData = _purge.Checked;
+        _status.ForeColor = Color.FromArgb(124, 131, 142);
+        _status.Text = "正在卸载…";
+        System.Threading.ThreadPool.QueueUserWorkItem(delegate(object state)
+        {
+            // silent=true：这一步的确认框就是窗口本身，别再弹一个
+            int removed = Installer.Uninstall(true, purgeData);
+            BeginInvoke((MethodInvoker)delegate
+            {
+                if (removed < 0)
+                {
+                    _status.Text = "已取消。";
+                    _go.Enabled = true;
+                    _close.Enabled = true;
+                    _purge.Enabled = true;
+                    return;
+                }
+                _done = true;
+                _removed = true;
+                _status.ForeColor = Color.FromArgb(74, 222, 128);
+                _status.Text = "已卸载（删除 " + removed + " 个文件" + (purgeData ? "，会话数据也已清除" : "") + "）。这个窗口关掉后，程序文件会自己删干净。";
+                _go.Text = "完成";
+                _go.Enabled = true;
+                _close.Enabled = true;
             });
         });
     }

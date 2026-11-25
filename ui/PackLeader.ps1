@@ -142,19 +142,8 @@ $xaml = @'
           <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
-        <!-- 品牌 -->
-        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="16,16,16,12">
-          <Border Width="18" Height="18" CornerRadius="5" Background="#2B5CFF" VerticalAlignment="Center">
-            <TextBlock Text="P" Foreground="White" FontSize="11" FontWeight="Bold"
-                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
-          </Border>
-          <TextBlock Text="PackLeader" Foreground="#F9FAFB" FontSize="13.5" FontWeight="SemiBold"
-                     Margin="9,0,0,0" VerticalAlignment="Center"/>
-          <TextBlock Text="单机" Foreground="#6B7280" FontSize="10.5" Margin="8,2,0,0" VerticalAlignment="Center"/>
-        </StackPanel>
-
         <!-- 新对话 -->
-        <Button Grid.Row="1" x:Name="NewChatBtn" Margin="12,0,12,8" Height="32" Cursor="Hand"
+        <Button Grid.Row="1" x:Name="NewChatBtn" Margin="12,16,12,8" Height="32" Cursor="Hand"
                 HorizontalContentAlignment="Left" Padding="10,0"
                 Background="#16181D" Foreground="#E6E8EE" BorderBrush="#1FFFFFFF" BorderThickness="1">
           <Button.Template>
@@ -221,6 +210,10 @@ $xaml = @'
       <Border Grid.Row="0" BorderBrush="#12FFFFFF" BorderThickness="0,0,0,1" Padding="24,0" Height="48">
         <DockPanel VerticalAlignment="Center">
           <StackPanel Orientation="Horizontal" DockPanel.Dock="Left" VerticalAlignment="Center">
+            <Border Width="18" Height="18" CornerRadius="5" Background="#2B5CFF" VerticalAlignment="Center" Margin="0,0,9,0">
+              <TextBlock Text="P" Foreground="White" FontSize="11" FontWeight="Bold"
+                         HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
             <TextBlock x:Name="TitleText" Text="新对话" Foreground="#F9FAFB" FontSize="13" FontWeight="SemiBold"
                        VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="420"/>
             <TextBlock x:Name="SubTitle" Text="" Foreground="#6B7280" FontSize="11" Margin="10,1,0,0"
@@ -389,6 +382,30 @@ $xaml = @'
 
 $window = [Windows.Markup.XamlReader]::Parse($xaml)
 Log 'XAML 解析成功'
+# 标题栏默认图标是 powershell.exe 带的白蓝色图标，换成和左栏一致的 P 徽标（WPF 没法把标题栏图标留空，只能换掉）
+try {
+  $icoXaml = '<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Width="64" Height="64"><Border CornerRadius="16" Background="#2B5CFF"><TextBlock Text="P" Foreground="White" FontSize="38" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center"/></Border></Grid>'
+  $icoEl = [System.Windows.Markup.XamlReader]::Parse($icoXaml)
+  $icoEl.Measure([System.Windows.Size]::new(64, 64))
+  $icoEl.Arrange([System.Windows.Rect]::new(0, 0, 64, 64))
+  $rtb = [System.Windows.Media.Imaging.RenderTargetBitmap]::new(64, 64, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+  $rtb.Render($icoEl)
+  $enc = [System.Windows.Media.Imaging.PngBitmapEncoder]::new()
+  $enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($rtb))
+  $icoPath = Join-Path $env:TEMP 'packleader-icon.png'
+  $fsIco = [System.IO.File]::Create($icoPath)
+  $enc.Save($fsIco)
+  $fsIco.Close()
+  $bi = [System.Windows.Media.Imaging.BitmapImage]::new()
+  $bi.BeginInit()
+  $bi.CacheOption = 'OnLoad'
+  $bi.UriSource = [Uri]$icoPath
+  $bi.EndInit()
+  $window.Icon = $bi
+  Log '标题栏图标已换成 P 徽标'
+} catch {
+  Log ('设置窗口图标失败: ' + $_.Exception.Message)
+}
 $window.Dispatcher.add_UnhandledException({
   param($s, $e)
   Log ("Dispatcher 未处理异常: " + $e.Exception.ToString())
@@ -465,6 +482,85 @@ function Add-Container([double]$mb = 14) {
   return $sp
 }
 
+# ---------------------------------------------------------------- 复制
+# WPF 的 TextBlock 不能拖蓝选中，所以每块内容挂右键菜单：复制本段 / 复制整段对话。
+# 待复制的文本放在哈希表里，由调用方随时更新（流式时内容一直在变），
+# 回调从 Tag 上取那份引用——PS 5.1 下事件里的 GetNewClosure 拿不到外部变量。
+$script:copyLog = New-Object System.Text.StringBuilder
+
+function Append-CopyLog([string]$t) {
+  if (-not $t) { return }
+  $script:copyLog.Append($t) | Out-Null
+  if (-not $t.EndsWith("`n")) { $script:copyLog.Append("`n") | Out-Null }
+}
+
+function Copy-Text([object]$t) {
+  $s = [string]$t
+  if (-not $s) { return }
+  try { [System.Windows.Clipboard]::SetText($s) } catch { Log ('复制失败: ' + ($_ | Out-String)) }
+}
+
+# 右键菜单的深色模板：系统默认的 ContextMenu / MenuItem 是浅灰底，和深色界面不搭
+$script:ctxTpl = $null
+$script:miTpl = $null
+
+function New-CtxTemplate {
+  if ($script:ctxTpl) { return $script:ctxTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="ContextMenu">
+  <Border Background="#14171D" BorderBrush="#2A2F39" BorderThickness="1" CornerRadius="6" Padding="4">
+    <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Cycle"/>
+  </Border>
+</ControlTemplate>
+'@
+  $script:ctxTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:ctxTpl
+}
+
+function New-MenuItemTemplate {
+  if ($script:miTpl) { return $script:miTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="MenuItem">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" Padding="14,6" CornerRadius="4">
+    <ContentPresenter ContentSource="Header" VerticalAlignment="Center" TextBlock.Foreground="{TemplateBinding Foreground}" TextBlock.FontSize="12"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsHighlighted" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#242A34"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:miTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:miTpl
+}
+
+function New-CopyMenu([object]$box) {
+  $cm = New-Object System.Windows.Controls.ContextMenu
+  $cm.Background = (Brush '#14171D')
+  $cm.Foreground = (Brush '#E6E8EE')
+  $cm.BorderBrush = (Brush '#2A2F39')
+  $cm.BorderThickness = '1'
+  $cm.Template = (New-CtxTemplate)
+  $mi = New-Object System.Windows.Controls.MenuItem
+  $mi.Foreground = (Brush '#E6E8EE')
+  $mi.Background = [System.Windows.Media.Brushes]::Transparent
+  $mi.Padding = '0'
+  $mi.Template = (New-MenuItemTemplate)
+  $mi.Header = '复制'
+  $mi.Tag = $box
+  $mi.Add_Click({ param($s, $e) Copy-Text ([string]$s.Tag.text) })
+  $cm.Items.Add($mi) | Out-Null
+  $ma = New-Object System.Windows.Controls.MenuItem
+  $ma.Header = '复制整段对话'
+  $ma.Foreground = (Brush '#E6E8EE')
+  $ma.Background = [System.Windows.Media.Brushes]::Transparent
+  $ma.Padding = '0'
+  $ma.Template = (New-MenuItemTemplate)
+  $ma.Add_Click({ param($s, $e) Copy-Text $script:copyLog.ToString() })
+  $cm.Items.Add($ma) | Out-Null
+  return $cm
+}
 function Add-UserMessage([string]$text, [object]$files = $null) {
   $sp = Add-Container 20
   $label = New-Text '你' 10.5 '#6B7280' 'Normal' 'Segoe UI' 4
@@ -515,6 +611,8 @@ function Add-UserMessage([string]$text, [object]$files = $null) {
     }
     $sp.Children.Add($wrap) | Out-Null
   }
+  $sp.ContextMenu = (New-CopyMenu (@{ text = "你：$text" }))
+  Append-CopyLog "你：$text"
   $script:currentAssistant = $null
 }
 
@@ -531,19 +629,21 @@ function Add-AssistantMessage {
   $tb.LineStackingStrategy = 'BlockLineHeight'
   $body.Children.Add($tb) | Out-Null
   $script:assistantBody = $body
+  $script:assistantBox = @{ text = '' }
+  $sp.ContextMenu = (New-CopyMenu $script:assistantBox)
   return $tb
 }
 
-function Add-ToolRow([string]$name, [string]$summary) {
+# 工具行：平时收在「N 次工具调用」分组里，展开后一行一条
+function Add-ToolRow([string]$name, [string]$summary, [object]$parent = $null) {
   $outer = New-Object System.Windows.Controls.Border
   $outer.Background = (Brush '#12141A')
   $outer.BorderBrush = (Brush '#0FFFFFFF')
   $outer.BorderThickness = '1'
   $outer.CornerRadius = '6'
   $outer.Padding = '9,5'
-  $outer.Margin = '0,0,0,5'
-  $outer.HorizontalAlignment = 'Left'
-  $outer.MaxWidth = 720
+  $outer.Margin = '0,0,0,4'
+  $outer.HorizontalAlignment = 'Stretch'
 
   $dp = New-Object System.Windows.Controls.DockPanel
   $status = New-Text '运行中…' 10.5 '#7C838E' 'Normal' 'Cascadia Mono, Consolas' 0
@@ -570,69 +670,231 @@ function Add-ToolRow([string]$name, [string]$summary) {
   $dp.Children.Add($sumTb) | Out-Null
 
   $outer.Child = $dp
-  $Transcript.Children.Add($outer) | Out-Null
+  # 右键可复制这一行的「工具名 + 参数 + 结果」；文本随着状态变，放在 $box 里跟着更新
+  $box = @{ text = "$name  $summary" }
+  $outer.ContextMenu = (New-CopyMenu $box)
+  if ($parent) { $parent.Children.Add($outer) | Out-Null }
+  else { $Transcript.Children.Add($outer) | Out-Null }
+  $status.Tag = @{ box = $box }
   return $status
 }
 
+# ---------------------------------------------------------------- 工具调用分组
+# 和 Kite 一样：连续几次调用收成一个可折叠的块，收起时就是一行
+# 「▸  5 次工具调用                  fs.read ×3 · fs.edit ×2」，点一下展开看每一行。
+$script:toolGroup = $null
+
+function Update-ToolGroup($g) {
+  if (-not $g) { return }
+  $arrow = $(if ($g.Open) { '▾' } else { '▸' })
+  $g.Head.Text = "$arrow  $($g.Count) 次工具调用"
+  $parts = @()
+  foreach ($k in $g.Order) { $parts += ("$k ×" + $g.Counts[$k]) }
+  $sum = ($parts -join ' · ')
+  if ($g.Running -gt 0) { $sum = $(if ($sum) { "运行中… · $sum" } else { '运行中…' }) }
+  if ($g.Failed -gt 0) { $sum = "$sum · $($g.Failed) 失败" }
+  if ($sum.Length -gt 72) { $sum = $sum.Substring(0, 72) + '…' }
+  $g.Sum.Text = $sum
+  $g.Sum.Foreground = $(if ($g.Failed -gt 0) { Brush '#F87171' } else { Brush '#6B7280' })
+}
+
+function New-ToolGroup {
+  $outer = New-Object System.Windows.Controls.Border
+  $outer.Background = (Brush '#0E1116')
+  $outer.BorderBrush = (Brush '#0FFFFFFF')
+  $outer.BorderThickness = '1'
+  $outer.CornerRadius = '8'
+  $outer.Margin = '0,0,0,6'
+  $outer.HorizontalAlignment = 'Stretch'
+
+  $sp = New-Object System.Windows.Controls.StackPanel
+
+  $head = New-Object System.Windows.Controls.Button
+  $head.Background = [System.Windows.Media.Brushes]::Transparent
+  $head.BorderThickness = '0'
+  $head.Padding = '10,7'
+  $head.Cursor = 'Hand'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($head, 'ToolGroupHead')
+  $head.HorizontalContentAlignment = 'Stretch'
+  $head.Template = (New-FlatTemplate)
+  $dp = New-Object System.Windows.Controls.DockPanel
+  $sum = New-Text '' 10.5 '#6B7280' 'Normal' 'Cascadia Mono, Consolas' 0
+  $sum.VerticalAlignment = 'Center'
+  $sum.TextTrimming = 'CharacterEllipsis'
+  $sum.TextWrapping = 'NoWrap'
+  [System.Windows.Controls.DockPanel]::SetDock($sum, 'Right')
+  $dp.Children.Add($sum) | Out-Null
+  $title = New-Text '▸  0 次工具调用' 11.5 '#C7CBD2' 'SemiBold' 'Segoe UI' 0
+  $title.VerticalAlignment = 'Center'
+  [System.Windows.Controls.DockPanel]::SetDock($title, 'Left')
+  $dp.Children.Add($title) | Out-Null
+  $head.Content = $dp
+  $sp.Children.Add($head) | Out-Null
+
+  $items = New-Object System.Windows.Controls.StackPanel
+  $items.Margin = '8,0,8,7'
+  $items.Visibility = 'Collapsed'
+  $sp.Children.Add($items) | Out-Null
+
+  $outer.Child = $sp
+  $Transcript.Children.Add($outer) | Out-Null
+
+  $g = New-Object PSObject -Property @{
+    Head = $title; Sum = $sum; Items = $items; Border = $outer
+    Count = 0; Counts = @{}; Order = (New-Object System.Collections.ArrayList)
+    Running = 0; Failed = 0; Open = $false
+  }
+  # 同样拿 Tag 传节点：事件里直接引用 $g 会拿到 null
+  $head.Tag = $g
+  $head.Add_Click({ param($s, $e) Toggle-ToolGroup $s.Tag })
+  return $g
+}
+
+function Toggle-ToolGroup($g) {
+  if (-not $g) { return }
+  $g.Open = -not $g.Open
+  $g.Items.Visibility = $(if ($g.Open) { 'Visible' } else { 'Collapsed' })
+  Update-ToolGroup $g
+}
+
+# 拿「当前这一组」：没有就新建。出现正文/思考/审批时调 Close-ToolGroup 断开
+function Get-ToolGroup {
+  if (-not $script:toolGroup) { $script:toolGroup = New-ToolGroup }
+  return $script:toolGroup
+}
+
+function Close-ToolGroup {
+  if ($script:toolGroup) { Update-ToolGroup $script:toolGroup }
+  $script:toolGroup = $null
+}
+
+function Add-ToolLine([string]$name, [string]$summary) {
+  $g = Get-ToolGroup
+  $st = Add-ToolRow $name $summary $g.Items
+  $g.Count++
+  if (-not $g.Counts.ContainsKey($name)) {
+    $g.Counts[$name] = 0
+    [void]$g.Order.Add($name)
+  }
+  $g.Counts[$name] = $g.Counts[$name] + 1
+  $g.Running++
+  # 组引挂在行上：组关闭后回来的结果也能把计数器减回去
+  $st.Tag.group = $g
+  Update-ToolGroup $g
+  return $st
+}
+
+function Set-ToolLineDone([string]$id, [string]$text, [bool]$ok) {
+  $st = $script:toolRows[$id]
+  if (-not $st) { return }
+  $st.Text = $text
+  $st.Foreground = $(if ($ok) { Brush '#4ADE80' } else { Brush '#F87171' })
+  $tag = $st.Tag
+  if (-not $tag) { return }
+  if ($tag.box) { $tag.box.text = $tag.box.text + " -> $text" }
+  $g = $tag.group
+  if (-not $g) { return }
+  $g.Running = [math]::Max(0, $g.Running - 1)
+  if (-not $ok) { $g.Failed++ }
+  Update-ToolGroup $g
+}
+
 # ---------------------------------------------------------------- 思考链
-# host 一直在发 reasoning 事件，但界面以前没有分支，思考过程被直接丢掉了。
-# 这里画成 DSH 那样的可折叠块：流式时展开显示，出正文/调工具后自动收起成一行摘要。
+# Kite 那样的样式：收起时就是一行「⋯ 思考了片刻  <开头一句>            0.9s ▸」，
+# 点一下展开看全文。流式时展开，出正文 / 调工具后自动收起。
 $script:reasonNode = $null
 
 function Update-ReasoningHeader($n) {
   if (-not $n) { return }
-  $arrow = $(if ($n.Open) { '▾' } else { '▸' })
   if ($n.Done) {
-    # 历史会话里没有耗时字段，别显示 "· 0s" 这种假数据
-    $tail = $(if ($n.Secs -ge 0.1) { " · $([math]::Round($n.Secs, 1))s" } else { '' })
-    $n.Head.Text = "$arrow 思考 · $($n.Chars) 字$tail"
+    $n.Title.Text = '思考了片刻'
+    $n.Title.Foreground = (Brush '#9BA3B4')
   } else {
-    $n.Head.Text = "$arrow 思考中… $($n.Chars) 字"
+    $n.Title.Text = '思考中…'
+    $n.Title.Foreground = (Brush '#8FA6FF')
   }
+  $tail = $(if ($n.Secs -ge 0.1) { "$([math]::Round($n.Secs, 1))s " } else { '' })
+  $n.Time.Text = $tail + $(if ($n.Open) { '▾' } else { '▸' })
+  # 收起时用正文开头一句当摘要（压成单行，超长截断）
+  $s = ($n.Body.Text -replace "\s+", ' ').Trim()
+  if ($s.Length -gt 110) { $s = $s.Substring(0, 110) + '…' }
+  $n.Sum.Text = $s
+  $n.Sum.Visibility = $(if ($n.Open) { 'Collapsed' } else { 'Visible' })
+  $n.Body.Visibility = $(if ($n.Open) { 'Visible' } else { 'Collapsed' })
 }
 
 function Toggle-Reasoning($n) {
   if (-not $n) { return }
   $n.Open = -not $n.Open
-  $n.Body.Visibility = $(if ($n.Open) { 'Visible' } else { 'Collapsed' })
   Update-ReasoningHeader $n
 }
 
 function Add-ReasoningBlock {
   $outer = New-Object System.Windows.Controls.Border
-  $outer.Background = (Brush '#0E1116')
-  $outer.BorderBrush = (Brush '#0FFFFFFF')
+  $outer.Background = (Brush '#12141A')
+  $outer.BorderBrush = (Brush '#12FFFFFF')
   $outer.BorderThickness = '1'
-  $outer.CornerRadius = '6'
-  $outer.Padding = '10,6,10,7'
+  $outer.CornerRadius = '8'
+  $outer.Padding = '10,7'
   $outer.Margin = '0,0,0,6'
-  $outer.HorizontalAlignment = 'Left'
-  $outer.MaxWidth = 780
+  $outer.HorizontalAlignment = 'Stretch'
 
   $stack = New-Object System.Windows.Controls.StackPanel
-  $head = New-Text '▾ 思考中…' 10.5 '#7C838E' 'Normal' 'Segoe UI' 0
+
+  $head = New-Object System.Windows.Controls.Button
+  $head.Background = [System.Windows.Media.Brushes]::Transparent
+  $head.BorderThickness = '0'
+  $head.Padding = '0'
   $head.Cursor = 'Hand'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($head, 'ReasonHead')
+  $head.HorizontalContentAlignment = 'Stretch'
+  $head.Template = (New-FlatTemplate)
   $head.ToolTip = '点一下收起 / 展开思考过程'
+  $dp = New-Object System.Windows.Controls.DockPanel
+  $time = New-Text '' 10.5 '#5B626D' 'Normal' 'Cascadia Mono, Consolas' 0
+  $time.VerticalAlignment = 'Center'
+  [System.Windows.Controls.DockPanel]::SetDock($time, 'Right')
+  $dp.Children.Add($time) | Out-Null
+  $icon = New-Text '⋯' 12 '#7C838E' 'SemiBold' 'Segoe UI' 0
+  $icon.VerticalAlignment = 'Center'
+  $icon.Margin = '0,0,7,0'
+  [System.Windows.Controls.DockPanel]::SetDock($icon, 'Left')
+  $dp.Children.Add($icon) | Out-Null
+  $title = New-Text '思考中…' 11.5 '#8FA6FF' 'SemiBold' 'Segoe UI' 0
+  $title.VerticalAlignment = 'Center'
+  $title.Margin = '0,0,10,0'
+  [System.Windows.Controls.DockPanel]::SetDock($title, 'Left')
+  $dp.Children.Add($title) | Out-Null
+  $sum = New-Text '' 11.5 '#6F7684' 'Normal' 'Segoe UI' 0
+  $sum.VerticalAlignment = 'Center'
+  $sum.TextTrimming = 'CharacterEllipsis'
+  $sum.TextWrapping = 'NoWrap'
+  $dp.Children.Add($sum) | Out-Null
+  $head.Content = $dp
   $stack.Children.Add($head) | Out-Null
 
   $body = New-Text '' 12 '#878F9C' 'Normal' 'Segoe UI' 0
   $body.TextWrapping = 'Wrap'
   $body.LineHeight = 19
   $body.LineStackingStrategy = 'BlockLineHeight'
-  $body.Margin = '0,4,0,0'
+  $body.Margin = '0,5,0,0'
   $stack.Children.Add($body) | Out-Null
 
   $outer.Child = $stack
+  $box = @{ text = '' }
+  $outer.ContextMenu = (New-CopyMenu $box)
   $Transcript.Children.Add($outer) | Out-Null
 
   $node = New-Object PSObject -Property @{
-    Head = $head; Body = $body; Border = $outer
-    Chars = 0; T0 = (Get-Date); Open = $true; Done = $false; Secs = 0
+    Head = $head; Title = $title; Time = $time; Sum = $sum; Body = $body
+    Border = $outer; Box = $box
+    T0 = (Get-Date); Open = $true; Done = $false; Secs = 0
   }
   # 节点挂在标题自己的 Tag 上：PS 5.1 下这个事件里的 GetNewClosure 拿不到 $node，点了会抛异常
   $head.Tag = $node
-  $head.Add_MouseLeftButtonUp({ param($s, $e) Toggle-Reasoning $s.Tag })
+  $head.Add_Click({ param($s, $e) Toggle-Reasoning $s.Tag })
   $script:reasonNode = $node
+  Update-ReasoningHeader $node
   return $node
 }
 
@@ -640,9 +902,11 @@ function Complete-Reasoning {
   $n = $script:reasonNode
   if (-not $n -or $n.Done) { return }
   $n.Done = $true
-  $n.Secs = ((Get-Date) - $n.T0).TotalSeconds
+  # 历史回放里已经给过耗时（$ev.ms）就别用「刚刚过去 0 秒」盖掉它
+  if ($n.Secs -lt 0.1) { $n.Secs = ((Get-Date) - $n.T0).TotalSeconds }
   $n.Open = $false
-  $n.Body.Visibility = 'Collapsed'
+  $n.Box.text = $n.Body.Text
+  Append-CopyLog ('[思考] ' + $n.Body.Text)
   Update-ReasoningHeader $n
   # 只解绑"当前"，节点本身还在界面上（点标题仍能展开），toggle 用的是节点 Tag 上的那一份
   $script:reasonNode = $null
@@ -975,6 +1239,9 @@ function Clear-Transcript {
   $script:pendingText.Clear() | Out-Null
   $script:reasonNode = $null
   $script:toolRows = @{}
+  $script:toolGroup = $null
+  $script:assistantBox = $null
+  $script:copyLog.Clear() | Out-Null
 $script:verifyRows = @{}
 }
 
@@ -1676,7 +1943,6 @@ function Handle-Event([string]$line) {
             if ($ev.reasoning) {
               $rn = Add-ReasoningBlock
               $rn.Body.Text = [string]$ev.reasoning
-              $rn.Chars = ([string]$ev.reasoning).Length
               $rn.Secs = [math]::Round(([double]$ev.ms) / 1000.0, 1)
               Complete-Reasoning
             }
@@ -1689,14 +1955,14 @@ function Handle-Event([string]$line) {
           elseif ($ev.kind -eq 'tool/call') {
             $sum = ''
             if ($ev.call.args) { $sum = ($ev.call.args | ConvertTo-Json -Compress -Depth 4) }
-            $st = Add-ToolRow ([string]$ev.call.name) $sum
+            $st = Add-ToolLine ([string]$ev.call.name) $sum
             $script:toolRows[[string]$ev.call.id] = $st
           }
           elseif ($ev.kind -eq 'tool/result') {
             $st = $script:toolRows[[string]$ev.callId]
             if ($st) {
-              if ($ev.ok) { $st.Text = "✓  $($ev.ms)ms"; $st.Foreground = (Brush '#4ADE80') }
-              else { $st.Text = '✕  失败'; $st.Foreground = (Brush '#F87171') }
+              if ($ev.ok) { Set-ToolLineDone ([string]$ev.callId) "✓  $($ev.ms)ms" $true }
+              else { Set-ToolLineDone ([string]$ev.callId) '✕  失败' $false }
             }
           }
         }
@@ -1715,20 +1981,23 @@ function Handle-Event([string]$line) {
       Send-Host @{ cmd = 'list-sessions' }
     }
     'reasoning' {
+      Close-ToolGroup
       if (-not $script:reasonNode) { Add-ReasoningBlock | Out-Null }
       $rn = $script:reasonNode
       $d = [string]$e.delta
       $rn.Body.Text = $rn.Body.Text + $d
-      $rn.Chars = $rn.Chars + $d.Length
       Update-ReasoningHeader $rn
       $Scroller.ScrollToEnd()
     }
     'text' {
+      Close-ToolGroup
       Complete-Reasoning
       if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
       $script:pendingText.Append([string]$e.delta) | Out-Null
+      if ($script:assistantBox) { $script:assistantBox.text = $script:pendingText.ToString() }
     }
     'assistant-end' {
+      Close-ToolGroup
       Complete-Reasoning
       if ($e.text -and ([string]$e.text).Trim()) {
         if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
@@ -1738,33 +2007,31 @@ function Handle-Event([string]$line) {
         $container = $script:assistantBody.Parent
         if ($container) { $Transcript.Children.Remove($container) | Out-Null }
       }
+      if ($script:assistantBox) { $script:assistantBox.text = [string]$e.text }
+      if ($e.text) { Append-CopyLog ([string]$e.text) }
       $script:pendingText.Clear() | Out-Null
       $script:currentAssistant = $null
     }
     'tool-start' {
       Complete-Reasoning
       $script:currentAssistant = $null
-      $st = Add-ToolRow ([string]$e.name) ([string]$e.summary)
+      $st = Add-ToolLine ([string]$e.name) ([string]$e.summary)
       $script:toolRows[[string]$e.id] = $st
       $Scroller.ScrollToEnd()
     }
     'tool-end' {
-      $st = $script:toolRows[[string]$e.id]
-      if ($st) {
-        if ($e.ok) {
-          $st.Text = "✓  $($e.ms)ms"
-          $st.Foreground = (Brush '#4ADE80')
-        } else {
-          $msg = ([string]$e.error).Split("`n")[0]
-          if ($msg.Length -gt 40) { $msg = $msg.Substring(0, 40) + '…' }
-          $st.Text = "✕  $msg"
-          $st.Foreground = (Brush '#F87171')
-        }
+      if ($e.ok) {
+        Set-ToolLineDone ([string]$e.id) "✓  $($e.ms)ms" $true
+      } else {
+        $msg = ([string]$e.error).Split("`n")[0]
+        if ($msg.Length -gt 40) { $msg = $msg.Substring(0, 40) + '…' }
+        Set-ToolLineDone ([string]$e.id) "✕  $msg" $false
       }
       $script:currentAssistant = $null
       $Scroller.ScrollToEnd()
     }
     'verify-start' {
+      Close-ToolGroup
       $script:currentAssistant = $null
       $r = Add-VerifyRow ([string]$e.label) ([int]$e.round)
       $script:verifyRows[[string]$e.round] = $r
@@ -1794,8 +2061,8 @@ function Handle-Event([string]$line) {
       $script:currentAssistant = $null
       $Scroller.ScrollToEnd()
     }
-    'approval' { Add-ApprovalCard $e }
-    'notice' { Add-SystemLine ([string]$e.text) '#9BA3B4' }
+    'approval' { Close-ToolGroup; Add-ApprovalCard $e }
+    'notice' { Close-ToolGroup; Add-SystemLine ([string]$e.text) '#9BA3B4' }
     'error' {
       Add-SystemLine ("错误：" + $e.message) '#F87171'
       # 拉模型失败也要在设置面板里现形，别一直停在「拉取中…」
@@ -1856,6 +2123,7 @@ function Handle-Event([string]$line) {
       $UsageText.Text = "$($e.calls) 次 · 缓存 $pct%"
     }
     'turn-end' {
+      Close-ToolGroup
       Complete-Reasoning
       if ($script:pendingText.Length -gt 0 -and $script:currentAssistant) {
         $script:currentAssistant.Text += $script:pendingText.ToString()

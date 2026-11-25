@@ -6,6 +6,7 @@
  */
 
 import { mkdir, readdir, readFile } from 'node:fs/promises'
+import { appendFileSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
@@ -35,6 +36,9 @@ CREATE TABLE IF NOT EXISTS approvals (
   tool TEXT NOT NULL, reason TEXT, decision TEXT NOT NULL, at INTEGER NOT NULL
 );
 `
+
+// 日志里长字段截一刀，别把整份文件内容写进去
+const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n)}…(共 ${s.length} 字符)` : s)
 
 export interface ToolCallRow {
   sessionId: string
@@ -77,14 +81,26 @@ export class Audit {
   private db: DatabaseSync | undefined
   readonly path: string
   readonly enabled: boolean
+  /** 人类可读的工具调用日志目录（按天一个 jsonl）：<dataDir>/logs */
+  readonly logsDir: string
+  private toolLogDay = ''
+  private toolLogFile = ''
 
-  private constructor(path: string, db: DatabaseSync | undefined) {
+  private constructor(path: string, db: DatabaseSync | undefined, logsDir: string) {
     this.path = path
     this.db = db
     this.enabled = Boolean(db)
+    this.logsDir = logsDir
   }
 
   static async open(path: string): Promise<Audit> {
+    // 工具调用日志和 sqlite 审计并行：谁也不依赖谁，sqlite 挂了日志照样要有
+    const logsDir = join(dirname(path), 'logs')
+    try {
+      mkdirSync(logsDir, { recursive: true })
+    } catch {
+      /* 建不了目录不影响主链路 */
+    }
     try {
       await mkdir(dirname(path), { recursive: true })
       const db = new DatabaseSync(path)
@@ -96,10 +112,10 @@ export class Audit {
       } catch {
         /* 列已存在 */
       }
-      return new Audit(path, db)
+      return new Audit(path, db, logsDir)
     } catch {
       // 审计不可用不是致命错误：主链路照跑
-      return new Audit(path, undefined)
+      return new Audit(path, undefined, logsDir)
     }
   }
 
@@ -159,6 +175,44 @@ export class Audit {
         r.startedAt,
         r.finishedAt,
       )
+    this.writeToolLog(r)
+  }
+
+  /**
+   * 追加一行到 <logsDir>/tool-calls-YYYY-MM-DD.jsonl。
+   * 给人和脚本直接读：sqlite 适合聚合，这里适合“一眼看这一轮模型都干了什么、为什么失败”。
+   * 写不进去就算了，绝不影响主链路。
+   */
+  private writeToolLog(r: ToolCallRow): void {
+    try {
+      const day = new Date(r.finishedAt || Date.now()).toISOString().slice(0, 10)
+      if (day !== this.toolLogDay) {
+        this.toolLogDay = day
+        this.toolLogFile = join(this.logsDir, `tool-calls-${day}.jsonl`)
+      }
+      appendFileSync(
+        this.toolLogFile,
+        `${JSON.stringify({
+          at: new Date(r.finishedAt || Date.now()).toISOString(),
+          session: r.sessionId,
+          turn: r.turn,
+          step: r.step,
+          tool: r.tool,
+          decision: r.decision ?? null,
+          status: r.status,
+          ok: Boolean(r.ok),
+          exit: r.exitCode ?? null,
+          ms: r.ms,
+          out: r.outBytes,
+          truncated: Boolean(r.truncated),
+          error: r.error ?? null,
+          args: clip(r.argsJson, 600),
+        })}\n`,
+        'utf8',
+      )
+    } catch {
+      /* 日志写不进去不影响主线 */
+    }
   }
 
   recordLlmCall(r: LlmCallRow): void {

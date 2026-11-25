@@ -67,7 +67,9 @@ export interface TurnResult {
   reason: 'done' | 'max-steps' | 'error' | 'cancelled'
 }
 
-const DEFAULT_MAX_STEPS = 40
+// 单轮步数上限：复杂任务（多文件改动 + 验证闭环）40 步常常不够，中途被强制收尾；
+// 提到 100 步，仍然有硬上限，不会无限跑。命令行 --max-steps 可覆盖。
+const DEFAULT_MAX_STEPS = 100
 const DEFAULT_MAX_OUTPUT = 64 * 1024
 
 export class Agent {

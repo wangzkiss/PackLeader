@@ -124,7 +124,7 @@ function resolveConfig(flags: Record<string, string | boolean>): Config {
       'https://api.deepseek.com/v1',
     model: str(flags, 'model') ?? process.env.PL_MODEL ?? saved.model ?? 'deepseek-chat',
     approval,
-    maxSteps: num(flags, 'max-steps') ?? 40,
+    maxSteps: num(flags, 'max-steps') ?? 100,
     // 空串 = 自动识别（detectVerifier）
     verify: flags['no-verify'] === true ? '' : (str(flags, 'verify') ?? saved.verify ?? ''),
   }
@@ -153,7 +153,7 @@ ${bold('选项')}
   --resume <id>        恢复指定会话
   --continue           恢复最近一次会话
   --data-dir <dir>     数据目录（默认 ~/.packleader）
-  --max-steps <n>      单轮最多几步（默认 40）
+  --max-steps <n>      单轮最多几步（默认 100）
   --verify <cmd>       改完文件后跑这条验证命令（默认自动识别 npm test / cargo test / go test / pytest）
   --no-verify          关掉自动验证
   --json               以 NDJSON 输出事件（给脚本/CI 用）

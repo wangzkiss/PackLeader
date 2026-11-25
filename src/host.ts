@@ -79,7 +79,7 @@ function parseArgs(argv: string[]): Opts {
     apiKey: s('api-key') ?? process.env.PL_API_KEY ?? process.env.DEEPSEEK_API_KEY ?? process.env.OPENAI_API_KEY ?? '',
     baseURL: s('base-url') ?? process.env.PL_BASE_URL ?? process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com/v1',
     model: s('model') ?? process.env.PL_MODEL ?? 'deepseek-chat',
-    maxSteps: Number(s('max-steps') ?? 40) || 40,
+    maxSteps: Number(s('max-steps') ?? 100) || 100,
     session: s('resume'),
     cont: flags.continue === true,
     verify: s('verify') ?? '',
@@ -253,6 +253,8 @@ async function main(): Promise<void> {
     verify: opts.verify,
     vision: opts.vision,
     events: session.events,
+    // 工具调用日志目录：界面上「设置」里直接显示出来，方便按日志改
+    logsDir: audit.logsDir,
   })
 
   send(state())
@@ -451,6 +453,7 @@ async function main(): Promise<void> {
             verify: opts.verify,
             vision: opts.vision,
             saved: true,
+            logsDir: audit.logsDir,
           })
         } catch (e) {
           send({ type: 'error', message: `配置已生效，但没写进磁盘：${(e as Error).message}` })

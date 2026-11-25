@@ -496,33 +496,57 @@ export class Agent {
           break
         }
 
+        // 只读工具可以同时跑（查文件没有副作用），写类工具必须独占执行；
+        // 不管谁先跑完，tool/call 与 tool/result 都按模型给的顺序落，
+        // 这样下次请求里 tool 消息的顺序永远和 tool_calls 对齐（顺序错了模型会串台）
+        const batches: Array<{ parallel: boolean; calls: ToolCall[] }> = []
         for (const call of res.toolCalls) {
-          totalCalls++
-          await session.append({ kind: 'tool/call', turn, step, call })
-          const sig = `${call.name}:${JSON.stringify(call.args)}`
-          const dupOf = seenCalls.get(sig)
-          if (dupOf === undefined) seenCalls.set(sig, step)
-          const { result } = await this.executeTool(call, turn, step)
-          // 一字不差的重复调用：结果照给，但提醒一句，别让模型把它当新信息
-          if (dupOf !== undefined) {
-            result.content = `[提示] 这一步的调用与第 ${dupOf} 步完全相同，结果应当一致；若确实没变化，就换别的查法。\n${result.content}`
+          const readonly = tools.get(call.name)?.permission === 'read'
+          const tail = batches[batches.length - 1]
+          if (readonly && tail?.parallel) tail.calls.push(call)
+          else batches.push({ parallel: readonly, calls: [call] })
+        }
+
+        for (const batch of batches) {
+          // 重复判断要在执行前按顺序算好：批里出现两个相同调用时，后一个要被告知
+          const dupOfs: Array<number | undefined> = []
+          for (const call of batch.calls) {
+            totalCalls++
+            await session.append({ kind: 'tool/call', turn, step, call })
+            const sig = `${call.name}:${JSON.stringify(call.args)}`
+            const dupOf = seenCalls.get(sig)
+            dupOfs.push(dupOf)
+            if (dupOf === undefined) seenCalls.set(sig, step)
           }
-          // 只有真的写成功了才算"改过文件"，后面据此决定要不要跑验证
-          if (result.ok && (call.name === 'write' || call.name === 'edit')) {
-            const p = (call.args as Record<string, unknown> | undefined)?.path
-            if (typeof p === 'string' && p) touched.add(p)
+          const run = (call: ToolCall) => this.executeTool(call, turn, step)
+          const outcomes = batch.parallel
+            ? await Promise.all(batch.calls.map(run))
+            : [await run(batch.calls[0]!)]
+          for (let k = 0; k < batch.calls.length; k++) {
+            const call = batch.calls[k]!
+            const { result } = outcomes[k]!
+            // 一字不差的重复调用：结果照给，但提醒一句，别让模型把它当新信息
+            const dupOf = dupOfs[k]
+            if (dupOf !== undefined) {
+              result.content = `[提示] 这一步的调用与第 ${dupOf} 步完全相同，结果应当一致；若确实没变化，就换别的查法。\n${result.content}`
+            }
+            // 只有真的写成功了才算"改过文件"，后面据此决定要不要跑验证
+            if (result.ok && (call.name === 'write' || call.name === 'edit')) {
+              const p = (call.args as Record<string, unknown> | undefined)?.path
+              if (typeof p === 'string' && p) touched.add(p)
+            }
+            await session.append({
+              kind: 'tool/result',
+              callId: call.id,
+              name: call.name,
+              ok: result.ok,
+              content: result.content,
+              exitCode: result.exitCode,
+              truncated: result.truncated,
+              spill: result.spill,
+              ms: result.ms,
+            })
           }
-          await session.append({
-            kind: 'tool/result',
-            callId: call.id,
-            name: call.name,
-            ok: result.ok,
-            content: result.content,
-            exitCode: result.exitCode,
-            truncated: result.truncated,
-            spill: result.spill,
-            ms: result.ms,
-          })
         }
         await session.append({ kind: 'step/end', turn, step, toolCalls: res.toolCalls.length })
 

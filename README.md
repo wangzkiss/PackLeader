@@ -10,7 +10,7 @@ node scripts/demo.ts       # 离线 demo，不需要 API Key
 ```
 
 - 设计方案：[DESIGN.md](DESIGN.md)（架构、包裁剪、体积测算、里程碑）
-- 当前状态：**M0–M5 已完成**，58 个测试全绿，**已在真实模型 + 5.5 GB 真实仓库上验证**（见下节）
+- 当前状态：**M0–M5 已完成**，133 个测试全绿，**已在真实模型 + 5.5 GB 真实仓库上验证**（见下节）
 
 ---
 
@@ -428,7 +428,7 @@ src/
 npm test     # 或 node --disable-warning=ExperimentalWarning --test "test/*.test.ts"
 ```
 
-98 个测试，覆盖：
+133 个测试，覆盖：
 
 - 会话恢复（含损坏半行、截断结果的说明文本）
 - 文件工具与路径越界、`{a,b}` 大括号 glob、`path` 限定范围

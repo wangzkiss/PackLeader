@@ -169,6 +169,32 @@ const NOT_METHOD = new Set([
 export function createFsTools(root: string): Tool[] {
   const abs = (p: string) => (p.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(p) ? resolve(p) : resolve(root, p))
 
+  /**
+   * 读缓存：同一个文件 + 同一组读参数，文件又没动过（mtime 和大小都没变），
+   * 就只回一句「没变」，不再把正文再占一遍上下文。
+   * 键里带参数指纹，所以换 offset/limit/ranges 一定会重新读；
+   * 工具自己写/改/搬/删之后主动失效，外部改动靠 mtime + size 兜住。
+   */
+  const READ_CACHE_LIMIT = 300
+  const readCache = new Map<string, { mtimeMs: number; size: number; content: string }>()
+  const readKey = (file: string, args: Record<string, unknown>) =>
+    `${file}\u0000${JSON.stringify({ offset: args.offset ?? null, limit: args.limit ?? null, ranges: args.ranges ?? null })}`
+  const dropReadCache = (file: string) => {
+    const prefix = `${file}\u0000`
+    // 目录被删/搬时，底下的文件缓存也一并失效
+    const dirPrefix = `${file}${sep}\u0000`
+    for (const k of [...readCache.keys()]) if (k.startsWith(prefix) || k.startsWith(dirPrefix)) readCache.delete(k)
+  }
+  const rememberRead = (key: string, mtimeMs: number, size: number, content: string) => {
+    // 重新插入保证「最近用过的在最后」，超过上限就丢最旧的
+    readCache.delete(key)
+    readCache.set(key, { mtimeMs, size, content })
+    if (readCache.size > READ_CACHE_LIMIT) {
+      const oldest = readCache.keys().next().value
+      if (oldest !== undefined) readCache.delete(oldest)
+    }
+  }
+
   const read: Tool = {
     name: 'read',
     description:
@@ -200,6 +226,14 @@ export function createFsTools(root: string): Tool[] {
       const st = await stat(file)
       if (!st.isFile()) throw new Error(`不是文件：${rel(root, file)}`)
       if (st.size > MAX_READ_BYTES) throw new Error(`文件过大（${(st.size / 1024 / 1024).toFixed(1)} MB），请用 offset/limit 或 grep`)
+      const key = readKey(file, args)
+      const hit = readCache.get(key)
+      if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) {
+        ctx.readFiles.add(file)
+        return {
+          content: `[未变] ${rel(root, file)} 与上次读取时完全相同（${fmtSize(st.size)}，${fmtTime(st.mtimeMs)}），正文同上次返回，这里不再重复。要看别的地方就换 offset/limit。`,
+        }
+      }
       const text = await readFile(file, 'utf8')
       ctx.readFiles.add(file)
       const lines = text.split('\n')
@@ -236,7 +270,9 @@ export function createFsTools(root: string): Tool[] {
           }
           blocks.push(`【${offset}-${offset + picked.length - 1}】\n${withLineNo(offset, picked)}`)
         }
-        return { content: `${rel(root, file)}（共 ${lines.length} 行，${rawRanges.length} 段）\n${blocks.join('\n\n')}` }
+        const content = `${rel(root, file)}（共 ${lines.length} 行，${rawRanges.length} 段）\n${blocks.join('\n\n')}`
+        rememberRead(key, st.mtimeMs, st.size, content)
+        return { content }
       }
 
       const offset = Math.max(1, optNumber(args, 'offset') ?? 1)
@@ -244,9 +280,9 @@ export function createFsTools(root: string): Tool[] {
       const taken = take(offset, want)
       const nextLine = taken.offset + taken.picked.length
       const footer = nextLine <= lines.length ? `\n[还有 ${lines.length - nextLine + 1} 行，用 offset=${nextLine} 继续]` : ''
-      return {
-        content: `${rel(root, file)} (共 ${lines.length} 行，本次 ${taken.offset}-${taken.offset + taken.picked.length - 1})\n${withLineNo(taken.offset, taken.picked)}${footer}`,
-      }
+      const content = `${rel(root, file)} (共 ${lines.length} 行，本次 ${taken.offset}-${taken.offset + taken.picked.length - 1})\n${withLineNo(taken.offset, taken.picked)}${footer}`
+      rememberRead(key, st.mtimeMs, st.size, content)
+      return { content }
     },
   }
 
@@ -268,6 +304,7 @@ export function createFsTools(root: string): Tool[] {
       const content = typeof args.content === 'string' ? args.content : String(args.content ?? '')
       await mkdir(dirname(file), { recursive: true })
       await writeFile(file, content, 'utf8')
+      dropReadCache(file)
       const n = content.split('\n').length
       return { content: `已写入 ${rel(root, file)}（${content.length} 字节，${n} 行）` }
     },
@@ -316,6 +353,7 @@ export function createFsTools(root: string): Tool[] {
       if (count >= 1) {
         const hit = all ? text.split(oldText).join(newText) : text.replace(oldText, newText)
         await writeFile(file, hit, 'utf8')
+        dropReadCache(file)
         return { content: `已修改 ${rel(root, file)}（替换 ${all ? count : 1} 处）` }
       }
 
@@ -376,6 +414,7 @@ export function createFsTools(root: string): Tool[] {
         next = [...lines.slice(0, at), ...buildInsert(at), ...lines.slice(at + want.length)].join('\n')
       }
       await writeFile(file, next, 'utf8')
+      dropReadCache(file)
       return {
         content: `已修改 ${rel(root, file)}（替换 ${all ? hits.length : 1} 处；行尾/换行差异已自动对齐）`,
       }
@@ -878,6 +917,8 @@ export function createFsTools(root: string): Tool[] {
         await copyFile(src, dst)
         await rm(src, { recursive: st.isDirectory(), force: true })
       }
+      dropReadCache(src)
+      dropReadCache(dst)
       return { content: `已移动 ${rel(root, src)} → ${rel(root, dst)}（${how}）` }
     },
   }
@@ -903,6 +944,7 @@ export function createFsTools(root: string): Tool[] {
       const recursive = args.recursive === true
       if (st.isDirectory() && !recursive) throw new Error(`${rel(root, file)} 是目录，删目录要 recursive=true`)
       await rm(file, { recursive: recursive && st.isDirectory(), force: true })
+      dropReadCache(file)
       return { content: `已删除 ${rel(root, file)}${st.isDirectory() ? '/' : ''}` }
     },
   }

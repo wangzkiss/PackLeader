@@ -275,7 +275,7 @@ export class Session {
           .filter((x): x is { mime: string; dataBase64: string } => x !== null)
         out.push({ role: 'user', content: e.text, ...(images.length ? { images } : {}) })
       } else if (e.kind === 'assistant/message')
-        out.push({ role: 'assistant', content: e.text, toolCalls: e.toolCalls.length ? e.toolCalls : undefined })
+        out.push({ role: 'assistant', content: e.text, toolCalls: (e.toolCalls ?? []).length ? e.toolCalls : undefined })
       else if (e.kind === 'tool/result')
         out.push({
           role: 'tool',

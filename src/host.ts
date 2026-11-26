@@ -309,7 +309,12 @@ async function main(): Promise<void> {
   }
 
   const renderer: Renderer = {
-    onTurnStart: (_turn, text, files) => send({ type: 'turn-start', text, files: files ?? [] }),
+    onTurnStart: (_turn, text, files) => {
+      send({ type: 'turn-start', text, files: files ?? [] })
+      // 提问索引（界面左侧那列白杠）是按会话事件算的，原先只在开关会话时给一次。
+      // 用户刚发的这句话要是不重发，白杠就得等重新打开会话才长出来。
+      send({ type: 'index', session: eventSession ?? session.id, historyCount: session.events.length, questions: questionPositions() })
+    },
     onStepStart: (step) => {
       runningStep = step
       send({ type: 'step', step })
@@ -654,6 +659,8 @@ async function main(): Promise<void> {
           await target.append({ kind: 'user/message', text: p.text, ...(p.files?.length ? { files: p.files } : {}) })
           const n = p.files?.length ?? 0
           send({ type: 'notice', text: n ? `已插话（带 ${n} 个附件）：模型下一步就能看到` : '已插话：模型下一步就能看到' })
+          // 插话也是一条 user/message，索引里同样多一根白杠
+          send({ type: 'index', session: session.id, historyCount: session.events.length, questions: questionPositions() })
         } else {
           // 没在跑就等同于正常发一轮
           const run = async (): Promise<void> => {

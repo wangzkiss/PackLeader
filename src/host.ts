@@ -31,8 +31,24 @@ import { OpenAiClient } from './llm/openai.ts'
 import { createDefaultTools } from './tools/index.ts'
 import type { Audit } from './core/audit.ts'
 
+// 事件归属哪个会话：正在跑的那一轮产生的事件都带上它。
+// 界面据此把「别的会话里跑着的那一轮」认出来（不画进当前聊天区，只提示状态）。
+// 同一时间只允许一轮在跑，所以一个变量够用。
+let eventSession: string | undefined
+
+// 只有轮次里产生的事件才带会话归属。ready / sessions / config 这些是全局状态，
+// 给它们补上「正在跑的那个会话」会让界面把它们当成别的会话的事件丢掉。
+const TURN_EVENT_TYPES = new Set([
+  'turn-start', 'step', 'text', 'reasoning', 'assistant-end', 'tool-start', 'tool-end',
+  'approval', 'question', 'usage', 'turn-end', 'memory-saved', 'memory-undone',
+])
+
 const send = (e: Record<string, unknown>): void => {
-  process.stdout.write(`${JSON.stringify({ ...e, at: Date.now() })}\n`)
+  const out =
+    e.session === undefined && eventSession && TURN_EVENT_TYPES.has(String(e.type))
+      ? { ...e, session: eventSession }
+      : e
+  process.stdout.write(`${JSON.stringify({ ...out, at: Date.now() })}\n`)
 }
 
 // ---------- 参数 ----------
@@ -99,10 +115,14 @@ function parseArgs(argv: string[]): Opts {
 /** 提问通道：把问题发给界面，等用户点一个选项（跳过则返回 null） */
 class HostAsker {
   private pending = new Map<string, (v: string | null) => void>()
+  /** 最近一次挂起的提问：切回这个会话时要重新画出来，否则看着在跑却没地方答 */
+  last: Record<string, unknown> | undefined
 
   ask(req: AskRequest): Promise<string | null> {
     const reqId = `q-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
-    send({ type: 'question', reqId, question: req.question, options: req.options })
+    const payload = { type: 'question', reqId, question: req.question, options: req.options }
+    this.last = payload
+    send(payload)
     return new Promise<string | null>((resolve) => this.pending.set(reqId, resolve))
   }
 
@@ -110,6 +130,7 @@ class HostAsker {
     const r = this.pending.get(reqId)
     if (!r) return
     this.pending.delete(reqId)
+    if (!this.pending.size) this.last = undefined
     r(value)
   }
 
@@ -118,14 +139,19 @@ class HostAsker {
       this.pending.delete(k)
       r(null)
     }
+    this.last = undefined
   }
 }
 
 class HostApprover implements Approver {
   private pending = new Map<string, (d: Decision) => void>()
+  /** 最近一次挂起的审批：切回这个会话时要重新画出来，否则看着在跑却没地方点 */
+  last: Record<string, unknown> | undefined
 
   ask(req: ApprovalRequest): Promise<Decision> {
-    send({ type: 'approval', reqId: req.reqId, tool: req.tool, reason: req.reason, detail: req.detail ?? '' })
+    const payload = { type: 'approval', reqId: req.reqId, tool: req.tool, reason: req.reason, detail: req.detail ?? '' }
+    this.last = payload
+    send(payload)
     return new Promise<Decision>((resolve) => this.pending.set(req.reqId, resolve))
   }
 
@@ -133,6 +159,7 @@ class HostApprover implements Approver {
     const r = this.pending.get(reqId)
     if (!r) return
     this.pending.delete(reqId)
+    if (!this.pending.size) this.last = undefined
     r(decision)
   }
 
@@ -142,6 +169,7 @@ class HostApprover implements Approver {
       this.pending.delete(id)
       r('denied')
     }
+    this.last = undefined
   }
 }
 
@@ -213,7 +241,10 @@ async function main(): Promise<void> {
 
   const renderer: Renderer = {
     onTurnStart: (_turn, text, files) => send({ type: 'turn-start', text, files: files ?? [] }),
-    onStepStart: (step) => send({ type: 'step', step }),
+    onStepStart: (step) => {
+      runningStep = step
+      send({ type: 'step', step })
+    },
     onText: (delta) => send({ type: 'text', delta }),
     onReasoning: (delta) => send({ type: 'reasoning', delta }),
     onAssistantEnd: (text) => send({ type: 'assistant-end', text }),
@@ -286,6 +317,24 @@ async function main(): Promise<void> {
         : [],
     )
 
+  // 正在跑的那一轮：属于哪个会话、跑到第几步。切会话不打断它，界面靠这两个值
+  // 判断「当前会话忙不忙」，以及切回来时要显示「运行中」。
+  // running 必须在这之前声明：state() 里要用它判断「这一轮是不是正跑着」，
+  // 声明放到下面会让 state() 头一次调用就撞上 TDZ（Cannot access 'running' before initialization）。
+  let running = false
+  let runningSession: string | undefined
+  let runningStep = 0
+
+  /** 最后一轮有没有收尾（进程被杀/崩掉时 turn/start 后面就不会有 turn/end 了） */
+  const unfinishedTurn = (): boolean => {
+    let open = false
+    for (const ev of session.events) {
+      if (ev.kind === 'turn/start') open = true
+      else if (ev.kind === 'turn/end') open = false
+    }
+    return open
+  }
+
   const state = (): Record<string, unknown> => ({
     type: 'ready',
     session: session.id,
@@ -303,21 +352,29 @@ async function main(): Promise<void> {
     questions: questionPositions(),
     // 工具调用日志目录：界面上「设置」里直接显示出来，方便按日志改
     logsDir: audit.logsDir,
+    // 有轮次在跑时把归属会话报出来：可能不是当前会话（切走了它还在跑）
+    runningSession: runningSession ?? null,
+    runningStep: runningSession ? runningStep : 0,
+    // 上一次进程退出时这一轮没跑完：界面上如实标出来，别看着像正常结束
+    // 正在跑的这一轮本来就没闭合，不算「没跑完」——切回正在跑的会话时别多一条黄字吓人
+    unfinished: running && runningSession === session.id ? false : unfinishedTurn(),
+    // 切回正在跑的会话时，挂着的审批/提问要重新画出来，否则看着在跑却没法继续
+    pendingApproval: approver.last ?? null,
+    pendingQuestion: asker.last ?? null,
   })
 
   send(state())
 
-  let running = false
   let controller: AbortController | undefined
   let current: Promise<void> | undefined
 
   // 本会话的用量（audit.cost() 是全库累计，界面上看着会误导）
-  const sessionUsage = (): { calls: number; prompt: number; completion: number; cacheRead: number } => {
+  const sessionUsage = (forSession: Session = session): { calls: number; prompt: number; completion: number; cacheRead: number } => {
     let calls = 0
     let prompt = 0
     let completion = 0
     let cacheRead = 0
-    for (const e of session.events) {
+    for (const e of forSession.events) {
       if (e.kind !== 'llm/usage') continue
       calls++
       prompt += e.prompt
@@ -330,35 +387,55 @@ async function main(): Promise<void> {
   // 把「文字 + 本地文件」整理成一条要落进会话的用户消息：
   // 附件先入库（拷进数据目录），文本类内联，图片留给 deriveMessages 按需读成 base64。
   // 正着一轮（task）和插队（insert）共用，插话带附件才不会有第二套逻辑。
-  const prepare = async (text: string, paths: string[]): Promise<{ text: string; files?: Attachment[] }> => {
+  const prepare = async (
+    text: string,
+    paths: string[],
+    forSession: Session = session,
+  ): Promise<{ text: string; files?: Attachment[] }> => {
     if (!paths.length) return { text }
-    const ing = await ingestFiles(opts.dataDir, session.id, paths, { vision: opts.vision })
+    const ing = await ingestFiles(opts.dataDir, forSession.id, paths, { vision: opts.vision })
     if (ing.attachments.length) return { text: `${text}\n\n${ing.text}`, files: ing.attachments }
     // 拷贝失败/被删就让模型知道，而不是静默少一个文件
     return { text: `${text}\n\n[附件] 指定的 ${paths.length} 个文件都没读到（可能已被删除或没有权限）` }
   }
 
-  const runTask = async (text: string, files?: Attachment[]): Promise<void> => {
+  const runTask = async (
+    text: string,
+    files?: Attachment[],
+    target?: { session: Session; agent: Agent },
+  ): Promise<void> => {
     if (running) {
-      send({ type: 'error', message: '上一轮还没结束（可先点停止）' })
+      // 同一时间只允许一轮：如果它在别的会话里跑着，说清是哪个会话，别让人以为卡住
+      const where = runningSession && runningSession !== session.id ? '（在另一个会话里跑着）' : ''
+      send({
+        type: 'error',
+        message: `上一轮还没结束${where}：等它跑完，或切回去点停止`,
+        runningSession: runningSession ?? null,
+      })
       return
     }
     if (!opts.apiKey) {
       send({ type: 'error', message: '还没配置模型：点右上角的设置，填端点地址和 API Key', needsSetup: true })
       return
     }
+    // 这一轮绑定发起时的会话与 agent：中途切到别的会话时，内容、记忆、用量都要落回原会话
+    const turnSession = target?.session ?? session
+    const turnAgent = target?.agent ?? agent
     running = true
     controller = new AbortController()
-    agent.signal = controller.signal
+    turnAgent.signal = controller.signal
+    eventSession = turnSession.id
+    runningSession = turnSession.id
+    runningStep = 0
     const t0 = Date.now()
     try {
-      const r = await agent.runTurn(text, files)
+      const r = await turnAgent.runTurn(text, files)
       // 本轮记下的记忆：按时间戳挑出这一轮新写的，落进会话事件（历史回放要用）
       try {
         const fresh = (await memory.all()).filter((m) => m.at >= t0 - 1)
         if (fresh.length) {
           const items = fresh.map((m) => ({ id: m.id, text: m.text, at: m.at }))
-          await session.append({ kind: 'memory/saved', items })
+          await turnSession.append({ kind: 'memory/saved', items })
           send({ type: 'memory-saved', items })
         }
       } catch (e) {
@@ -371,8 +448,12 @@ async function main(): Promise<void> {
     } finally {
       running = false
       controller = undefined
-      agent.signal = undefined
-      send({ type: 'usage', ...sessionUsage() })
+      turnAgent.signal = undefined
+      send({ type: 'usage', ...sessionUsage(turnSession) })
+      // 上面的收尾事件还得带这一轮的会话，清空放最后
+      eventSession = undefined
+      runningSession = undefined
+      runningStep = 0
     }
   }
 
@@ -418,8 +499,10 @@ async function main(): Promise<void> {
         const text = String(cmd.text ?? '').trim()
         const paths = Array.isArray(cmd.files) ? (cmd.files as unknown[]).filter((x): x is string => typeof x === 'string') : []
         const run = async (): Promise<void> => {
-          const p = await prepare(text, paths)
-          await runTask(p.text, p.files)
+          // 这一轮绑定发起时的会话与 agent：中途切到别的会话也不会把内容写错地方
+          const target = { session, agent }
+          const p = await prepare(text, paths, target.session)
+          await runTask(p.text, p.files, target)
         }
         // 关键：不能 await —— 否则执行期间读不到 stdin，approve/abort 永远进不来（死锁）
         if (text || paths.length) current = run().finally(() => { current = undefined })
@@ -432,17 +515,24 @@ async function main(): Promise<void> {
         const paths = Array.isArray(cmd.files) ? (cmd.files as unknown[]).filter((x): x is string => typeof x === 'string') : []
         if (!text && !paths.length) break
         if (running) {
+          // 正在跑的是别的会话：这条插话落不进那一轮的上下文，说清楚别让人以为没生效
+          if (runningSession && runningSession !== session.id) {
+            send({ type: 'error', message: '另一个会话还在跑：插话要用在那个会话里，先切回去', runningSession })
+            break
+          }
           // 附件照样先入库再追加：图片会被 deriveMessages 读成 base64，文本类内联，
           // 所以插话带图和带文件跟正常发一轮是同一套处理
-          const p = await prepare(text, paths)
-          await session.append({ kind: 'user/message', text: p.text, ...(p.files?.length ? { files: p.files } : {}) })
+          const target = session
+          const p = await prepare(text, paths, target)
+          await target.append({ kind: 'user/message', text: p.text, ...(p.files?.length ? { files: p.files } : {}) })
           const n = p.files?.length ?? 0
           send({ type: 'notice', text: n ? `已插话（带 ${n} 个附件）：模型下一步就能看到` : '已插话：模型下一步就能看到' })
         } else {
           // 没在跑就等同于正常发一轮
           const run = async (): Promise<void> => {
-            const p = await prepare(text, paths)
-            await runTask(p.text, p.files)
+            const target = { session, agent }
+            const p = await prepare(text, paths, target.session)
+            await runTask(p.text, p.files, target)
           }
           current = run().finally(() => { current = undefined })
         }
@@ -484,6 +574,13 @@ async function main(): Promise<void> {
         break
       }
       case 'abort': {
+        // 界面只在「当前会话在跑」时给停止键，但保险起见再核对一次：
+        // 别让一次误点把另一个会话里跑着的活干掉
+        const want = String(cmd.session ?? '')
+        if (runningSession && want && want !== runningSession) {
+          send({ type: 'error', message: '当前会话没有在跑的轮次（另一个会话在跑，切回去再停）' })
+          break
+        }
         controller?.abort()
         approver.rejectAll()
         asker.rejectAll()
@@ -602,9 +699,11 @@ async function main(): Promise<void> {
         break
       }
       case 'cwd': {
-        // 切 workspace：策略与工具都要重建（GUI 里换项目）
+        // 切 workspace：策略与工具都要重建（GUI 里换项目）。
+        // 只在「当前会话自己这一轮在跑」时停：换了工具根，这一轮继续跑在旧根上会让人意外。
+        // 另一个会话在跑不受影响（它用着自己那份 tools/agent）。
         const dir = resolve(String(cmd.dir ?? ''))
-        if (running && !(await stopCurrentTurn())) {
+        if (running && runningSession === session.id && !(await stopCurrentTurn())) {
           send({ type: 'error', message: '这一轮没停下来（可能有工具不响应），稍后再切目录' })
           break
         }
@@ -619,21 +718,19 @@ async function main(): Promise<void> {
         break
       }
       case 'new-session': {
-        if (running && !(await stopCurrentTurn())) {
-          send({ type: 'error', message: '这一轮没停下来（可能有工具不响应），稍后再新建' })
-          break
-        }
+        // 新建会话不打断正在跑的那一轮：它在原会话里继续跑
         session = await Session.create(opts.dataDir, meta())
         agent = await buildAgent()
         send(state())
         break
       }
       case 'delete-session': {
-        if (running && !(await stopCurrentTurn())) {
+        const id = String(cmd.id ?? '')
+        // 删掉的正是正在跑的那个会话：先停下再删，否则它还会往已删除的目录里写
+        if (running && runningSession === id && !(await stopCurrentTurn())) {
           send({ type: 'error', message: '这一轮没停下来（可能有工具不响应），稍后再删' })
           break
         }
-        const id = String(cmd.id ?? '')
         try {
           await Session.remove(opts.dataDir, id)
           // 删掉的正好是当前会话：得换一个新的，否则 agent 还指着已删除的文件
@@ -684,13 +781,8 @@ async function main(): Promise<void> {
         break
       }
       case 'load-session': {
-        // 切会话不再要求先等这一轮跑完：先把它停干净（abort + 等收尾），再切过去
-        const wasRunning = running
-        if (wasRunning && !(await stopCurrentTurn())) {
-          send({ type: 'error', message: '这一轮没停下来（可能有工具不响应），稍后再切' })
-          break
-        }
-        if (wasRunning) send({ type: 'notice', text: '上一轮已中断，已切到目标会话' })
+        // 切会话不中断正在跑的那一轮：它在原会话里继续跑（事件带它自己的 session），
+        // 切回来还能接着看、接着停。要停就切回去点停止。
         try {
           session = await Session.open(opts.dataDir, String(cmd.id ?? ''))
           agent = await buildAgent()

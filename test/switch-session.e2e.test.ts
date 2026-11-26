@@ -74,7 +74,7 @@ class HostProc {
   }
 }
 
-test('load-session: 一轮跑着时也能切会话（先中止当前轮，不报错）', async () => {
+test('load-session: 一轮跑着时切会话不报错，也不再取消那一轮', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pl-switch-ws-'))
   const dataDir = await mkdtemp(join(tmpdir(), 'pl-switch-data-'))
   const llm = await startFakeLlm([
@@ -115,15 +115,14 @@ test('load-session: 一轮跑着时也能切会话（先中止当前轮，不报
     host.send({ cmd: 'load-session', id: bId })
     const readyB = await host.next('ready')
     assert.equal(String(readyB.session), bId)
+    assert.equal(String(readyB.runningSession), aId, '切走了 A 那一轮应该还在跑')
     assert.deepEqual(host.errors(), [], '切会话不该回错误')
 
-    // 中断的那一轮要收尾成 cancelled，并且切过去之后还能正常开新一轮
+    // 新行为：切会话不再取消那一轮。要停就明着发 abort（带上它所属的会话）
+    host.send({ cmd: 'abort', session: aId })
     const cancelled = await host.next('turn-end')
-    assert.equal(cancelled.reason, 'cancelled')
-
-    host.send({ cmd: 'task', text: '再试一次' })
-    const turn = await host.next('turn-end')
-    assert.equal(turn.reason, 'done')
+    assert.equal(String(cancelled.reason), 'cancelled')
+    assert.equal(String(cancelled.session), aId)
   } finally {
     await host.close()
     await llm.close()

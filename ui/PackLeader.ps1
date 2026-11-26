@@ -2020,6 +2020,9 @@ function Set-Sessions($items) {
   # 记一份标题：左栏宽度上限按「最长的那个标题能不能完整显示」来定
   $script:sideTitles = @()
   if ($items) { $script:sideTitles = @($items | ForEach-Object { [string]$_.title }) }
+  # id → 标题：后台会话跑完/还在跑时要在提示行里报出是哪一条
+  $script:sessionTitles = @{}
+  if ($items) { foreach ($it in @($items)) { $script:sessionTitles[[string]$it.id] = [string]$it.title } }
   $SessionList.Children.Clear()
   if (-not $items -or $items.Count -eq 0) {
     $empty = New-Text '还没有会话' 11 '#5B626D' 'Normal' 'Segoe UI' 0
@@ -2264,6 +2267,17 @@ function Continue-ReplayRender {
     $script:historyT0 = $null
   }
   Update-ReplayMore
+  if ($script:pendingNotice -and $script:pendingNotice.Count -gt 0) {
+    foreach ($n in $script:pendingNotice) { Add-SystemLine ([string]$n[0]) ([string]$n[1]) }
+    $script:pendingNotice.Clear()
+  }
+  # 历史画完了，再把挂着的审批/提问补在末尾（要等清屏后的历史先排好）
+  if ($script:pendingCards -and $script:pendingCards.Count -gt 0) {
+    foreach ($c in $script:pendingCards) {
+      if ([string]$c[0] -eq 'approval') { Add-ApprovalCard $c[1] } else { Add-QuestionCard $c[1] }
+    }
+    $script:pendingCards.Clear()
+  }
   if ($script:pendingJump -ge 0) {
     $target = $script:pendingJump
     $script:pendingJump = -1
@@ -3238,12 +3252,33 @@ function Start-Turn([string]$text) {
 # ---------------------------------------------------------------- 事件处理
 function Handle-Event([string]$line) {
   try { $e = $line | ConvertFrom-Json } catch { return }
+  # 事件都带 session：正在跑的那一轮可能属于别的会话（切走了它还在跑）。
+  # 那些事件不能画进当前聊天区（会串），但「它跑完了」要提示一下，别让人一直以为还在跑。
+  $evSession = [string]$e.session
+  # 只有轮次里产生的事件才有「属于哪个会话」之分。ready / sessions / config 这些是全局状态，
+  # 带上 session 只是交代当前会话是谁——切会话时它必然不等于切换前的那个，一丢界面就卡在旧状态
+  # （按钮还显示「插话」、左栏列表也不刷新，看着像那一轮被中断了）。
+  $turnTypes = @('turn-start', 'step', 'text', 'reasoning', 'assistant-end', 'tool-start', 'tool-end', 'approval', 'question', 'usage', 'turn-end', 'memory-saved', 'memory-undone')
+  if ($evSession -and $script:sessionId -and $evSession -ne $script:sessionId -and ($turnTypes -contains [string]$e.type)) {
+    if ($e.type -eq 'turn-end') {
+      $t = [string]$script:sessionTitles[$evSession]
+      if (-not $t) { $t = $evSession }
+      $what = $(if ($e.reason -eq 'done') { '跑完了' } elseif ($e.reason -eq 'error') { '出错了' } elseif ($e.reason -eq 'cancelled') { '已中断' } else { '结束了' })
+      $color = $(if ($e.reason -eq 'done') { '#4ADE80' } else { '#FBBF24' })
+      Add-SystemLine ("后台会话「$t」$what") $color
+      Send-Host @{ cmd = 'list-sessions' }
+    }
+    return
+  }
   switch ($e.type) {
     'ready' {
-      # 切会话时 host 已经把上一轮停干净了：这里跟着复位，否则下面的「busy 就不重建」会跳过清屏，
-      # 界面上留着上一个会话的内容、底部还显示「停止」
-      if ($script:busy) { Set-Busy $false }
+      # 切会话不再中断正在跑的那一轮：它可能在别的会话里接着跑。
+      # 所以不能像以前那样无脑复位 busy——按「这个会话自己是不是在跑」来定。
+      $prevSession = $script:sessionId
       $script:sessionId = [string]$e.session
+      $switched = ($script:sessionId -ne $prevSession)
+      $mine = ([string]$e.runningSession -ne '') -and ([string]$e.runningSession -eq $script:sessionId)
+      Set-Busy $mine
       $script:historyCount = [int]$e.historyCount
       $script:historyQuestions = @($e.questions)
       $script:historyBefore = 0
@@ -3265,9 +3300,10 @@ function Handle-Event([string]$line) {
       # 第一次用（没 Key）：直接把设置面板弹出来，别让用户对着输入框发呆
       if (-not $script:hasKey) { Open-Settings }
 
-      if (-not $script:busy) {
+      # 切了会话就必须重画（界面上还是上一个会话的内容）；同一个会话且不忙也重画
+      if ($switched -or -not $mine) {
         Clear-Transcript
-        # 首屏只读取最后一轮，往上滚动或点击右侧提问索引时再按需加载。
+        # 首屏只读最后几轮，往上滚动或点击右侧提问索引时再按需加载。
         $script:replayEvents = @()
         $script:replayAt = 0
         $script:replayHasUser = $false
@@ -3275,6 +3311,23 @@ function Handle-Event([string]$line) {
         $script:moreRow = $null
         Send-HistoryRequest 'tail'
       }
+      # 提示行等历史画完再出（画的过程中 Transcript 还在往里加），先挂起来
+      $script:pendingNotice = New-Object System.Collections.ArrayList
+      if ($e.unfinished) {
+        [void]$script:pendingNotice.Add(@('上一轮没有跑完（进程退出或没来得及收尾）', '#FBBF24'))
+      }
+      $rs = [string]$e.runningSession
+      if ($mine -and [int]$e.runningStep -gt 0) {
+        [void]$script:pendingNotice.Add(@("这个会话的一轮还在运行（第 $([int]$e.runningStep) 步）", '#4ADE80'))
+      } elseif ($rs -and -not $mine) {
+        $t = [string]$script:sessionTitles[$rs]
+        if (-not $t) { $t = $rs }
+        [void]$script:pendingNotice.Add(@("会话「$t」还在后台运行，跑完会提示", '#4ADE80'))
+      }
+      # 切回来时还挂着的审批/提问：不重画出来就只能干看着「运行中」没法往下推
+      $script:pendingCards = New-Object System.Collections.ArrayList
+      if ($mine -and $e.pendingApproval) { [void]$script:pendingCards.Add(@('approval', $e.pendingApproval)) }
+      if ($mine -and $e.pendingQuestion) { [void]$script:pendingCards.Add(@('question', $e.pendingQuestion)) }
       Send-Host @{ cmd = 'list-sessions' }
     }
     'history-slice' {
@@ -3487,7 +3540,7 @@ function Handle-Event([string]$line) {
 
 # ---------------------------------------------------------------- 交互
 $SendBtn.Add_Click({ Start-Turn $InputBox.Text })
-$StopBtn.Add_Click({ Send-Host @{ cmd = 'abort' } })
+$StopBtn.Add_Click({ Send-Host @{ cmd = 'abort'; session = $script:sessionId } })
 
 # 设置面板
 $SettingsBtn.Add_Click({ Open-Settings })

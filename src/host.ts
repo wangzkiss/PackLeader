@@ -310,10 +310,30 @@ async function main(): Promise<void> {
 
   let agent = await buildAgent()
 
-  const questionPositions = (): Array<{ eventIndex: number; seq: number; text: string; at: number }> =>
+  // 索引悬停预览用：这一轮的回答开头（找下一条 assistant/message，
+  // 碰到新的提问就停——那是下一轮的答案了）
+  const answerAfter = (start: number): string => {
+    for (let i = start + 1; i < session.events.length; i++) {
+      const event = session.events[i]!
+      if (event.kind === 'user/message') return ''
+      if (event.kind === 'assistant/message') {
+        const text = event.text.replace(/\s+/g, ' ').trim()
+        if (text) return text.slice(0, 160)
+      }
+    }
+    return ''
+  }
+
+  const questionPositions = (): Array<{ eventIndex: number; seq: number; text: string; answer: string; at: number }> =>
     session.events.flatMap((event, eventIndex) =>
       event.kind === 'user/message' && !event.text.startsWith('[自动验证]')
-        ? [{ eventIndex, seq: event.seq, text: event.text.replace(/\s+/g, ' ').trim().slice(0, 100), at: event.at }]
+        ? [{
+            eventIndex,
+            seq: event.seq,
+            text: event.text.replace(/\s+/g, ' ').trim().slice(0, 100),
+            answer: answerAfter(eventIndex),
+            at: event.at,
+          }]
         : [],
     )
 

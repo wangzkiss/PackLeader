@@ -117,6 +117,7 @@ export function runShell(
     let stderr = ''
     let timedOut = false
     let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
 
     const child = spawn(shell.file, shell.args(command), {
       cwd: opts.cwd,
@@ -127,18 +128,35 @@ export function runShell(
     const finish = (exitCode: number) => {
       if (settled) return
       settled = true
-      clearTimeout(timer)
+      if (timer) clearTimeout(timer)
       opts.signal?.removeEventListener('abort', onAbort)
       resolve({ stdout, stderr, exitCode, timedOut, ms: Date.now() - started })
     }
 
+    // 中断 / 超时：Windows 上 child.kill() 只杀掉直接子进程（powershell / cmd），命令里再拉起的
+    // 孙进程（node、python、构建工具）还活着并握着 stdout 管道，close 事件就一直不来——
+    // runShell 的 promise 永远不 resolve，界面上就是「点了停止还在跑」。所以按整棵树杀。
     const onAbort = () => {
+      if (settled) return
       timedOut = true
-      child.kill()
+      if (isWin && child.pid) {
+        try {
+          spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true })
+        } catch {
+          child.kill()
+        }
+      } else {
+        child.kill()
+      }
       setTimeout(() => child.kill('SIGKILL'), 2000).unref?.()
+      // 兜底：树没杀干净（或句柄还没释放）也不能让调用方无限等
+      setTimeout(() => finish(-1), 4000).unref?.()
     }
-    const timer = setTimeout(onAbort, timeoutMs)
-    opts.signal?.addEventListener('abort', onAbort, { once: true })
+
+    timer = setTimeout(onAbort, timeoutMs)
+    // 已经 abort 过的 signal 不会再触发事件，这里补一次，免得工具白跑到底
+    if (opts.signal?.aborted) onAbort()
+    else opts.signal?.addEventListener('abort', onAbort, { once: true })
 
     child.stdout?.on('data', (b: Buffer) => {
       if (stdout.length < maxBytes) stdout += b.toString('utf8')

@@ -1790,10 +1790,16 @@ function Add-InlineLines($tb, $lines) {
     if (-not $first) { $tb.Inlines.Add((New-Object System.Windows.Documents.LineBreak)) | Out-Null }
     $first = $false
     if ($line -match '^(#{1,6})\s+(.*)$') {
-      $tb.Inlines.Add((New-Run $Matches[2] '#F9FAFB' $true $false)) | Out-Null
+      # 先把捕获组取出来：下面还要跑别的正则，$Matches 会被覆盖
+      $htext = [string]$Matches[2]
+      $tb.Inlines.Add((New-Run $htext '#F9FAFB' $true $false)) | Out-Null
       continue
     }
-    if ($line -match '^(\s*)[-*]\s+(.*)$') { $line = "$($Matches[1])• $($Matches[2])" }
+    if ($line -match '^(\s*)[-*]\s+(.*)$') {
+      $lind = [string]$Matches[1]
+      $lbody = [string]$Matches[2]
+      $line = "$lind• $lbody"
+    }
     $parts = [regex]::Split($line, '(\*\*[^*]+\*\*|`[^`]+`)')
     foreach ($p in $parts) {
       if (-not $p) { continue }
@@ -1827,13 +1833,26 @@ function New-CodeBlock([string]$code, [string]$lang) {
   return $outer
 }
 
-# 把整段回答重绘成「段落 + 代码块卡片」。流式阶段仍然是纯文本，结束时再格式化。
+# 把整段回答重绘成「段落 + 代码块卡片 + 表格卡片」。流式阶段仍然是纯文本，结束时再格式化。
 function Render-Markdown($hostPanel, [string]$text) {
   $hostPanel.Children.Clear()
   $lines = ($text -replace "`r`n", "`n") -split "`n"
   $i = 0
   $n = $lines.Count
   while ($i -lt $n) {
+    # 表格：本行含 |，且下一行是 | --- | 分隔行
+    if ($lines[$i] -match '\|' -and ($i + 1) -lt $n -and ([string]$lines[$i + 1]) -match $script:tableRuleRe) {
+      $rows = New-Object System.Collections.ArrayList
+      [void]$rows.Add((Split-TableRow ([string]$lines[$i])))
+      $i += 2
+      while (($i -lt $n) -and (([string]$lines[$i]) -match '\|') -and (([string]$lines[$i]).Trim())) {
+        [void]$rows.Add((Split-TableRow ([string]$lines[$i])))
+        $i++
+      }
+      $card = New-TableCard $rows 1
+      if ($null -ne $card) { $hostPanel.Children.Add($card) | Out-Null }
+      continue
+    }
     if ($lines[$i] -match '^\s*```\s*([^`]*)$') {
       $lang = $Matches[1].Trim()
       $buf = New-Object System.Text.StringBuilder
@@ -1861,6 +1880,130 @@ function Render-Markdown($hostPanel, [string]$text) {
     Add-InlineLines $tb $chunk
     $hostPanel.Children.Add($tb) | Out-Null
   }
+}
+
+# ---------------- 管道表格：| a | b | 加 | --- | 分隔行 → 网格卡片 ----------------
+# 表格是模型「给结论」时最常用的格式，原样输出成一堆竖线很难读。
+# 不追求完整 Markdown 语义，只做三件事：按列估宽度、表头给底色、行间画细线。
+$script:tableRuleRe = '^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$'
+
+function Split-TableRow([string]$line) {
+  $s = $line.Trim()
+  if ($s.StartsWith('|')) { $s = $s.Substring(1) }
+  if ($s.EndsWith('|')) { $s = $s.Substring(0, $s.Length - 1) }
+  $cells = New-Object System.Collections.ArrayList
+  $buf = New-Object System.Text.StringBuilder
+  # 逐字符扫：反引号内的 | 是内容不是分隔符（`a|b` 仍算一格）
+  $inCode = $false
+  foreach ($ch in $s.ToCharArray()) {
+    if ($ch -eq '`') { $inCode = -not $inCode }
+    if (($ch -eq '|') -and (-not $inCode)) {
+      [void]$cells.Add($buf.ToString().Trim())
+      [void]$buf.Clear()
+      continue
+    }
+    [void]$buf.Append($ch)
+  }
+  [void]$cells.Add($buf.ToString().Trim())
+  return $cells
+}
+
+# 单元格里的粗体 / 行内代码走和正文一样的切分逻辑
+function Add-TableInlines($tb, [string]$cell) {
+  if (-not $cell) { return }
+  $s = $cell -replace '<br\s*/?>', ' / '
+  $parts = [regex]::Split($s, '(\*\*[^*]+\*\*|`[^`]+`)')
+  foreach ($p in $parts) {
+    if (-not $p) { continue }
+    if ($p -match '^\*\*(.+)\*\*$') { $tb.Inlines.Add((New-Run ([string]$Matches[1]) '#F9FAFB' $true $false)) | Out-Null }
+    elseif ($p -match '^`(.+)`$') { $tb.Inlines.Add((New-Run ([string]$Matches[1]) '#9FC7FF' $false $true)) | Out-Null }
+    else { $tb.Inlines.Add((New-Run $p '#D4D9E0' $false $false)) | Out-Null }
+  }
+}
+
+# 列宽按「该列各行最长显示宽度」估星号比例；中文按 1.7 个字符宽算，单列上限 40
+function New-TableCard($rows, [int]$headerRows) {
+  $cols = 0
+  foreach ($r in $rows) { if ($r.Count -gt $cols) { $cols = $r.Count } }
+  if ($cols -eq 0) { return $null }
+  $w = [double[]]::new($cols)
+  for ($c = 0; $c -lt $cols; $c++) {
+    $max = 4.0
+    foreach ($r in $rows) {
+      if ($c -ge $r.Count) { continue }
+      $len = 0.0
+      foreach ($ch in ([string]$r[$c]).ToCharArray()) {
+        if ([int]$ch -gt 0x2E7F) { $len += 1.7 } else { $len += 1.0 }
+      }
+      if ($len -gt $max) { $max = $len }
+    }
+    if ($max -gt 40) { $max = 40 }
+    $w[$c] = $max
+  }
+
+  $outer = New-Object System.Windows.Controls.Border
+  $outer.Background = (Brush '#12141A')
+  $outer.CornerRadius = '8'
+  $outer.BorderThickness = '1'
+  $outer.BorderBrush = (Brush '#1FFFFFFF')
+  $outer.Padding = '8,6,8,8'
+  $outer.Margin = '0,4,0,10'
+
+  $grid = New-Object System.Windows.Controls.Grid
+  for ($c = 0; $c -lt $cols; $c++) {
+    $cd = New-Object System.Windows.Controls.ColumnDefinition
+    $cd.Width = [System.Windows.GridLength]::new($w[$c], [System.Windows.GridUnitType]::Star)
+    $grid.ColumnDefinitions.Add($cd) | Out-Null
+  }
+  for ($r = 0; $r -lt $rows.Count; $r++) {
+    $rd = New-Object System.Windows.Controls.RowDefinition
+    $rd.Height = [System.Windows.GridLength]::Auto
+    $grid.RowDefinitions.Add($rd) | Out-Null
+  }
+
+  for ($r = 0; $r -lt $rows.Count; $r++) {
+    $row = $rows[$r]
+    $isHead = ($r -lt $headerRows)
+    if ($isHead) {
+      # 表头底色铺一整条横跨所有列的 Border，比逐格画省元素
+      $hb = New-Object System.Windows.Controls.Border
+      $hb.Background = (Brush '#1A1E27')
+      $hb.CornerRadius = '5'
+      $hb.Margin = '0,0,0,2'
+      [System.Windows.Controls.Grid]::SetRow($hb, $r)
+      [System.Windows.Controls.Grid]::SetColumn($hb, 0)
+      [System.Windows.Controls.Grid]::SetColumnSpan($hb, $cols)
+      $grid.Children.Add($hb) | Out-Null
+    }
+    for ($c = 0; $c -lt $cols; $c++) {
+      $cellTxt = ''
+      if ($c -lt $row.Count) { $cellTxt = [string]$row[$c] }
+      $tb = New-Text '' 12.5 '#D4D9E0' 'Normal' 'Segoe UI' 0
+      $tb.TextWrapping = 'Wrap'
+      $tb.Margin = '10,5,10,5'
+      $tb.VerticalAlignment = 'Center'
+      if ($isHead) { $tb.FontWeight = [System.Windows.FontWeights]::SemiBold }
+      Add-TableInlines $tb $cellTxt
+      [System.Windows.Controls.Grid]::SetRow($tb, $r)
+      [System.Windows.Controls.Grid]::SetColumn($tb, $c)
+      $grid.Children.Add($tb) | Out-Null
+    }
+    if (-not $isHead -and $r -lt ($rows.Count - 1)) {
+      # 行分隔线：一条只留底边的 Border，跨满整行
+      $ln = New-Object System.Windows.Controls.Border
+      $ln.BorderBrush = (Brush '#14FFFFFF')
+      $ln.BorderThickness = '0,0,0,1'
+      $ln.Margin = '6,0,6,0'
+      [System.Windows.Controls.Grid]::SetRow($ln, $r)
+      [System.Windows.Controls.Grid]::SetColumn($ln, 0)
+      [System.Windows.Controls.Grid]::SetColumnSpan($ln, $cols)
+      $ln.VerticalAlignment = 'Bottom'
+      $grid.Children.Add($ln) | Out-Null
+    }
+  }
+
+  $outer.Child = $grid
+  return $outer
 }
 
 # 超长文本先截一段看，剩下的用一行提示带过（思考过程回放用）
@@ -4023,6 +4166,9 @@ function Set-Busy([bool]$on) {
   $SendBtn.IsEnabled = $true
   $SendBtn.Visibility = 'Visible'
   $SendBtn.ToolTip = $(if ($on) { '插话（跑着时插队，模型下一步就看到）' } else { '发送（Enter）' })
+  # 每轮结束（或重开）都把停止键还原：中断中点过它，文案已经改成「正在中断…」
+  if (-not $on -and $script:stopTimer) { $script:stopTimer.Stop() }
+  $StopBtn.Content = '停止'
   $StopBtn.IsEnabled = $on
   $StopBtn.Visibility = $(if ($on) { 'Visible' } else { 'Collapsed' })
   if ($on) {
@@ -4393,7 +4539,25 @@ function Handle-Event([string]$line) {
 
 # ---------------------------------------------------------------- 交互
 $SendBtn.Add_Click({ Start-Turn $InputBox.Text })
-$StopBtn.Add_Click({ Send-Host @{ cmd = 'abort'; session = $script:sessionId } })
+$StopBtn.Add_Click({
+  if (-not $script:busy) { return }
+  # 点过一次就灰掉：连点只会多几行「已中断当前轮」，不会更快
+  $StopBtn.IsEnabled = $false
+  $StopBtn.Content = '正在中断…'
+  # 界面兜底：宿主 25 秒还没回 turn-end（有工具不响应中断）就本地解锁，
+  # 不能让「点了停止」永远挂着「执行中」
+  if ($script:stopTimer) { $script:stopTimer.Stop() }
+  $script:stopTimer = New-Object System.Windows.Threading.DispatcherTimer
+  $script:stopTimer.Interval = [TimeSpan]::FromSeconds(25)
+  $script:stopTimer.Add_Tick({
+    $script:stopTimer.Stop()
+    if (-not $script:busy) { return }
+    Set-Busy $false
+    Add-SystemLine '宿主 25 秒没有确认结束，界面先解锁；后台若还在跑，切一下会话就能看到最新状态' '#FBBF24'
+  })
+  $script:stopTimer.Start()
+  Send-Host @{ cmd = 'abort'; session = $script:sessionId }
+})
 
 # 设置面板
 $SettingsBtn.Add_Click({ Open-Settings })

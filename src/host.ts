@@ -473,6 +473,8 @@ async function main(): Promise<void> {
 
   let controller: AbortController | undefined
   let current: Promise<void> | undefined
+  /** 停止键的兜底：工具有不响应中断的，到时强制解锁界面 */
+  let stopWatchdog: ReturnType<typeof setTimeout> | undefined
 
   // 本会话的用量（audit.cost() 是全库累计，界面上看着会误导）
   const sessionUsage = (forSession: Session = session): { calls: number; prompt: number; completion: number; cacheRead: number } => {
@@ -529,6 +531,7 @@ async function main(): Promise<void> {
     const turnAgent = target?.agent ?? agent
     running = true
     controller = new AbortController()
+    const myController = controller
     turnAgent.signal = controller.signal
     eventSession = turnSession.id
     runningSession = turnSession.id
@@ -555,14 +558,22 @@ async function main(): Promise<void> {
       send({ type: 'error', message: (e as Error).message })
       send({ type: 'turn-end', reason: 'error', ms: Date.now() - t0, text: '', stats: timeline?.stats() ?? null })
     } finally {
-      running = false
-      controller = undefined
-      turnAgent.signal = undefined
-      send({ type: 'usage', ...sessionUsage(turnSession) })
-      // 上面的收尾事件还得带这一轮的会话，清空放最后
-      eventSession = undefined
-      runningSession = undefined
-      runningStep = 0
+      // 只有「还是当前这一轮」才清状态：兜底强制收尾后用户可能已经发起了新一轮，
+      // 旧的那一轮随后收尾不能把新一轮的 running 抹掉
+      if (controller === myController) {
+        running = false
+        controller = undefined
+        turnAgent.signal = undefined
+        if (stopWatchdog) {
+          clearTimeout(stopWatchdog)
+          stopWatchdog = undefined
+        }
+        send({ type: 'usage', ...sessionUsage(turnSession) })
+        // 上面的收尾事件还得带这一轮的会话，清空放最后
+        eventSession = undefined
+        runningSession = undefined
+        runningStep = 0
+      }
     }
   }
 
@@ -614,7 +625,14 @@ async function main(): Promise<void> {
           await runTask(p.text, p.files, target)
         }
         // 关键：不能 await —— 否则执行期间读不到 stdin，approve/abort 永远进不来（死锁）
-        if (text || paths.length) current = run().finally(() => { current = undefined })
+        if (text || paths.length) {
+          const p = run()
+          current = p
+          // 只清自己：强制收尾之后新的一轮可能已经把 current 换掉了
+          void p.finally(() => {
+            if (current === p) current = undefined
+          })
+        }
         break
       }
       // 插队：这一轮还在跑的时候，用户这句话（连同附件）直接落进当前会话，模型下一步就能看到
@@ -643,7 +661,11 @@ async function main(): Promise<void> {
             const p = await prepare(text, paths, target.session)
             await runTask(p.text, p.files, target)
           }
-          current = run().finally(() => { current = undefined })
+          const p = run()
+          current = p
+          void p.finally(() => {
+            if (current === p) current = undefined
+          })
         }
         break
       }
@@ -693,7 +715,25 @@ async function main(): Promise<void> {
         controller?.abort()
         approver.rejectAll()
         asker.rejectAll()
+        // 连点两下停止：只回一句，别再造一颗兜底定时器
+        if (stopWatchdog) {
+          send({ type: 'notice', text: '正在中断中，等这一轮退出' })
+          break
+        }
         send({ type: 'notice', text: '已中断当前轮' })
+        // 兜底：有工具不响应中断（长命令、挂着子进程树）时，20 秒后强制解锁界面，
+        // 不让「点了停止」永远停在「执行中」
+        stopWatchdog = setTimeout(() => {
+          stopWatchdog = undefined
+          if (!running) return
+          running = false
+          runningSession = undefined
+          runningStep = 0
+          controller = undefined
+          send({ type: 'notice', text: '这一轮 20 秒还没有退出（有工具不响应中断），已强制结束并解锁界面' })
+          send({ type: 'turn-end', reason: 'cancelled', ms: 0, text: '', stats: timeline?.stats() ?? null })
+        }, 20_000)
+        stopWatchdog.unref?.()
         break
       }
       case 'answer': {

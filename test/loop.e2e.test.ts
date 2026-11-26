@@ -271,3 +271,15 @@ test('e2e: 工具输出远超上限时按 64KB 预算截断（不是只裁 15%�
     await s.close()
   }
 })
+
+test('e2e: 系统提示要求思考过程用中文', async () => {
+  const s = await setup([{ reasoning: '先想一想', text: '好' }])
+  try {
+    await s.agent.runTurn('随便说一句')
+    const sys = s.llmServer.requests[0]!.messages.find((m: Record<string, any>) => m.role === 'system')
+    assert.ok(sys, '请求里要有 system 消息')
+    assert.match(String(sys.content), /思考过程一律用中文/)
+  } finally {
+    await s.close()
+  }
+})

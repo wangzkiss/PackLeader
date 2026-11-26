@@ -263,16 +263,17 @@ $xaml = @'
       <!-- 会话内容 + 提问缩略索引。索引独立于历史控件，未加载的提问也能直接跳转。 -->
       <Grid Grid.Row="1">
         <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="26"/>
           <ColumnDefinition Width="*"/>
-          <ColumnDefinition Width="22"/>
         </Grid.ColumnDefinitions>
-        <ScrollViewer Grid.Column="0" x:Name="Scroller" VerticalScrollBarVisibility="Auto" Padding="24,18,16,18">
-          <StackPanel x:Name="Transcript"/>
-        </ScrollViewer>
-        <Border Grid.Column="1" Width="16" Margin="0,12,2,12" Background="#14FFFFFF" CornerRadius="8"
+        <!-- 提问索引在左边（Kite 样式：一列短横线，悬停变长变亮、点击跳转） -->
+        <Border x:Name="QIndexHost" Grid.Column="0" Width="20" Margin="4,14,0,14"
                 ToolTip="提问索引：点击标记跳到对应问题">
           <Canvas x:Name="QuestionIndexCanvas" ClipToBounds="True"/>
         </Border>
+        <ScrollViewer Grid.Column="1" x:Name="Scroller" VerticalScrollBarVisibility="Auto" Padding="10,18,24,18">
+          <StackPanel x:Name="Transcript"/>
+        </ScrollViewer>
       </Grid>
 
       <!-- 输入区 -->
@@ -475,6 +476,23 @@ $xaml = @'
         <Image x:Name="PreviewImage" Stretch="Uniform"/>
       </Border>
     </Grid>
+
+    <!-- 提问索引的悬停预览卡：挂在根 Grid 上做覆盖层。
+         Popup 在这台 125% DPI 的机器上会飘到窗口外看不见，改成窗口内浮层 -->
+    <Border x:Name="QPreviewCard" Grid.ColumnSpan="3" HorizontalAlignment="Left" VerticalAlignment="Top" MaxWidth="380" MaxHeight="240"
+            Background="#1C1F26" BorderBrush="#2E3440" BorderThickness="1" CornerRadius="10" Padding="13,11,13,10"
+            Visibility="Collapsed" IsHitTestVisible="False" Panel.ZIndex="60">
+      <Border.Effect>
+        <DropShadowEffect BlurRadius="18" ShadowDepth="4" Opacity="0.55" Color="Black"/>
+      </Border.Effect>
+      <StackPanel>
+        <TextBlock x:Name="QPreviewTitle" FontSize="13" FontWeight="SemiBold" Foreground="#F3F4F6"
+                   TextWrapping="Wrap" MaxWidth="352"/>
+        <TextBlock x:Name="QPreviewBody" FontSize="12" Foreground="#9AA1AC" TextWrapping="Wrap" MaxWidth="352"
+                   MaxHeight="126" ClipToBounds="True" Margin="0,7,0,0" LineHeight="18"/>
+        <TextBlock x:Name="QPreviewFoot" FontSize="10.5" Foreground="#5B626D" Margin="0,8,0,0"/>
+      </StackPanel>
+    </Border>
   </Grid>
 </Window>
 '@
@@ -636,6 +654,7 @@ $script:historyFetched = 0
 $script:historyTailFill = $false
 $Scroller = $window.FindName('Scroller')
 $QuestionIndexCanvas = $window.FindName('QuestionIndexCanvas')
+$rootGrid = $window.FindName('RootGrid')
 # 滑到顶就自动补一批更早的记录（点顶部那一行也一样）。
 # 补的内容插在上方、视口会往下跳，Load-OlderHistory 里会补回去。
 $Scroller.Add_ScrollChanged({
@@ -1068,14 +1087,28 @@ function Add-ToolRow([string]$name, [string]$summary, [object]$parent = $null) {
 }
 
 # ---------------------------------------------------------------- 工具调用分组
-# 和 Kite 一样：连续几次调用收成一个可折叠的块，收起时就是一行
-# 「▸  5 次工具调用                  fs.read ×3 · fs.edit ×2」，点一下展开看每一行。
+# 一整轮的所有工具调用收成同一个可折叠的块，收起时就是一行
+# 「▸  12 次工具调用 · 共 8.4s            fs.read ×3 · fs.edit ×2」，点一下展开看每一行。
+# 早先是「每次思考后各起一块」，十步的一轮就是十块工具组往下平铺；现在整轮共用一块，
+# 中间夹进来的思考块只把块往上挤，Add-ToolLine 会把它挪回末尾。
 $script:toolGroup = $null
+
+# 工具耗时合计：不足一秒报毫秒，一分钟内报一位小数秒（「共 8.4s」比「8 秒」信息多）
+function Format-ToolSecs([double]$ms) {
+  if ($ms -lt 1) { return '<1ms' }
+  if ($ms -lt 1000) { return ([string][int][math]::Round($ms)) + 'ms' }
+  $s = $ms / 1000.0
+  if ($s -lt 60) { return ([string][math]::Round($s, 1)) + 's' }
+  return (Format-Elapsed $s)
+}
 
 function Update-ToolGroup($g) {
   if (-not $g) { return }
   $arrow = $(if ($g.Open) { '▾' } else { '▸' })
-  $g.Head.Text = "$arrow  $($g.Count) 次工具调用"
+  # 只要有一条跑完了就报合计（全是 0ms 的极快调用也报「共 <1ms」，免得时有时无）
+  $done = $g.Count - $g.Running
+  $total = $(if ($done -gt 0) { ' · 共 ' + (Format-ToolSecs $g.TotalMs) } else { '' })
+  $g.Head.Text = "$arrow  $($g.Count) 次工具调用$total"
   $parts = @()
   foreach ($k in $g.Order) { $parts += ("$k ×" + $g.Counts[$k]) }
   $sum = ($parts -join ' · ')
@@ -1130,7 +1163,7 @@ function New-ToolGroup {
   $g = New-Object PSObject -Property @{
     Head = $title; Sum = $sum; Items = $items; Border = $outer
     Count = 0; Counts = @{}; Order = (New-Object System.Collections.ArrayList)
-    Running = 0; Failed = 0; Open = $false
+    Running = 0; Failed = 0; Open = $false; TotalMs = 0
   }
   # 同样拿 Tag 传节点：事件里直接引用 $g 会拿到 null
   $head.Tag = $g
@@ -1158,6 +1191,13 @@ function Close-ToolGroup {
 
 function Add-ToolLine([string]$name, [string]$summary) {
   $g = Get-ToolGroup
+  # 一组管一整轮：中间插进来的思考块会把组挤到上面，这里把它挪回末尾，
+  # 于是多步调用始终显示成「思考 1 / 2 / 3 … + 一块工具汇总」，不会一步一块往下平铺
+  $panel = $script:renderHost
+  if ($g.Border.Parent -eq $panel -and $panel.Children.IndexOf($g.Border) -ne ($panel.Children.Count - 1)) {
+    $panel.Children.Remove($g.Border) | Out-Null
+    $panel.Children.Add($g.Border) | Out-Null
+  }
   $st = Add-ToolRow $name $summary $g.Items
   $g.Count++
   if (-not $g.Counts.ContainsKey($name)) {
@@ -1172,7 +1212,7 @@ function Add-ToolLine([string]$name, [string]$summary) {
   return $st
 }
 
-function Set-ToolLineDone([string]$id, [string]$text, [bool]$ok) {
+function Set-ToolLineDone([string]$id, [string]$text, [bool]$ok, [int]$ms = 0) {
   $st = $script:toolRows[$id]
   if (-not $st) { return }
   $st.Text = $text
@@ -1184,6 +1224,7 @@ function Set-ToolLineDone([string]$id, [string]$text, [bool]$ok) {
   if (-not $g) { return }
   $g.Running = [math]::Max(0, $g.Running - 1)
   if (-not $ok) { $g.Failed++ }
+  if ($ms -gt 0) { $g.TotalMs = $g.TotalMs + $ms }
   Update-ToolGroup $g
 }
 
@@ -1191,6 +1232,10 @@ function Set-ToolLineDone([string]$id, [string]$text, [bool]$ok) {
 # Kite 那样的样式：收起时就是一行「⋯ 思考了4s  <开头一句>            ▸」，
 # 点一下展开看全文。流式时展开，出正文 / 调工具后自动收起。
 $script:reasonNode = $null
+# 思考流式的待吐队列：模型一次给一大段（或一帧里攒了好几条 delta）时先存这里，按帧追上去
+$script:reasonQueue = New-Object System.Text.StringBuilder
+$script:reasonTypingTimer = $null
+$script:reasonTypingTick = 0
 
 # 收起时的标题直接报耗时：「思考了4s」。
 # 不足一秒也写 1s（写 0s 像是没想过）；超过一分钟改用「1分30秒」，几秒的数字太长了
@@ -1281,11 +1326,30 @@ function Add-ReasoningBlock {
   $stack.Children.Add($head) | Out-Null
 
   $body = New-Text '' 12 '#878F9C' 'Normal' 'Segoe UI' 0
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($body, 'ReasonBody')
   $body.TextWrapping = 'Wrap'
   $body.LineHeight = 19
   $body.LineStackingStrategy = 'BlockLineHeight'
   $body.Margin = '0,5,0,0'
   $stack.Children.Add($body) | Out-Null
+
+  # 流式时正文末尾那个一闪一闪的小光标（Kite 的思考就是边想边流出来的样子）
+  $caret = New-Object System.Windows.Controls.Border
+  $caret.Width = 2
+  $caret.Height = 12
+  $caret.CornerRadius = '1'
+  $caret.Background = (Brush '#8FA6FF')
+  $caret.HorizontalAlignment = 'Left'
+  $caret.Margin = '1,3,0,0'
+  $caret.Visibility = 'Collapsed'
+  $caretBlink = New-Object System.Windows.Media.Animation.DoubleAnimation
+  $caretBlink.From = 1.0
+  $caretBlink.To = 0.12
+  $caretBlink.Duration = [System.Windows.Duration]::new([TimeSpan]::FromMilliseconds(560))
+  $caretBlink.AutoReverse = $true
+  $caretBlink.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+  $caret.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $caretBlink)
+  $stack.Children.Add($caret) | Out-Null
 
   $outer.Child = $stack
   $box = @{ text = '' }
@@ -1293,7 +1357,7 @@ function Add-ReasoningBlock {
   $script:renderHost.Children.Add($outer) | Out-Null
 
   $node = New-Object PSObject -Property @{
-    Head = $head; Title = $title; Time = $time; Sum = $sum; Body = $body
+    Head = $head; Title = $title; Time = $time; Sum = $sum; Body = $body; Caret = $caret
     Border = $outer; Box = $box
     T0 = (Get-Date); Open = $true; Done = $false; Secs = 0
   }
@@ -1305,9 +1369,61 @@ function Add-ReasoningBlock {
   return $node
 }
 
+# 思考内容逐字流出：一帧里攒了好几条 delta（或者模型一次给一大段）时，
+# 直接整块塞进文本框看着就是“啪”地出现一整段；这里先攒进队列，按帧追上去，
+# 观感跟 Kite 一样是一行行写出来的。积压多时一帧多吐些，不至于越落越远。
+function Start-ReasonTyping {
+  if (-not $script:reasonTypingTimer) {
+    $timer = New-Object System.Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromMilliseconds(16)
+    $timer.Add_Tick({ Step-ReasonTyping })
+    $script:reasonTypingTimer = $timer
+  }
+  if (-not $script:reasonTypingTimer.IsEnabled) { $script:reasonTypingTimer.Start() }
+}
+
+function Step-ReasonTyping {
+  $rn = $script:reasonNode
+  $timer = $script:reasonTypingTimer
+  if (-not $rn -or $rn.Done) {
+    if ($timer) { $timer.Stop() }
+    $script:reasonQueue.Clear() | Out-Null
+    return
+  }
+  $pending = $script:reasonQueue.Length
+  if ($pending -le 0) {
+    if ($timer) { $timer.Stop() }
+    return
+  }
+  $take = 1
+  if ($pending -gt 800) { $take = 200 }
+  elseif ($pending -gt 300) { $take = 60 }
+  elseif ($pending -gt 80) { $take = 20 }
+  elseif ($pending -gt 20) { $take = 5 }
+  if ($take -gt $pending) { $take = $pending }
+  $rn.Body.Text = $rn.Body.Text + $script:reasonQueue.ToString(0, $take)
+  $script:reasonQueue.Remove(0, $take) | Out-Null
+  $script:reasonTypingTick++
+  # 停在底部才跟着滚（用户往上翻旧内容时别硬拉回来），也别每帧都触发一次排版
+  if (($script:reasonTypingTick % 3) -eq 0) {
+    if (($Scroller.VerticalOffset + $Scroller.ViewportHeight) -ge ($Scroller.ExtentHeight - 120)) { $Scroller.ScrollToEnd() }
+  }
+}
+
+# 一轮思考结束：队列里剩下的直接补上（不能丢字），停表，收起光标
+function Flush-ReasonTyping($rn) {
+  if ($script:reasonTypingTimer) { $script:reasonTypingTimer.Stop() }
+  if ($rn -and $script:reasonQueue.Length -gt 0) {
+    $rn.Body.Text = $rn.Body.Text + $script:reasonQueue.ToString()
+  }
+  $script:reasonQueue.Clear() | Out-Null
+  if ($rn -and $rn.Caret) { $rn.Caret.Visibility = 'Collapsed' }
+}
+
 function Complete-Reasoning {
   $n = $script:reasonNode
   if (-not $n -or $n.Done) { return }
+  Flush-ReasonTyping $n
   $n.Done = $true
   # 历史回放里已经给过耗时（$ev.ms）就别用「刚刚过去 0 秒」盖掉它
   if ($n.Secs -lt 0.1) { $n.Secs = ((Get-Date) - $n.T0).TotalSeconds }
@@ -2135,7 +2251,12 @@ $script:userElements = @{}
 
 # 画一个历史事件。初次切换会话时会分多个 UI 时间片调用，避免一口气创建几百个控件卡住窗口。
 function Render-ReplayEvent($ev) {
-  if ($ev.kind -eq 'user/message') { Add-UserMessage ([string]$ev.text) $ev.files; $script:replayHasUser = $true }
+  if ($ev.kind -eq 'user/message') {
+    # 一轮从用户消息开始：上一轮的工具块在这里收掉，回放时也是一轮一块
+    Close-ToolGroup
+    Add-UserMessage ([string]$ev.text) $ev.files
+    $script:replayHasUser = $true
+  }
   elseif ($ev.kind -eq 'assistant/message') {
     # 历史里的思考过程也要能看，默认收起成一行摘要；超长的先只放前一段
     if ($ev.reasoning) {
@@ -2145,6 +2266,7 @@ function Render-ReplayEvent($ev) {
       Complete-Reasoning
     }
     if ($ev.text) {
+      Close-ToolGroup
       if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
       $txt = [string]$ev.text
       if ($txt.Length -gt $script:replayFoldChars) {
@@ -2166,8 +2288,8 @@ function Render-ReplayEvent($ev) {
   elseif ($ev.kind -eq 'tool/result') {
     $st = $script:toolRows[[string]$ev.callId]
     if ($st) {
-      if ($ev.ok) { Set-ToolLineDone ([string]$ev.callId) "✓  $($ev.ms)ms" $true }
-      else { Set-ToolLineDone ([string]$ev.callId) '✕  失败' $false }
+      if ($ev.ok) { Set-ToolLineDone ([string]$ev.callId) "✓  $($ev.ms)ms" $true ([int]$ev.ms) }
+      else { Set-ToolLineDone ([string]$ev.callId) '✕  失败' $false ([int]$ev.ms) }
     }
   }
   elseif ($ev.kind -eq 'memory/saved') {
@@ -2181,94 +2303,333 @@ function Render-ReplayEvent($ev) {
 # 索引位置只依赖完整事件数，不依赖已经渲染了多少控件。
 function Draw-QuestionIndex {
   if (-not $QuestionIndexCanvas) { return }
+  Hide-QuestionPreview
+  $script:qiHoverKey = -1
+  $script:qiHot = -1
   $QuestionIndexCanvas.Children.Clear()
+  # 索引条整体接管悬停/点击：点只有 6x1.5px，硬点它太难用
+  if (-not $script:qiBound) {
+    $script:qiBound = $true
+    $script:qiPendY = 0.0
+    $script:qiPendEvent = -1
+    $QuestionIndexCanvas.Background = (Brush '#01000000')
+    # 鼠标停下 70ms 再出卡：提问点很密，不然指针一抖就在相邻两条之间闪
+    $script:qiDwell = New-Object System.Windows.Threading.DispatcherTimer
+    $script:qiDwell.Interval = [TimeSpan]::FromMilliseconds(70)
+    $script:qiDwell.Add_Tick({
+      $script:qiDwell.Stop()
+      if ($script:qiPendEvent -ge 0 -and $script:qiHoverKey -ne $script:qiPendEvent) {
+        $script:qiHoverKey = $script:qiPendEvent
+        Show-QuestionPreview $script:qiPendY $script:qiPendEvent
+      }
+    })
+    $QuestionIndexCanvas.Add_MouseMove({
+      param($s, $e)
+      $y = $e.GetPosition($s).Y
+      $q = Nearest-Question $y
+      if (-not $q) { return }
+      $key = [int]$q.eventIndex
+      # 悬停放大：离指针最近的那条横线变长变亮（Kite 的手感）
+      if ($script:qiHot -ne $key) {
+        if ($script:qiHot -ge 0) { Set-QiDot $script:qiHot $false }
+        $script:qiHot = $key
+        Set-QiDot $key $true
+      }
+      if ($script:qiHoverKey -eq $key) { return }
+      $script:qiPendY = $y
+      $script:qiPendEvent = $key
+      $script:qiDwell.Stop()
+      $script:qiDwell.Start()
+    })
+    $QuestionIndexCanvas.Add_MouseLeave({
+      $script:qiHoverKey = -1
+      if ($script:qiHot -ge 0) {
+        Set-QiDot $script:qiHot $false
+        $script:qiHot = -1
+      }
+      if ($script:qiDwell) { $script:qiDwell.Stop() }
+      Hide-QuestionPreview
+    })
+    $QuestionIndexCanvas.Add_MouseLeftButtonUp({
+      param($s, $e)
+      $y = $e.GetPosition($s).Y
+      $q = Nearest-Question $y
+      if (-not $q) { return }
+      Hide-QuestionPreview
+      Select-QuestionIndex ([int]$q.eventIndex) $null
+      Jump-ToQuestion ([int]$q.eventIndex)
+    })
+  }
   $script:qiBar = $null
   $h = $QuestionIndexCanvas.ActualHeight
   if ($h -le 0 -or $script:historyCount -le 0) { return }
-  # 视口框：半透明浅色块 + 一圈亮边，盖在点上面（ZIndex 10）。
-  # 只把颜色调淡的竖条在密集的点里根本看不出来，有边框才分得清「当前读到哪一段」
+  # 视口位置：一条纯白短线（Kite 的滚动指示），不再用框住整条的高方框
   $bar = New-Object System.Windows.Shapes.Rectangle
-  $bar.Width = 12
-  $bar.Fill = (Brush '#14FFFFFF')
-  $bar.Stroke = (Brush '#59FFFFFF')
-  $bar.StrokeThickness = 1
-  $bar.RadiusX = 6
-  $bar.RadiusY = 6
+  $bar.Width = 18
+  $bar.Height = 3
+  $bar.Fill = (Brush '#FFFFFF')
+  $bar.RadiusX = 1.5
+  $bar.RadiusY = 1.5
   $bar.IsHitTestVisible = $false
+  $bar.Visibility = 'Collapsed'
   [System.Windows.Controls.Canvas]::SetLeft($bar, 1)
   [System.Windows.Controls.Panel]::SetZIndex($bar, 10)
   $QuestionIndexCanvas.Children.Add($bar) | Out-Null
   $script:qiBar = $bar
   $n = 0
-  # 问题特别多时（几百轮）点会重叠成一条蓝带：按可用高度压缩每个点的高度
+  # 预览卡的内容表：按 eventIndex 查（事件闭包里拿不到循环里的局部变量）
+  $script:qiPreviewInfo = @{}
+  # Kite 的索引：一列紧凑短横线，问得少时也靠在一起从顶上排，
+  # 不会因为只有 5 轮就被拉伸成铺满整条高（那样看着像根竖条）；问得多才均分压缩
   $qCount = @($script:historyQuestions).Count
-  $dotH = 6.0
-  if ($qCount -gt 0) { $dotH = [math]::Max(1.5, [math]::Min(6.0, ($h - 8) / $qCount)) }
+  $step = 8.0
+  if ($qCount -gt 1) {
+    $step = [math]::Min(8.0, ($h - 6.0) / ($qCount - 1))
+    if ($step -lt 1.6) { $step = 1.6 }
+  }
+  $dotH = [math]::Max(1.5, [math]::Min(3.0, $step * 0.5))
+  $script:qiStep = $step
+  # 问得少时整列不要在顶上像挂在天花板上：把这一列垂直居中（多到铺满时 top0 回落成 3）
+  $span = [math]::Max(0.0, ($qCount - 1) * $step)
+  $top0 = [math]::Max(3.0, ($h - $span) / 2)
+  $script:qiTop0 = $top0
   $script:qiDotH = $dotH
+  # 视口内那几条提问稍微亮一点（Kite 那列短横线的深浅差别就是这个）
+  $script:qiLitFrom = -1
+  $script:qiLitTo = -2
+  $script:qiDots = @{}
+  $script:qiIndex = @{}
   foreach ($q in @($script:historyQuestions)) {
     $n++
-    $dot = New-Object System.Windows.Shapes.Ellipse
-    $dot.Width = 6
+    $dot = New-Object System.Windows.Shapes.Rectangle
+    $dot.Width = 12
     $dot.Height = $dotH
-    $dot.Fill = (Brush '#9DB4FF')
-    $dot.Opacity = 0.85
+    $dot.RadiusX = 1.5
+    $dot.RadiusY = 1.5
+    $dot.Fill = (Brush '#3A4048')
     $dot.Cursor = 'Hand'
-    $dot.ToolTip = "第 $n 个提问：$([string]$q.text)"
     $dot.Tag = [int]$q.eventIndex
-    [System.Windows.Controls.Canvas]::SetLeft($dot, 5)
-    [System.Windows.Controls.Canvas]::SetTop($dot, [math]::Max(0, [math]::Min($h - $dotH, ($q.eventIndex / [double]$script:historyCount) * $h)))
-    # 鼠标划过时放大变亮：条很窄，不这样几乎点不中
-    $dot.Add_MouseEnter({
-      param($s, $e)
-      $s.Opacity = 1
-      $s.Width = 10
-      $s.Height = [math]::Max(10.0, [double]$script:qiDotH)
-      $s.Fill = (Brush '#FFFFFF')
-    })
-    $dot.Add_MouseLeave({
-      param($s, $e)
-      $s.Opacity = 0.85
-      $s.Width = 6
-      $s.Height = [double]$script:qiDotH
-      $s.Fill = (Brush '#9DB4FF')
-    })
-    $dot.Add_MouseLeftButtonUp({ param($s, $e) Jump-ToQuestion ([int]$s.Tag) })
+    $script:qiPreviewInfo[[int]$q.eventIndex] = @{
+      n = $n
+      title = [string]$q.text
+      body = [string]$q.answer
+    }
+    $script:qiDots[[int]$q.eventIndex] = $dot
+    $script:qiIndex[[int]$q.eventIndex] = ($n - 1)
+    [System.Windows.Controls.Canvas]::SetLeft($dot, 4)
+    [System.Windows.Controls.Canvas]::SetTop($dot, [math]::Max(0, [math]::Min($h - $dotH, $top0 + ($n - 1) * $step - ($dotH / 2))))
     $QuestionIndexCanvas.Children.Add($dot) | Out-Null
   }
+
+  # 点击后的反馈走短横线脉冲（见 Select-QuestionIndex），不再画白框
   Update-QuestionIndexBar
 }
 
-# 滚动时只挪那根视口条，不重画全部标记（不然长对话一滚就卡）
+$script:qiPreviewInfo = @{}
+$script:qiSelEvent = -1
+$script:qiHoverKey = -1
+$script:qiHot = -1
+$script:qiBound = $false
+
+# 索引悬停预览：深色小卡，标题是问题原文、底下是那一轮回答的开头
+# （跟 Kite 一样：不点进去也能知道那段对话讲了什么）
+function Ensure-QuestionPreview {
+  # 卡片在 XAML 里（RootGrid 上的覆盖层）；Popup 会飘出窗口，不用了
+  if ($script:qPreview) { return }
+  $card = $window.FindName('QPreviewCard')
+  if (-not $card) { return }
+  $script:qPreview = $card
+  $script:qPreviewTitle = $window.FindName('QPreviewTitle')
+  $script:qPreviewBody = $window.FindName('QPreviewBody')
+  $script:qPreviewFoot = $window.FindName('QPreviewFoot')
+}
+
+# 悬停索引条任意位置就预览最近的提问（点只有 6x1.5px，硬去点它太难用；
+# Kite 也是悬停在条上就出预览）
+function Show-QuestionPreview([double]$y, [int]$eventIndex) {
+  Ensure-QuestionPreview
+  $info = $script:qiPreviewInfo[$eventIndex]
+  if (-not $info) { return }
+  $script:qPreviewTitle.Text = [string]$info.title
+  $bodyText = [string]$info.body
+  if ($bodyText.Length -gt 200) { $bodyText = $bodyText.Substring(0, 200) + '…' }
+  $script:qPreviewBody.Text = $bodyText
+  $script:qPreviewBody.Visibility = $(if ($bodyText) { 'Visible' } else { 'Collapsed' })
+  $script:qPreviewFoot.Text = "第 $($info.n) 个提问 · 点击跳到这一段"
+  $card = $script:qPreview
+  if (-not $card) { return }
+  $card.Visibility = 'Visible'
+  $px = 10.0
+  $py = 10.0
+  $card.Measure((New-Object System.Windows.Size(380, [double]::PositiveInfinity)))
+  $cw = [double]$card.DesiredSize.Width
+  $ch = [double]$card.DesiredSize.Height
+  if ($rootGrid -and $cw -gt 0) {
+    # 索引条在左边，卡片就贴在它右边；纵向跟着指针，再夹进窗口里
+    # 注意别用 TranslatePoint：布局没跑完时它会给回 0，卡片就整个偏上一大截
+    $base = $rootGrid.PointFromScreen($QuestionIndexCanvas.PointToScreen((New-Object System.Windows.Point(0, 0))))
+    $px = $base.X + 26.0
+    $maxX = [double]$rootGrid.ActualWidth - $cw - 10
+    if ($px -gt $maxX) { $px = [math]::Max(10.0, $maxX) }
+    $py = $base.Y + $y - ($ch / 2)
+    $lo = 10.0
+    $hi = [double]$rootGrid.ActualHeight - $ch - 10
+    if ($hi -lt $lo) { $hi = $lo }
+    $py = [math]::Max($lo, [math]::Min($hi, $py))
+    $card.Margin = (New-Object System.Windows.Thickness($px, $py, 0, 0))
+  }
+}
+
+# 索引条上离鼠标最近的提问（鼠标 y → 提问）
+function Nearest-Question([double]$y) {
+  $h = $QuestionIndexCanvas.ActualHeight
+  $qs = @($script:historyQuestions)
+  if ($h -le 0 -or $qs.Count -le 0) { return $null }
+  # 短横线按固定间距从上往下排：直接按间距换算第几条（不再按整条高的比例）
+  $step = [double]$script:qiStep
+  if ($step -le 0) { $step = 8.0 }
+  $t0 = [double]$script:qiTop0
+  if ($t0 -le 0) { $t0 = 3.0 }
+  $i = [int][math]::Round(($y - $t0) / $step)
+  if ($i -lt 0) { $i = 0 }
+  if ($i -ge $qs.Count) { $i = $qs.Count - 1 }
+  return $qs[$i]
+}
+
+function Hide-QuestionPreview {
+  if ($script:qPreview) { $script:qPreview.Visibility = 'Collapsed' }
+}
+
+# 短横线的颜色：视口里那几条亮一点（Kite 那列的深浅差别）
+function Get-QiDotColor([int]$eventIndex) {
+  $i = -1
+  if ($script:qiIndex) {
+    $v = $script:qiIndex[$eventIndex]
+    if ($null -ne $v) { $i = [int]$v }
+  }
+  if ($i -ge 0 -and $i -ge [int]$script:qiLitFrom -and $i -le [int]$script:qiLitTo) { return '#6B7280' }
+  return '#3A4048'
+}
+
+# 索引条上的短横线：悬停时变长变亮（Kite 的手感）
+function Set-QiDot([int]$eventIndex, [bool]$hot) {
+  if (-not $script:qiDots) { return }
+  $d = $script:qiDots[$eventIndex]
+  if (-not $d) { return }
+  $base = [double]$script:qiDotH
+  if ($base -le 0) { $base = 2 }
+  if ($hot) {
+    $d.Width = 18
+    [System.Windows.Controls.Canvas]::SetLeft($d, 1)
+    $d.Height = [math]::Max($base + 1.2, 3.2)
+    $d.Fill = (Brush '#FFFFFF')
+  } else {
+    $d.Width = 12
+    [System.Windows.Controls.Canvas]::SetLeft($d, 4)
+    $d.Height = $base
+    $d.Fill = (Brush (Get-QiDotColor $eventIndex))
+  }
+}
+
+# 点击索引点的反馈（Kite 的手感）：那一条短横线白一下、加长再回落，
+# 不再套一个白框（索引列已经在左边，白框会像多出来的一根竖条）
+function Select-QuestionIndex([int]$eventIndex, $dot) {
+  $script:qiSelEvent = $eventIndex
+  if (-not $dot -and $script:qiDots) { $dot = $script:qiDots[$eventIndex] }
+  if (-not $dot) { return }
+  $pulseW = New-Object System.Windows.Media.Animation.DoubleAnimation
+  $pulseW.From = [double]$dot.Width
+  $pulseW.To = 18
+  $pulseW.Duration = [System.Windows.Duration]::new([TimeSpan]::FromMilliseconds(130))
+  $pulseH = New-Object System.Windows.Media.Animation.DoubleAnimation
+  $pulseH.From = [double]$dot.Height
+  $pulseH.To = 4.5
+  $pulseH.Duration = [System.Windows.Duration]::new([TimeSpan]::FromMilliseconds(130))
+  $script:qiPulseDot = $dot
+  $script:qiPulseEvent = $eventIndex
+  # 脉冲完把动画清掉再按普通态重画，否则点会一直“卡”在放大后的尺寸（动画优先级高过本地值）
+  $pulseW.Add_Completed({
+    if ($script:qiPulseDot) {
+      $script:qiPulseDot.BeginAnimation([System.Windows.FrameworkElement]::WidthProperty, $null)
+      $script:qiPulseDot.BeginAnimation([System.Windows.FrameworkElement]::HeightProperty, $null)
+      Set-QiDot ([int]$script:qiPulseEvent) ([int]$script:qiHot -eq [int]$script:qiPulseEvent)
+      $script:qiPulseDot = $null
+    }
+  })
+  $dot.BeginAnimation([System.Windows.FrameworkElement]::WidthProperty, $pulseW)
+  $dot.BeginAnimation([System.Windows.FrameworkElement]::HeightProperty, $pulseH)
+}
+
+# 滚动时只挪那根白色指示线 + 调亮视口里的提问，不重画全部标记（不然长对话一滚就卡）
 function Update-QuestionIndexBar {
   if (-not $script:qiBar) { return }
   $h = $QuestionIndexCanvas.ActualHeight
   $ext = [double]$Scroller.ExtentHeight
-  if ($h -le 0 -or $ext -le 0) {
+  $total = [double]$script:historyCount
+  if ($h -le 0 -or $ext -le 0 -or $total -le 0) {
+    $script:qiBar.Visibility = 'Collapsed'
+    return
+  }
+  $qs = @($script:historyQuestions)
+  $qn = $qs.Count
+  if ($qn -le 0) {
     $script:qiBar.Visibility = 'Collapsed'
     return
   }
   $vh = [double]$Scroller.ViewportHeight
-  # 标记是按「全部事件」的位置等分画的，视口条必须用同一套坐标。
-  # 只渲染了尾巴（historyBefore > 0）时，直接拿已渲染内容的比例去定位会让
-  # 视口条占满整条、和点对不上：把窗口 [historyBefore, historyCount) 映射回全局，
-  # 起点 g0 = historyBefore / historyCount，窗口内的滚动比例 p 再线性摊进去。
-  $total = [double]$script:historyCount
-  $g0 = 0.0
-  if ($total -gt 0) {
-    $g0 = [math]::Max(0.0, [math]::Min(1.0, ([double]$script:historyBefore) / $total))
-  }
-  $span = [math]::Max(0.0, 1.0 - $g0)
   $scrollable = $ext - $vh
   $p = 0.0
   if ($scrollable -gt 0) {
     $p = [math]::Max(0.0, [math]::Min(1.0, ([double]$Scroller.VerticalOffset) / $scrollable))
   }
-  $hh = [math]::Max(14.0, $span * ($vh / $ext) * $h)
-  if ($hh -gt $h) { $hh = $h }
-  $top = ($g0 + $span * $p) * $h
+  # 视口覆盖的全局事件区间：只渲染了尾巴（historyBefore > 0）时，窗口内的滚动比例要摊回全局
+  $e0 = [double]$script:historyBefore + $p * $total
+  $e1 = $e0 + ($vh / $ext) * $total
+  if ($e1 -gt ($e0 + $total)) { $e1 = $e0 + $total }
+  # 事件位置 → 提问序号（两个提问之间线性插值），指示线因此总落在那一列短横线上
+  $k = -1
+  $i0 = 0
+  $i1 = 0
+  for ($i = 0; $i -lt $qn; $i++) {
+    $ev = [double]$qs[$i].eventIndex
+    if ($ev -le $e0) { $k = $i; $i0 = $i }
+    if ($ev -le $e1) { $i1 = $i }
+  }
+  $pos = 0.0
+  if ($k -ge ($qn - 1)) {
+    $pos = [double]($qn - 1)
+  } elseif ($k -ge 0) {
+    $a = [double]$qs[$k].eventIndex
+    $b = [double]$qs[$k + 1].eventIndex
+    $f = 0.0
+    if ($b -gt $a) { $f = [math]::Max(0.0, [math]::Min(1.0, ($e0 - $a) / ($b - $a))) }
+    $pos = $k + $f
+  }
+  $step = [double]$script:qiStep
+  if ($step -le 0) { $step = 8.0 }
+  $t0 = [double]$script:qiTop0
+  if ($t0 -le 0) { $t0 = 3.0 }
+  $top = $t0 + $pos * $step - 1.5
+  if ($top -lt 0) { $top = 0 }
+  if ($top -gt ($h - 3)) { $top = $h - 3 }
   $script:qiBar.Visibility = 'Visible'
-  $script:qiBar.Height = $hh
-  [System.Windows.Controls.Canvas]::SetTop($script:qiBar, [math]::Max(0, [math]::Min($h - $hh, $top)))
+  $script:qiBar.Height = 3
+  [System.Windows.Controls.Canvas]::SetTop($script:qiBar, $top)
+  # 视口里的提问亮一点；只改进出视口的那两条，滚动时不动全部
+  $oldFrom = [int]$script:qiLitFrom
+  $oldTo = [int]$script:qiLitTo
+  if ($i0 -ne $oldFrom -or $i1 -ne $oldTo) {
+    $script:qiLitFrom = $i0
+    $script:qiLitTo = $i1
+    for ($i = 0; $i -lt $qn; $i++) {
+      $was = ($i -ge $oldFrom -and $i -le $oldTo)
+      $now = ($i -ge $i0 -and $i -le $i1)
+      if ($was -ne $now) {
+        $ev = [int]$qs[$i].eventIndex
+        Set-QiDot $ev ([int]$script:qiHot -eq $ev)
+      }
+    }
+  }
 }
 
 $QuestionIndexCanvas.Add_SizeChanged({ Draw-QuestionIndex })
@@ -3476,14 +3837,15 @@ function Handle-Event([string]$line) {
       Start-HistoryRender $e
     }
     'reasoning' {
-      Close-ToolGroup
+      # 思考不再断开工具组：整轮共用一块，块的位置由 Add-ToolLine 挪回末尾
       if (-not $script:reasonNode) { Add-ReasoningBlock | Out-Null }
       Set-ThinkVerb '思考中'
       $rn = $script:reasonNode
-      $d = [string]$e.delta
-      $rn.Body.Text = $rn.Body.Text + $d
-      Update-ReasoningHeader $rn
-      $Scroller.ScrollToEnd()
+      if ($rn.Caret) { $rn.Caret.Visibility = 'Visible' }
+      # 不直接把 delta 塞进文本框（那样一帧里几条一叠就是“啪”地出一大段），
+      # 先入队，由 16ms 的逐字泵按帧吐出来，看着才是流式的
+      $script:reasonQueue.Append([string]$e.delta) | Out-Null
+      Start-ReasonTyping
     }
     'text' {
       Close-ToolGroup
@@ -3494,9 +3856,10 @@ function Handle-Event([string]$line) {
       if ($script:assistantBox) { $script:assistantBox.text = $script:pendingText.ToString() }
     }
     'assistant-end' {
-      Close-ToolGroup
       Complete-Reasoning
       if ($e.text -and ([string]$e.text).Trim()) {
+        # 真的出了一段正文才断开工具组；只有工具调用、没有文字的一步保持同一块继续累加
+        Close-ToolGroup
         if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
         Render-Markdown $script:assistantBody ([string]$e.text)
       } elseif ($script:currentAssistant -and $script:assistantBody) {
@@ -3522,11 +3885,11 @@ function Handle-Event([string]$line) {
     'tool-end' {
       Set-ThinkVerb '思考中'
       if ($e.ok) {
-        Set-ToolLineDone ([string]$e.id) "✓  $($e.ms)ms" $true
+        Set-ToolLineDone ([string]$e.id) "✓  $($e.ms)ms" $true ([int]$e.ms)
       } else {
         $msg = ([string]$e.error).Split("`n")[0]
         if ($msg.Length -gt 40) { $msg = $msg.Substring(0, 40) + '…' }
-        Set-ToolLineDone ([string]$e.id) "✕  $msg" $false
+        Set-ToolLineDone ([string]$e.id) "✕  $msg" $false ([int]$e.ms)
       }
       # todo_write 的结果里带结构化清单：画成计划卡（同一条任务重复写就原地更新）
       if ([string]$e.name -eq 'todo_write' -and $e.data -and $e.data.items) {

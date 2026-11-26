@@ -1445,6 +1445,16 @@ function Toggle-TurnProc($t) {
   Update-TurnProc $t
 }
 
+# 回放的一轮从建成起就是收起态：过程区（思考链 / 工具卡 / 中间结论）先不占地方，
+# 也避免「先展开渲染一遍、收尾再收起」——长历史里那一步会看到内容闪一下。
+function Set-TurnProcCollapsed($t) {
+  if (-not $t -or $t.Done) { return }
+  if (-not $t.Open) { return }
+  $t.Open = $false
+  if ($t.Body) { $t.Body.Visibility = 'Collapsed' }
+  Update-TurnProc $t
+}
+
 # 开新的一步：上一段思考先定格，然后在这一块里依次长「思考 → 工具 → 结论」。
 # 整轮共用一张思考条 / 一张工具聚合卡，会让「哪段思考配哪几次调用」糊成一片。
 function New-StepBlock {
@@ -1468,7 +1478,8 @@ function New-StepBlock {
 }
 
 # 一轮收尾：算出总耗时，状态行定格「已完成 1:30」，绿点熄掉，
-# 并把最后一步的结论搬进 Final 区（折叠轮头收的是「过程」，最后结论要一直看得见）
+# 并把最后一步的结论搬进 Final 区（折叠轮头收的是「过程」，最后结论要一直看得见）。
+# 历史回放（Replay）额外做一件事：整轮过程默认收起，打开旧会话先看到结论。
 function Close-TurnProc {
   $t = $script:turnProc
   if (-not $t -or $t.Done) { return }
@@ -1502,6 +1513,13 @@ function Close-TurnProc {
       }
       if ($moved) { break }
     }
+  }
+  # 历史回放（切到旧会话也是这条路）：这一轮的过程默认整块收起，
+  # 只留轮头两行和最后的结论——打开旧会话先看到结论，不用先翻一屏思考链和工具卡；
+  # 想看过程点轮头就放回来（Body 里的思考条 / 工具卡本身仍是各自的收起态）。
+  if ($t.Replay -and $t.Open) {
+    $t.Open = $false
+    if ($t.Body) { $t.Body.Visibility = 'Collapsed' }
   }
   $script:reasonNode = $null
   $script:toolGroup = $null
@@ -1765,9 +1783,25 @@ function Format-ReasonSecs([double]$secs) {
   return (Format-Elapsed $secs)
 }
 
+# 这条思考的完整文本：实时是边流边写进 TextBlock 的；
+# 历史回放先挂在 Pending 上（不写 TextBlock，见 Render-ReplayEvent），点开时才落进去
+function Get-ReasonFullText($n) {
+  if (-not $n) { return '' }
+  $t = [string]$n.Body.Text
+  if (-not $t -and $n.Pending) { return [string]$n.Pending }
+  return $t
+}
+
+# 把挂起的正文真正写进 TextBlock（回放里第一次展开时才调）：之后摘要/复制都走 Body.Text
+function Set-ReasoningText($n) {
+  if (-not $n -or -not $n.Pending) { return }
+  $n.Body.Text = [string]$n.Pending
+  $n.Pending = $null
+}
+
 # 这一段思考的纯文本（整轮只有一张条，只取当前这一段）
 function Get-ReasonSegText($n) {
-  $t = [string]$n.Body.Text
+  $t = Get-ReasonFullText $n
   $seg = $t
   if ($n.SegStart -gt 0 -and $n.SegStart -lt $t.Length) { $seg = $t.Substring($n.SegStart) }
   return ($seg -replace "\s+", ' ').Trim()
@@ -1809,6 +1843,8 @@ function Update-ReasoningTime($n) {
 function Toggle-Reasoning($n) {
   if (-not $n) { return }
   $n.Open = -not $n.Open
+  # 展开：回放里挂起的正文到这里才写进 TextBlock（一开始就不渲染，省掉一屏思考的长文本排版）
+  if ($n.Open) { Set-ReasoningText $n }
   Update-ReasoningHeader $n
 }
 
@@ -1818,6 +1854,8 @@ function Add-ReasoningBlock {
   $tp = Get-TurnProc
   if ($tp.Thought) {
     $n = $tp.Thought
+    # 上一段还是挂起态（回放里没渲染）就先落下去：接着写要按 Body.Text 的长度算段起点
+    Set-ReasoningText $n
     $n.Done = $false
     $n.Open = $false
     $n.T0 = (Get-Date)
@@ -1912,6 +1950,8 @@ function Add-ReasoningBlock {
     Head = $head; Title = $title; Time = $time; Sum = $sum; Body = $body; Caret = $caret
     Border = $outer; Box = $box
     T0 = (Get-Date); Open = $false; Done = $false; Secs = 0; SegStart = 0
+    # 回放时正文先挂这儿，展开（或"复制整段对话"）时才写进 Body
+    Pending = $null
   }
   # 节点挂在标题自己的 Tag 上：PS 5.1 下这个事件里的 GetNewClosure 拿不到 $node，点了会抛异常
   $head.Tag = $node
@@ -1983,8 +2023,10 @@ function Complete-Reasoning {
   # 历史回放里已经给过耗时（$ev.ms）就别用「刚刚过去 0 秒」盖掉它
   if ($n.Secs -lt 0.1) { $n.Secs = ((Get-Date) - $n.T0).TotalSeconds }
   $n.Open = $false
-  $n.Box.text = $n.Body.Text
-  Append-CopyLog ('[思考] ' + $n.Body.Text)
+  # 复制菜单 / 复制日志要拿到完整正文：回放里正文可能还挂在 Pending 上（没渲染）
+  $full = Get-ReasonFullText $n
+  $n.Box.text = $full
+  Append-CopyLog ('[思考] ' + $full)
   Update-ReasoningHeader $n
   # 只解绑"当前"，节点本身还在界面上（点标题仍能展开），toggle 用的是节点 Tag 上的那一份
   $script:reasonNode = $null
@@ -2968,17 +3010,20 @@ function Render-ReplayEvent($ev) {
   }
   elseif ($ev.kind -eq 'assistant/message') {
     # 历史里没有 step/start 事件：每条 assistant/message 就是一步的产出，在这里开新块
-    Get-TurnProc | Out-Null
+    # 整轮都打上回放标记：Close-TurnProc 据此把过程默认收起（只有思考/正文、没有工具的轮次也算）
+    $tp = Get-TurnProc
+    $tp.Replay = $true
+    # 从建成起就收起：过程区不参与排版，也不会「先展开一屏再收起来」
+    Set-TurnProcCollapsed $tp
     New-StepBlock | Out-Null
     # 历史里的思考过程也要能看，默认收起成一行摘要；超长的先只放前一段
     if ($ev.reasoning) {
-      Get-TurnProc | Out-Null
       $tp = $script:turnProc
-      $tp.Replay = $true
       if ($tp.At0 -le 0) { $tp.At0 = $at }
       $rn = Add-ReasoningBlock
-      # 一轮里几段思考接着往同一张条里写（Add-ReasoningBlock 已补过段间空行）
-      $rn.Body.Text = $rn.Body.Text + (Clip-LongText ([string]$ev.reasoning) $script:reasonFoldChars)
+      # 正文先挂着不渲染（Pending）：收起时只要一行摘要，点开这一条时才写进 TextBlock。
+      # 几十段思考一次性铺满整棵树，切会话那一下会明显卡一下，而且马上又要收起来。
+      $rn.Pending = (Clip-LongText ([string]$ev.reasoning) $script:reasonFoldChars)
       $rn.Secs = [math]::Round(([double]$ev.ms) / 1000.0, 1)
       Complete-Reasoning
     }
@@ -3000,6 +3045,7 @@ function Render-ReplayEvent($ev) {
     Get-TurnProc | Out-Null
     $tp = $script:turnProc
     $tp.Replay = $true
+    Set-TurnProcCollapsed $tp
     if ($tp.At0 -le 0) { $tp.At0 = $at }
     # 历史里只存了入参和结果：摘要取自关键字段，展开区放完整参数
     $sum = ''

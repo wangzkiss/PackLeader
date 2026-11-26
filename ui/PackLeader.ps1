@@ -2131,6 +2131,9 @@ function Render-Markdown($hostPanel, [string]$text) {
     }
     $chunk = New-Object System.Collections.ArrayList
     while ($i -lt $n -and $lines[$i] -notmatch '^\s*```') {
+      # 表格起始行也要断开：否则整张表被当成普通段落吞进来，竖线原样画出来。
+      # 判断条件与上面表格分支保持一致（本条含 | 且下一行是 |---| 分隔行）。
+      if ($lines[$i] -match '\|' -and ($i + 1) -lt $n -and ([string]$lines[$i + 1]) -match $script:tableRuleRe) { break }
       [void]$chunk.Add([string]$lines[$i])
       $i++
     }
@@ -2200,6 +2203,9 @@ function New-TableCard($rows, [int]$headerRows) {
       }
       if ($len -gt $max) { $max = $len }
     }
+    # 每格左右各 10px 的 Margin 不参与上面的字符宽度估算，按字号折算成字符宽补回来，
+    # 否则「行数」这种两字窄列拿到的星号比例不够，会被挤成一字一行。
+    $max += 1.6
     if ($max -gt 40) { $max = 40 }
     $w[$c] = $max
   }

@@ -11,8 +11,8 @@ npm run demo               # 离线 demo，不需要 API Key
 
 - 命令行：单次执行 / 交互模式 / 审计 / 撤销 / 会话列表
 - 桌面窗口：`pl gui`，原生 WPF 窗口（.NET Framework 4.8 + Windows PowerShell 5.1，系统自带），不是 Electron、没有 web 服务和端口
-- 21 个工具，含跨会话记忆（`remember`，按工作目录分文件，界面上可撤销）
-- 安装包：338 KB 自解压 exe + 92 KB 便携版，不含 Node 运行时
+- 23 个工具，含跨会话记忆（`remember`，按工作目录分文件，界面上可撤销）和截图验证（`screenshot` / `view_image`）
+- 安装包：684 KB 自解压 exe + 216 KB 便携版，不含 Node 运行时
 
 ---
 
@@ -21,17 +21,20 @@ npm run demo               # 离线 demo，不需要 API Key
 ### Agent 主循环
 turn → step → tool batch，事件全量落盘，`--max-steps` 保护；步数用尽时强制收尾作答，不会只留一堆工具日志没有结论。
 
-### 21 个工具
+### 23 个工具
 
 | 类别 | 工具 |
 |---|---|
 | 文件 | `read` `write` `edit` `glob` `grep` `list` `find` `outline` `stat` `hash` `move` `remove` |
 | 运行时 | `shell` `logtail` `processlist` `netprobe` `sysstat` `waitfor` |
+| 界面 | `screenshot`（截窗口/整屏，可选先点一下再截）`view_image`（把图片交回给模型看） |
 | 便签 | `todo_write`（界面画成「执行方案」清单，反复写就原地更新进度） |
 | 交互 | `ask`（向用户提一个选择题，界面画成选项卡） |
 | 记忆 | `remember`（写进 `<数据目录>/memory/<cwd 指纹>.jsonl`，下一轮起进系统提示；界面上带「撤销」） |
 
 工具结果超长会截断（head 60% / tail 25%），完整输出落到 `spill/` 并给出路径。
+
+**截图验证界面**：`screenshot` 用 Windows 自带的 PowerShell + System.Drawing + `PrintWindow` 截窗口（也可以 `target=screen` 截整屏），PNG 落在 `<数据目录>/shots/`，太宽的图会先等比缩到 1600 宽（`max_width` 可调）；`click:"x,y"` 可以先在窗口内点一下（展开菜单、切标签）再截。图片不进 `session.jsonl`（日志里只有路径，二进制请求前才读成 base64），下一轮请求时作为一条 `user` 消息跟在 `tool` 结果后面交回给模型——tool 消息正文只能放文本，图得单给，但又不能插在 `tool_calls` 与 `tool` 中间。关掉「模型支持看图」时只保留路径、不塞 base64。`view_image` 用来把设计稿、已有的截图交给模型看（`read` 读图片是二进制乱码，别用它）。
 
 只读工具（`permission: 'read'`）在同一批里并行跑，写类工具独占执行；落盘顺序仍按模型给的顺序，保证 `tool` 消息和 `tool_calls` 对齐。
 
@@ -173,13 +176,13 @@ dist\PackLeader-Setup-0.1.0.exe --uninstall /S # 静默卸载
 
 | 产物 | 大小 | 说明 |
 |---|---|---|
-| `dist/PackLeader-Setup-0.1.0.exe` | 338 KB | 安装包：自解压 + 开始菜单 / 桌面快捷方式 + 注册卸载项，带安装界面，支持 `/S` 静默 |
-| `dist/PackLeader-0.1.0-portable.zip` | 92 KB | 便携版：解压即用，双击 `PackLeader.exe` 开窗口 |
+| `dist/PackLeader-Setup-0.1.0.exe` | 684 KB | 安装包：自解压 + 开始菜单 / 桌面快捷方式 + 注册卸载项，带安装界面，支持 `/S` 静默 |
+| `dist/PackLeader-0.1.0-portable.zip` | 216 KB | 便携版：解压即用，双击 `PackLeader.exe` 开窗口 |
 
-装完占 277 KB（25 个文件），**不含 Node 运行时**，复用系统 Node。
+装完占约 1.28 MB（35 个文件 = 负载 623 KB + `Uninstall.exe` 684 KB），**不含 Node 运行时**，复用系统 Node。
 
 - 构建脚本：`scripts/build-dist.ps1`，只用系统自带的东西——`csc.exe`（.NET Framework 4.8）编译启动器和安装包，图标脚本现画，负载用自定义容器（`payload.bin`，不压缩，省一个 Compression 引用）嵌进安装包，**不需要 NSIS / Inno / WiX**。
-- 负载只带运行时需要的东西：`package.json` `README.md` `src/` `ui/` + 编译出来的 `PackLeader.exe`。
+- 负载只带运行时需要的东西：`package.json` `README.md` `src/` `ui/` + 编译出来的 `PackLeader.exe`；`*.bak` / `*.orig` / `*.map` / `*.log` 这类备份与调试残留会被跳过，不进包。
 - 安装包的行为：先关掉正在运行的旧实例（否则覆盖安装 `IOException`）、文件被占用时改名再写、写 `HKCU` 卸载项、建开始菜单 / 桌面快捷方式。
 - 卸载：应用和功能、开始菜单右键、或双击安装目录里的 `Uninstall.exe`（按「文件名 + 参数」识别，弹出的是卸载界面）。默认保留会话记录和 `config.json`，勾选「同时删除会话记录和配置」才清 `%USERPROFILE%\.packleader` + `%LOCALAPPDATA%\PackLeader`。
 
@@ -187,7 +190,7 @@ dist\PackLeader-Setup-0.1.0.exe --uninstall /S # 静默卸载
 
 | 方案 | 安装包 | 前提 |
 |---|---|---|
-| 启动器 + 系统 Node（当前） | 338 KB | 需 Node ≥ 22.18 |
+| 启动器 + 系统 Node（当前） | 684 KB | 需 Node ≥ 22.18 |
 | Node SEA 单文件 | 30–33 MB | 无 |
 | Rust / Tauri 重写引擎 | 9–12 MB | 无 |
 

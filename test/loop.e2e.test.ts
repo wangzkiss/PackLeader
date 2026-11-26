@@ -6,7 +6,7 @@ import { test } from 'node:test'
 import { Audit } from '../src/core/audit.ts'
 import { ApprovalBroker } from '../src/core/approval.ts'
 import { Checkpoints } from '../src/core/checkpoint.ts'
-import { Agent } from '../src/core/loop.ts'
+import { Agent, type Renderer } from '../src/core/loop.ts'
 import { Policy } from '../src/core/policy.ts'
 import { Session } from '../src/core/session.ts'
 import type { Mode } from '../src/core/types.ts'
@@ -14,7 +14,10 @@ import { OpenAiClient } from '../src/llm/openai.ts'
 import { createDefaultTools } from '../src/tools/index.ts'
 import { startFakeLlm, type ScriptStep } from './fake-llm.ts'
 
-async function setup(steps: ScriptStep[], opts: { mode?: Mode; approval?: 'ask' | 'allow' | 'deny' } = {}) {
+async function setup(
+  steps: ScriptStep[],
+  opts: { mode?: Mode; approval?: 'ask' | 'allow' | 'deny'; renderer?: Renderer } = {},
+) {
   const root = await mkdtemp(join(tmpdir(), 'pl-e2e-'))
   const dataDir = await mkdtemp(join(tmpdir(), 'pl-data-'))
   const llmServer = await startFakeLlm(steps)
@@ -35,6 +38,7 @@ async function setup(steps: ScriptStep[], opts: { mode?: Mode; approval?: 'ask' 
     checkpoints: new Checkpoints(join(dataDir, 'ckpt')),
     audit,
     dataDir,
+    ...(opts.renderer ? { renderer: opts.renderer } : {}),
   })
   const close = async () => {
     audit.close()
@@ -170,13 +174,14 @@ test('e2e: 模型编出不存在的工具，也进审计（unknown-tool）', asy
 })
 
 test('e2e: 到步数上限会强制收尾（不给工具，逼出答案）', async () => {
+  const notices: string[] = []
   const s = await setup(
     [
       { toolCalls: [{ name: 'read', args: { path: 'a.txt' } }] },
       { toolCalls: [{ name: 'read', args: { path: 'a.txt' } }] },
       { text: '基于已读到的内容，结论是……' },
     ],
-    { mode: 'read-only', approval: 'allow' },
+    { mode: 'read-only', approval: 'allow', renderer: { onNotice: (t) => notices.push(t) } },
   )
   try {
     const agent = s.agent
@@ -189,6 +194,32 @@ test('e2e: 到步数上限会强制收尾（不给工具，逼出答案）', asy
     const last = s.llmServer.requests.at(-1)!
     assert.equal(last.tools, undefined)
     assert.ok(last.messages.at(-1).content.includes('步数已达上限'))
+    // 到上限只提示一次（不再另发一条「本轮停止」）
+    assert.equal(notices.filter((t) => t.includes('步数上限')).length, 1, '到步数上限只该提示一次')
+    assert.match(notices.find((t) => t.includes('步数上限'))!, /转入收尾/)
+  } finally {
+    await s.close()
+  }
+})
+
+test('e2e: 预算将尽时每步提醒还剩几步，提醒只进请求、不进历史', async () => {
+  const four = Array.from({ length: 4 }, () => ({ toolCalls: [{ name: 'read', args: { path: 'a.txt' } }] }))
+  const s = await setup([...four, { text: '读完了' }], { mode: 'read-only', approval: 'allow' })
+  try {
+    // maxSteps=8 → 剩 5 步起提醒：第 3 步（剩 5）与第 4 步（剩 4）带提醒
+    // @ts-expect-error 测试里直接调窄 maxSteps
+    s.agent.opts.maxSteps = 8
+    const r = await s.agent.runTurn('把 a.txt 读四遍')
+    assert.equal(r.reason, 'done')
+    const tail = (i: number) => String(s.llmServer.requests[i]!.messages.at(-1).content ?? '')
+    assert.ok(!tail(0).includes('还剩'), '预算充足时不该提醒')
+    assert.match(tail(3), /还剩 4 步/)
+    assert.match(tail(3), /开始收尾|必须收尾/)
+    // 提醒是临时插进请求的，不落会话历史（回放干净）
+    const inHistory = s.session.events.filter(
+      (e) => e.kind === 'user/message' && typeof (e as { text?: string }).text === 'string' && (e as { text: string }).text.includes('还剩'),
+    )
+    assert.equal(inHistory.length, 0)
   } finally {
     await s.close()
   }

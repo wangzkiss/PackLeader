@@ -64,6 +64,8 @@ export interface AgentOptions {
   maxContextChars?: number
   /** 提问通道（GUI 注入；没有时 ask 工具会如实说没通道） */
   ask?: Asker
+  /** 模型能不能看图（关掉时截图只给路径、不读 base64），默认开 */
+  vision?: boolean
 }
 
 export interface TurnResult {
@@ -77,6 +79,14 @@ export interface TurnResult {
 // 提到 100 步，仍然有硬上限，不会无限跑。命令行 --max-steps 可覆盖。
 const DEFAULT_MAX_STEPS = 100
 const DEFAULT_MAX_OUTPUT = 64 * 1024
+
+/**
+ * 预算提醒窗口：剩余步数进到这个范围，每次请求末尾都提一句还剩几步（100 步 → 15 步）。
+ * 提前打招呼，模型会自己收尾；不提醒的话它一路调工具，到第 maxSteps 步被硬掰断，任务停在半截。
+ */
+function budgetWarnAt(maxSteps: number): number {
+  return Math.min(20, Math.max(5, Math.round(maxSteps * 0.15)))
+}
 /** 上下文压缩阈值：估算字符数超了就把早期的工具结果压成摘要 */
 const DEFAULT_MAX_CONTEXT = 240_000
 
@@ -161,6 +171,7 @@ export class Agent {
   private systemPrompt(): string {
     const { policy, tools } = this.opts
     const base = this.opts.systemPrompt ?? ''
+    const budgetMax = this.opts.maxSteps ?? DEFAULT_MAX_STEPS
     return [
       base,
       base ? '' : '你是一个在本机工作的软件工程助手。',
@@ -175,11 +186,13 @@ export class Agent {
       '2. 不要凭记忆猜文件内容，用 read；不要猜路径，用 glob/grep。',
       '3. 命令输出很长时自己挑重点，不要把整段贴回用户。',
       '4. 任务完成后给结论和验证方式，不要罗列过程。',
-      `5. 预算意识：单轮最多 ${this.opts.maxSteps ?? DEFAULT_MAX_STEPS} 步，到上限会被强制收尾。` +
+      `5. 预算意识：单轮最多 ${budgetMax} 步。剩 ${budgetWarnAt(budgetMax)} 步以内时，每次请求末尾都会提醒你还有几步，` +
+        '那时立刻转入收尾——不再开新的探查，把已经改动的东西确认到可交付状态，把结论写出来。' +
         '证据够了就回答，不要为了“更全面”无限探索。',
       '6. 大文件别整篇翻：先用 grep 定位行号，再 read 带 offset/limit 精确取几段。同一个文件反复分页读通常说明该换搜索词了。',
       '7. 边界只管写和执行：读可以用绝对路径读 workspace 外的文件（全局配置、依赖源码、系统日志都行），写/删/执行才限制在工作目录内。',
       '8. 一件事要好几步做完（改多处、排查完再修、跨文件重构）时，先用 todo_write 写下执行方案（3–6 条、每条一句话），做完一条就更新一次；一两步的小事不用写。',
+      '9. 改界面要自己看一眼：构建成功、退出码 0 都不等于界面变对了。用 screenshot 截一张（可以先 click 展开菜单/切标签），对照预期逐条看图；用户给了设计稿/截图就先用 view_image 看一遍再动手，每改一轮重新截、重新对照。',
       '',
       '可用工具：',
       tools.describe(),
@@ -189,7 +202,7 @@ export class Agent {
   }
 
   private messages(): LlmMessage[] {
-    const history = this.opts.session.deriveMessages()
+    const history = this.opts.session.deriveMessages({ vision: this.opts.vision })
     // 长会话别把窗口撑爆：早期工具结果压成摘要，最近几条原样留着
     const { messages } = compactMessages(history, this.opts.maxContextChars ?? DEFAULT_MAX_CONTEXT)
     return [{ role: 'system', content: this.systemPrompt() }, ...messages]
@@ -385,6 +398,7 @@ export class Agent {
         ms: Date.now() - t0,
         meta: out.meta,
         data: out.data,
+        images: out.images,
       }
     } catch (e) {
       result = { ok: false, content: `工具执行失败：${(e as Error).message}`, ms: Date.now() - t0 }
@@ -419,6 +433,7 @@ export class Agent {
     const { session, llm, renderer, audit, policy, tools } = this.opts
     const turn = session.nextTurn()
     const maxSteps = this.opts.maxSteps ?? DEFAULT_MAX_STEPS
+    const warnAt = budgetWarnAt(maxSteps)
 
     await session.append({ kind: 'turn/start', turn })
     await session.append({ kind: 'user/message', text: userText, ...(files?.length ? { files } : {}) })
@@ -452,6 +467,19 @@ export class Agent {
         renderer?.onStepStart?.(step)
 
         const messages = this.messages()
+        // 预算将尽：在本次请求末尾临时插一条提醒（不落历史，会话回放不受影响）。
+        // 目的是让它自己转入收尾，而不是一路调工具、到第 maxSteps 步被硬掰断。
+        const stepsLeft = maxSteps - i
+        // 最后一步（剩 0 步）不插：紧接着就强制收尾，插了只是噪音
+        if (stepsLeft > 0 && stepsLeft <= warnAt) {
+          messages.push({
+            role: 'user',
+            content:
+              stepsLeft <= 3
+                ? `[系统] 只剩 ${stepsLeft} 步：现在必须收尾，不要再调用工具，直接用这一条消息给出最终结论——做了什么、验证结果如何、还差什么。`
+                : `[系统] 本轮预算还剩 ${stepsLeft} 步（上限 ${maxSteps} 步）。开始收尾：不再开新的探查，把改动确认到可交付状态，把结论整理好。`,
+          })
+        }
         const res = await llm.chat({
           messages,
           tools: tools.schemas(),
@@ -549,6 +577,7 @@ export class Agent {
               truncated: result.truncated,
               spill: result.spill,
               ms: result.ms,
+              images: result.images,
             })
           }
         }
@@ -556,15 +585,17 @@ export class Agent {
 
         if (i === maxSteps) {
           reason = 'max-steps'
-          renderer?.onNotice?.(`已达单轮步数上限（${maxSteps}），让模型基于现有信息收尾`)
+          renderer?.onNotice?.(
+            `已达单轮步数上限（${maxSteps} 步），转入收尾：不再调用工具，下面这条是模型的收尾结论`,
+          )
           // 收尾：不给工具，逼它把已经看到的东西整理成答案（生产 agent 的常见做法）
           const wrapMessages: LlmMessage[] = [
             ...this.messages(),
             {
               role: 'user',
               content:
-                `[系统] 本轮步数已达上限（${maxSteps}），不能再调用工具。` +
-                '请直接基于上面已获得的信息给出最终回答；信息不足的地方明确说明缺什么、下一步该查哪。',
+                `[系统] 本轮步数已达上限（${maxSteps} 步），不能再调用工具。` +
+                '请直接基于上面已获得的信息给出最终回答：先说做完了什么、验证结果如何，再说没做完的部分和下一步该查哪——没有再调工具的机会了。',
             },
           ]
           const wrap = await llm.chat({
@@ -629,9 +660,6 @@ export class Agent {
 
     await session.append({ kind: 'turn/end', turn, reason })
     this.syncAudit()
-    if (reason === 'max-steps') {
-      renderer?.onNotice?.(`已达单轮步数上限（${maxSteps}），本轮停止`)
-    }
     return { text: finalText, steps, toolCalls: totalCalls, reason }
   }
 

@@ -54,6 +54,9 @@ try {
   Copy-Item (Join-Path $root 'README.md') $stage
   Copy-Item (Join-Path $root 'src') $stage -Recurse
   Copy-Item (Join-Path $root 'ui') $stage -Recurse
+  # 清掉不该进包的东西：编辑器/调参留下的备份、map、隐藏文件
+  Get-ChildItem $stage -Recurse -File -Force -Include '*.bak', '*.orig', '*.rej', '*.map', '*.log', '.DS_Store', 'Thumbs.db' |
+    ForEach-Object { Write-Host ('  跳过 {0}' -f $_.FullName.Substring($stage.Length + 1)); Remove-Item $_.FullName -Force }
 
   # ---------- 3. 启动器 ----------
   & $csc /nologo /target:winexe /codepage:65001 /optimize+ /platform:anycpu "/win32icon:$icon" "/out:$stage\PackLeader.exe" (Join-Path $root 'build\launcher.cs')

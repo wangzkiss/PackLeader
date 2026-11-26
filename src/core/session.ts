@@ -12,7 +12,7 @@ import { appendFile, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { EventInput, SessionEvent } from './events.ts'
-import type { LlmMessage } from './types.ts'
+import type { ImagePart, LlmMessage } from './types.ts'
 
 /** 会话元信息：不进入 session.jsonl，避免污染模型历史投影 */
 export interface SessionMeta {
@@ -257,11 +257,48 @@ export class Session {
     return n + 1
   }
 
-  /** 模型历史：只由持久事件投影，绝不额外拼装 */
-  deriveMessages(): LlmMessage[] {
+  /**
+   * 模型历史：只由持久事件投影，绝不额外拼装。
+   *
+   * 工具产出的截图（tool/result.images）会被投影成紧跟这批工具结果之后的一条 user 消息：
+   * tool 消息只能放文本，图片得单独给；但又不能插在 tool_calls → tool 中间（顺序一乱模型就串台），
+   * 所以先攒着，等下一批 tool/result 结束才 flush。
+   * vision === false 时只给路径、不读 base64（给不支持看图的模型时不能硬塞图片）。
+   */
+  deriveMessages(opts: { vision?: boolean } = {}): LlmMessage[] {
     const out: LlmMessage[] = []
+    const pendingPaths: string[] = []
+    const pendingImages: ImagePart[] = []
+    const flushShots = (): void => {
+      if (!pendingPaths.length) return
+      const paths = pendingPaths.splice(0).join('、')
+      const images = pendingImages.splice(0)
+      out.push({
+        role: 'user',
+        content: images.length ? `[截图] 上面工具产出的图片（${paths}）。` : `[截图] 已存到 ${paths}（设置里关掉了看图，图片没有发给模型）。`,
+        ...(images.length ? { images } : {}),
+      })
+    }
     for (const e of this.events) {
-      if (e.kind === 'user/message') {
+      if (e.kind === 'tool/result') {
+        out.push({
+          role: 'tool',
+          toolCallId: e.callId,
+          content: e.truncated ? `${e.content}\n[输出已截断，完整内容见 ${e.spill ?? 'spill 文件'}]` : e.content,
+        })
+        for (const img of e.images ?? []) {
+          pendingPaths.push(img.path)
+          if (opts.vision === false) continue
+          try {
+            pendingImages.push({ mime: img.mime, dataBase64: readFileSync(img.path).toString('base64') })
+          } catch {
+            // 截图文件被删了：路径还在，模型至少知道曾经截过一张
+          }
+        }
+      } else {
+        // 一批 tool/result 到此结束，截图可以补上了
+        flushShots()
+        if (e.kind === 'user/message') {
         // 图片存在 attachment 目录里，请求前才读成 base64：日志里不存二进制
         const images = (e.files ?? [])
           .filter((f) => f.mime.startsWith('image/'))
@@ -274,15 +311,11 @@ export class Session {
           })
           .filter((x): x is { mime: string; dataBase64: string } => x !== null)
         out.push({ role: 'user', content: e.text, ...(images.length ? { images } : {}) })
-      } else if (e.kind === 'assistant/message')
-        out.push({ role: 'assistant', content: e.text, toolCalls: (e.toolCalls ?? []).length ? e.toolCalls : undefined })
-      else if (e.kind === 'tool/result')
-        out.push({
-          role: 'tool',
-          toolCallId: e.callId,
-          content: e.truncated ? `${e.content}\n[输出已截断，完整内容见 ${e.spill ?? 'spill 文件'}]` : e.content,
-        })
+        } else if (e.kind === 'assistant/message')
+          out.push({ role: 'assistant', content: e.text, toolCalls: (e.toolCalls ?? []).length ? e.toolCalls : undefined })
+      }
     }
+    flushShots()
     return out
   }
 }

@@ -452,7 +452,7 @@ async function main(): Promise<void> {
   const { Audit } = await import('./core/audit.ts')
   const audit = await Audit.open(join(cfg.dataDir, 'audit.sqlite'))
   const checkpoints = new Checkpoints(join(cfg.dataDir, 'ckpt'))
-  const tools = createDefaultTools({ root: cfg.root })
+  const tools = createDefaultTools({ root: cfg.root, dataDir: cfg.dataDir })
   const llm = new OpenAiClient({ baseURL: cfg.baseURL, apiKey: cfg.apiKey, model: cfg.model, ...cfg.llmTimeouts })
   const policy = new Policy(cfg.root, cfg.mode)
 

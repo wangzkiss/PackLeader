@@ -227,7 +227,7 @@ async function main(): Promise<void> {
   const checkpoints = new Checkpoints(join(opts.dataDir, 'ckpt'))
   // 记忆按工作目录分文件；切 cwd 时要重建，否则会往上一个仓库的记忆文件里写
   let memory = new MemoryStore(opts.dataDir, opts.root)
-  let tools = createDefaultTools({ root: opts.root, memory })
+  let tools = createDefaultTools({ root: opts.root, dataDir: opts.dataDir, memory })
   const llm = new OpenAiClient({ baseURL: opts.baseURL, apiKey: opts.apiKey, model: opts.model, ...opts.llmTimeouts })
   const policy = new Policy(opts.root, opts.mode)
 
@@ -266,7 +266,7 @@ async function main(): Promise<void> {
     policyOf(session).setRoot(dir)
     // 记忆按目录分文件；工具都相对 root 定位（原来是 cwd 命令里内联写死的，抽出来复用）
     memory = new MemoryStore(opts.dataDir, dir)
-    tools = createDefaultTools({ root: dir, memory })
+    tools = createDefaultTools({ root: dir, dataDir: opts.dataDir, memory })
   }
   /** 切会话时调到该会话的目录，并把目录定下来（老会话首次打开就写进 meta.json） */
   const adoptSessionRoot = async (s: Session): Promise<void> => {
@@ -352,6 +352,8 @@ async function main(): Promise<void> {
         error: result.ok ? '' : result.content.slice(0, 500),
         // 结构化结果：界面据此画专用卡片（todo → 计划卡）
         data: result.data,
+        // 工具产出的图片（截图）：界面可以画缩略图，模型那边走 give-back
+        images: result.images ?? [],
       })
     },
     onVerifyStart: (label, round) => send({ type: 'verify-start', label, round }),
@@ -397,6 +399,8 @@ async function main(): Promise<void> {
       verify: opts.noVerify ? null : opts.verify === '' ? undefined : { label: opts.verify },
       systemPrompt: memoryPrompt(await memory.all()),
       ask: (req) => asker.ask(req),
+      // 关掉看图时，截图只给路径、不读 base64
+      vision: opts.vision,
     })
 
   let agent = await buildAgent()

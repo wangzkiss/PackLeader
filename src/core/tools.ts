@@ -5,7 +5,7 @@
  * run() 只负责「做这件事」，超时/截断/审批/审计都在外层流水线统一处理。
  */
 
-import type { Permission, ToolResult, ToolSchema } from './types.ts'
+import type { ImageRef, Permission, ToolResult, ToolSchema } from './types.ts'
 
 /** 向用户提问：question + 2-4 个选项；返回选中的那一项，没作答返回 null */
 export interface AskRequest {
@@ -18,6 +18,8 @@ export type Asker = (req: AskRequest) => Promise<string | null>
 export interface ToolContext {
   root: string
   spillDir: string
+  /** 数据目录（截图等产出的文件放这里）；工具单独测试时可能没有 */
+  dataDir?: string
   maxOutputBytes: number
   signal?: AbortSignal
   /** 会话内已读文件（供「先读后写」提示，不强制） */
@@ -32,6 +34,8 @@ export interface ToolOutcome {
   meta?: Record<string, unknown>
   /** 结构化结果（给界面画专用卡片，比如 todo 的 items） */
   data?: unknown
+  /** 工具产出的图片（只给支持视觉的模型用）：下一轮会作为 image part 交回去 */
+  images?: ImageRef[]
 }
 
 export interface Tool {

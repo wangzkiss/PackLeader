@@ -7,7 +7,7 @@
  *  - 审批是审计事件（approval/asked → approval/decided），模型看不到过程
  */
 
-import type { Attachment, Decision, ToolCall } from './types.ts'
+import type { Attachment, Decision, ImageRef, ToolCall } from './types.ts'
 
 export type EventPayload =
   | { kind: 'session/start'; id: string; cwd: string; model: string; baseURL: string; mode: string; version: string }
@@ -28,6 +28,8 @@ export type EventPayload =
       truncated?: boolean
       spill?: string
       ms: number
+      /** 工具产出的图片（截图）：只记路径，请求前才读成 base64 */
+      images?: ImageRef[]
     }
   | { kind: 'step/end'; turn: number; step: number; toolCalls: number }
   | { kind: 'verify/start'; turn: number; round: number; label: string }

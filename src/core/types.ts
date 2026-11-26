@@ -36,6 +36,16 @@ export interface ImagePart {
   dataBase64: string
 }
 
+/**
+ * 工具产出的图片（截图 / 看图）：和附件一样只记路径，请求前才读成 base64。
+ * 落进 session.jsonl 的只有路径，日志里永远不存二进制。
+ */
+export interface ImageRef {
+  path: string
+  mime: string
+  bytes?: number
+}
+
 /** 用户带进来的附件：拷贝到数据目录后只记路径，不把内容塞进日志 */
 export interface Attachment {
   name: string
@@ -68,6 +78,8 @@ export interface ToolResult {
   meta?: Record<string, unknown>
   /** 结构化结果（给界面画专用卡片用，比如计划卡读 todo 的 items） */
   data?: unknown
+  /** 工具产出的图片：下一轮请求里会作为 image part 交回给模型看 */
+  images?: ImageRef[]
 }
 
 /** 审批结果词汇：一次性 / 本会话内对同类操作不再问 / 拒绝 / 无通道 / 取消 */

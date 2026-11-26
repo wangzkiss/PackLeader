@@ -1026,7 +1026,7 @@ function Add-MemoryCard([object]$items) {
 }
 
 function Add-AssistantMessage {
-  $sp = Add-Container 16
+  $sp = Add-Container 10
   $head = New-Text $script:modelName 10.5 '#7C838E' 'Normal' 'Segoe UI' 4
   $sp.Children.Add($head) | Out-Null
   # 正文宿主：流式时里面只有一个 TextBlock，回答结束时整体重绘成
@@ -1321,6 +1321,8 @@ function Close-TurnProc {
   $script:toolGroup = $null
   Update-TurnProc $t
   $script:turnProc = $null
+  # 这一轮定格了：底部胶囊跟着收起来（常驻模式下它也挂在消息流最下面）
+  Update-BottomPill
 }
 
 # ---------------------------------------------------------------- 工具调用分组
@@ -1358,7 +1360,9 @@ function Update-ToolGroup($g) {
   foreach ($k in $g.Order) { $parts += ("$k ×" + $g.Counts[$k]) }
   $sum = ($parts -join ' · ')
   if ($g.Failed -gt 0) { $sum = $(if ($sum) { "$sum · $($g.Failed) 失败" } else { "$($g.Failed) 失败" }) }
-  if ($sum.Length -gt 64) { $sum = $sum.Substring(0, 64) + '…' }
+  # 窄窗口下别铺出去：右侧统计按实际宽度截（左边标题占 200 出头）
+  $maxChars = Get-RowChars 210 6.6
+  if ($sum.Length -gt $maxChars) { $sum = $sum.Substring(0, $maxChars) + '…' }
   $g.Sum.Text = $sum
   $g.Sum.Foreground = $(if ($g.Failed -gt 0) { Brush '#F87171' } else { Brush '#6B7280' })
 }
@@ -1455,6 +1459,16 @@ $script:bottomPill = $null
 $script:liveCalls = @{}
 $script:liveSeq = 0
 
+# 一行能放多少字：按聊天区实际宽度估（中英混排约 7px 一个字），
+# 留给左边标题/箭头多少由调用方给。窄窗口下摘要和工具统计靠它截断，
+# 不然 TextBlock 会按内容宽度钺出去，被 ScrollViewer 硬裁掉（连省略号都没）。
+function Get-RowChars([double]$reservePx = 200, [double]$perChar = 7) {
+  $w = 0
+  if ($Scroller) { $w = $Scroller.ActualWidth }
+  if ($w -le 0) { $w = 900 }
+  return [int][math]::Max(16, [math]::Floor(($w - $reservePx) / $perChar))
+}
+
 function Get-BottomPill {
   if ($script:bottomPill) { return $script:bottomPill }
 
@@ -1510,6 +1524,15 @@ function Reset-LiveCalls {
   Update-BottomPill
 }
 
+# 把胶囊挪到消息流最末：这一轮后面新加的卡片会插到它后面
+function Move-BottomPillToEnd($p) {
+  $hostPanel = $script:renderHost
+  if ($hostPanel -and $p.Border.Parent -eq $hostPanel -and $hostPanel.Children.IndexOf($p.Border) -ne ($hostPanel.Children.Count - 1)) {
+    $hostPanel.Children.Remove($p.Border) | Out-Null
+    $hostPanel.Children.Add($p.Border) | Out-Null
+  }
+}
+
 function Update-BottomPill {
   $p = Get-BottomPill
   $cur = $null
@@ -1517,19 +1540,26 @@ function Update-BottomPill {
     $c = $script:liveCalls[$k]
     if (-not $cur -or $c.Seq -lt $cur.Seq) { $cur = $c }
   }
-  if (-not $cur) {
-    $p.Border.Visibility = 'Collapsed'
+  if ($cur) {
+    $secs = ((Get-Date) - $cur.T0).TotalSeconds
+    $p.Text.Text = '执行 ' + $cur.Name + ' · 用时 ' + (Format-Elapsed $secs) + '…'
+    $p.Border.Visibility = 'Visible'
+    Move-BottomPillToEnd $p
     return
   }
-  $secs = ((Get-Date) - $cur.T0).TotalSeconds
-  $p.Text.Text = '执行 ' + $cur.Name + ' · 用时 ' + (Format-Elapsed $secs) + '…'
-  $p.Border.Visibility = 'Visible'
-  # 永远贴着最下面：这一轮后面新加的卡片会插到它后面，把它挪回来
-  $hostPanel = $script:renderHost
-  if ($hostPanel -and $p.Border.Parent -eq $hostPanel -and $hostPanel.Children.IndexOf($p.Border) -ne ($hostPanel.Children.Count - 1)) {
-    $hostPanel.Children.Remove($p.Border) | Out-Null
-    $hostPanel.Children.Add($p.Border) | Out-Null
+  # 没有工具在跑、但这一轮还没结束：胶囊改报当前动作（思考中 / 回答中）和本轮用时，
+  # 长任务里它就一直在，不会等到有工具跑才闪一下
+  $tp = $script:turnProc
+  if ($tp -and -not $tp.Done) {
+    $verb = ([string]$script:thinkVerb) -replace '…$', ''
+    if (-not $verb) { $verb = '思考中' }
+    $secs = ((Get-Date) - $tp.T0).TotalSeconds
+    $p.Text.Text = $verb + ' · 用时 ' + (Format-Elapsed $secs) + '…'
+    $p.Border.Visibility = 'Visible'
+    Move-BottomPillToEnd $p
+    return
   }
+  $p.Border.Visibility = 'Collapsed'
 }
 
 function Add-ToolLine([string]$name, [string]$summary, [string]$argsText = '') {
@@ -1621,8 +1651,10 @@ function Update-ReasoningHeader($n) {
   $n.Time.Text = $(if ($n.Open) { '▾' } else { '▸' })
   # 收起时右边只挂一行摘要：想完了取这一段的开头，还在想就取最新那一小段（单行、超长截断）
   $s = Get-ReasonSegText $n
-  if ($s.Length -gt 110) {
-    if ($n.Done) { $s = $s.Substring(0, 110) + '…' } else { $s = '…' + $s.Substring($s.Length - 110) }
+  # 截多少字看窗口实际宽度（窄窗口下 110 字会铺到窗口外被硬裁）
+  $maxChars = Get-RowChars 230 7
+  if ($s.Length -gt $maxChars) {
+    if ($n.Done) { $s = $s.Substring(0, $maxChars) + '…' } else { $s = '…' + $s.Substring($s.Length - $maxChars) }
   }
   $n.Sum.Text = $s
   $n.Sum.Visibility = $(if ($n.Open) { 'Collapsed' } else { 'Visible' })
@@ -4870,7 +4902,7 @@ $timer.Add_Tick({
         Update-ThinkRow $script:thinkVerb
         Update-ReasoningTime $script:reasonNode
         # 底部胶囊的「用时」也走这一拍（只改一行字，不重排整段）
-        if ($script:liveCalls.Count -gt 0) { Update-BottomPill }
+        Update-BottomPill
         $tp = $script:turnProc
         if ($tp -and -not $tp.Done) {
           $tp.Clock.Text = (Format-Clock ((Get-Date) - $tp.T0).TotalSeconds)

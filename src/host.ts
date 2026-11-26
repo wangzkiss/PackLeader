@@ -16,20 +16,22 @@
 import { createInterface } from 'node:readline'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { existsSync } from 'node:fs'
 import { ApprovalBroker, type ApprovalRequest, type Approver } from './core/approval.ts'
 import { Checkpoints } from './core/checkpoint.ts'
 import { Agent, type Renderer } from './core/loop.ts'
 import { Policy } from './core/policy.ts'
 import { Session } from './core/session.ts'
 import { ingestFiles } from './core/attach.ts'
-import { loadSettings, maskKey, saveSettings, visionFrom } from './core/settings.ts'
+import { llmTimeoutsOf, loadSettings, maskKey, saveSettings, visionFrom } from './core/settings.ts'
 import { registerSecret } from './core/redact.ts'
 import type { AskRequest } from './core/tools.ts'
 import { MemoryStore } from './core/memory.ts'
 import type { Attachment, Decision, Mode, ToolCall } from './core/types.ts'
-import { OpenAiClient } from './llm/openai.ts'
+import { LLM_DEFAULT_TIMEOUTS, OpenAiClient } from './llm/openai.ts'
 import { createDefaultTools } from './tools/index.ts'
 import type { Audit } from './core/audit.ts'
+import { PREVIEW_CHARS, TurnTimeline } from './core/timeline.ts'
 
 // 事件归属哪个会话：正在跑的那一轮产生的事件都带上它。
 // 界面据此把「别的会话里跑着的那一轮」认出来（不画进当前聊天区，只提示状态）。
@@ -70,6 +72,8 @@ interface Opts {
   vision: boolean
   /** vision 是否由命令行/环境变量显式指定（否则以 config.json 为准，缺省开） */
   visionSet: boolean
+  /** LLM 三层超时（毫秒）：来自 config.json 的 *Secs，缺省由客户端决定 */
+  llmTimeouts: { firstByteMs?: number; idleMs?: number; timeoutMs?: number }
 }
 
 function parseArgs(argv: string[]): Opts {
@@ -107,6 +111,7 @@ function parseArgs(argv: string[]): Opts {
     // 命令行 --vision / --no-vision 可以强制；没给就先记"未指定"，等读到 config.json 再定
     vision: flags.vision === true || process.env.PL_VISION === '1',
     visionSet: flags.vision === true || flags['no-vision'] === true || process.env.PL_VISION !== undefined,
+    llmTimeouts: {},
   }
 }
 
@@ -212,6 +217,8 @@ async function main(): Promise<void> {
   // 看图：命令行/环境变量没显式指定就听 config.json 的，那里也没有就按默认（开）。
   // 注意这条不能塞进上面的 if：Key 来自环境变量时也得读到用户存过的开关。
   if (!opts.visionSet) opts.vision = visionFrom(saved)
+  // 请求超时同理：config.json 写过就按它，没写过由客户端给默认（首字节 120s / 空闲 180s / 整体 900s）
+  opts.llmTimeouts = llmTimeoutsOf(saved)
 
   const { Audit: AuditClass } = await import('./core/audit.ts')
   const audit: Audit = await AuditClass.open(join(opts.dataDir, 'audit.sqlite'))
@@ -221,8 +228,56 @@ async function main(): Promise<void> {
   // 记忆按工作目录分文件；切 cwd 时要重建，否则会往上一个仓库的记忆文件里写
   let memory = new MemoryStore(opts.dataDir, opts.root)
   let tools = createDefaultTools({ root: opts.root, memory })
-  const llm = new OpenAiClient({ baseURL: opts.baseURL, apiKey: opts.apiKey, model: opts.model })
+  const llm = new OpenAiClient({ baseURL: opts.baseURL, apiKey: opts.apiKey, model: opts.model, ...opts.llmTimeouts })
   const policy = new Policy(opts.root, opts.mode)
+
+  // 会话对象在下面才创建，但下面的 applyRoot / policyOf 都要引用它：先声明、后赋值
+  let session!: Session
+
+  // 每个会话记住自己的工作目录：切会话时工具根跟着它走。
+  // 没记过（老会话）就落到当前默认目录，从此固定在这个会话上。
+  const defaultRoot = opts.root
+
+  // 每个会话一份策略实例：切会话要换 root，而 policy 是共享对象时 setRoot 会波及
+  // 「另一个会话里还跑着的那一轮」，让它按别人的目录判越界。分开之后各用各的。
+  const sessionPolicies = new Map<string, Policy>()
+  /** 会话记的目录；没记过或目录已经不在了 = 用默认目录 */
+  const rootOf = (s: Session): string => {
+    const want = (s.meta.cwd ?? '').trim()
+    return want && existsSync(want) ? want : defaultRoot
+  }
+  const policyOf = (s: Session): Policy => {
+    let p = sessionPolicies.get(s.id)
+    if (!p) {
+      p = new Policy(rootOf(s), policy.mode)
+      sessionPolicies.set(s.id, p)
+    }
+    return p
+  }
+  /** 权限档是全局设置：改一次就该对所有会话生效（包括后台正跑着的那一轮） */
+  const setModeAll = (m: Mode): void => {
+    policy.setMode(m)
+    for (const p of sessionPolicies.values()) p.setMode(m)
+  }
+  /** 换工具根：策略、记忆、工具集都跟着换，之后由调用方重建 agent */
+  const applyRoot = (dir: string): void => {
+    opts.root = dir
+    policy.setRoot(dir)
+    policyOf(session).setRoot(dir)
+    // 记忆按目录分文件；工具都相对 root 定位（原来是 cwd 命令里内联写死的，抽出来复用）
+    memory = new MemoryStore(opts.dataDir, dir)
+    tools = createDefaultTools({ root: dir, memory })
+  }
+  /** 切会话时调到该会话的目录，并把目录定下来（老会话首次打开就写进 meta.json） */
+  const adoptSessionRoot = async (s: Session): Promise<void> => {
+    const want = rootOf(s)
+    if (want !== opts.root) applyRoot(want)
+    if ((s.meta.cwd ?? '').trim() !== want) {
+      await Session.setMeta(opts.dataDir, s.id, { cwd: want })
+      s.meta.cwd = want
+    }
+  }
+
   const approver = new HostApprover()
   const broker = new ApprovalBroker('ask', approver)
 
@@ -234,10 +289,24 @@ async function main(): Promise<void> {
     startedAt: Date.now(),
   })
 
-  let session: Session
   if (opts.session) session = await Session.open(opts.dataDir, opts.session)
   else if (opts.cont) session = (await Session.latest(opts.dataDir)) ?? (await Session.create(opts.dataDir, meta()))
   else session = await Session.create(opts.dataDir, meta())
+
+  // 把这个会话自己的工作目录恢复出来（要在 send(state()) 之前定好，界面一上来就显示对）
+  await adoptSessionRoot(session)
+
+  // 这一轮的时间线：思考块、工具调用、统计（turn-end 报给界面 / 审计）。
+  // 界面自己也实时算同一套数字，这里报一份是为了两边口径一致、也能离线折。
+  let timeline: TurnTimeline | null = null
+  let reasonT0 = 0
+
+  // 思考块到这儿为止：记下这一段花了多久（模型是思考→调工具→再思考，一段一段给）
+  const closeThought = (): void => {
+    if (!reasonT0) return
+    timeline?.closeThought(Date.now() - reasonT0)
+    reasonT0 = 0
+  }
 
   const renderer: Renderer = {
     onTurnStart: (_turn, text, files) => send({ type: 'turn-start', text, files: files ?? [] }),
@@ -245,13 +314,27 @@ async function main(): Promise<void> {
       runningStep = step
       send({ type: 'step', step })
     },
-    onText: (delta) => send({ type: 'text', delta }),
-    onReasoning: (delta) => send({ type: 'reasoning', delta }),
+    onText: (delta) => {
+      // 出正文就是开始回答了，前面那段思考到此为止
+      closeThought()
+      timeline?.answer()
+      send({ type: 'text', delta })
+    },
+    onReasoning: (delta) => {
+      if (!reasonT0) reasonT0 = Date.now()
+      timeline?.reason(delta)
+      send({ type: 'reasoning', delta })
+    },
     onAssistantEnd: (text) => send({ type: 'assistant-end', text }),
     onNotice: (text) => send({ type: 'notice', text }),
-    onToolStart: (call: ToolCall) =>
-      send({ type: 'tool-start', id: call.id, name: call.name, summary: summarizeCall(call.name, call.args), args: call.args }),
-    onToolEnd: (call: ToolCall, result) =>
+    onToolStart: (call: ToolCall) => {
+      closeThought()
+      const summary = summarizeCall(call.name, call.args)
+      timeline?.toolStart(call, summary)
+      send({ type: 'tool-start', id: call.id, name: call.name, summary, args: call.args })
+    },
+    onToolEnd: (call: ToolCall, result) => {
+      timeline?.toolEnd(call.id, { ok: result.ok, ms: result.ms, content: result.content })
       send({
         type: 'tool-end',
         id: call.id,
@@ -259,10 +342,13 @@ async function main(): Promise<void> {
         ok: result.ok,
         ms: result.ms,
         bytes: result.content.length,
+        // 结果开头一段：界面上点开某一行看的就是它（完整内容还在会话日志里）
+        preview: result.content.slice(0, PREVIEW_CHARS),
         error: result.ok ? '' : result.content.slice(0, 500),
         // 结构化结果：界面据此画专用卡片（todo → 计划卡）
         data: result.data,
-      }),
+      })
+    },
     onVerifyStart: (label, round) => send({ type: 'verify-start', label, round }),
     onVerifyEnd: (r, round) =>
       send({
@@ -296,7 +382,7 @@ async function main(): Promise<void> {
       session,
       llm,
       tools,
-      policy,
+      policy: policyOf(session),
       broker,
       checkpoints,
       audit,
@@ -448,6 +534,9 @@ async function main(): Promise<void> {
     runningSession = turnSession.id
     runningStep = 0
     const t0 = Date.now()
+    // 时间线按这一轮的起点算，状态行那颗计时器读的就是它
+    timeline = new TurnTimeline(t0)
+    reasonT0 = 0
     try {
       const r = await turnAgent.runTurn(text, files)
       // 本轮记下的记忆：按时间戳挑出这一轮新写的，落进会话事件（历史回放要用）
@@ -461,10 +550,10 @@ async function main(): Promise<void> {
       } catch (e) {
         send({ type: 'error', message: `记忆收尾失败：${(e as Error).message}` })
       }
-      send({ type: 'turn-end', reason: r.reason, ms: Date.now() - t0, text: r.text })
+      send({ type: 'turn-end', reason: r.reason, ms: Date.now() - t0, text: r.text, stats: timeline?.stats() ?? null })
     } catch (e) {
       send({ type: 'error', message: (e as Error).message })
-      send({ type: 'turn-end', reason: 'error', ms: Date.now() - t0, text: '' })
+      send({ type: 'turn-end', reason: 'error', ms: Date.now() - t0, text: '', stats: timeline?.stats() ?? null })
     } finally {
       running = false
       controller = undefined
@@ -616,7 +705,7 @@ async function main(): Promise<void> {
       case 'mode': {
         const m = String(cmd.mode ?? '') as Mode
         if (['read-only', 'guarded', 'full'].includes(m)) {
-          policy.setMode(m)
+          setModeAll(m)
           send({ type: 'mode', mode: m })
         } else send({ type: 'error', message: `未知权限档：${m}` })
         break
@@ -651,6 +740,11 @@ async function main(): Promise<void> {
         }
         opts.verify = saved.verify ?? ''
         opts.vision = visionFrom(saved)
+        // 超时：文件里删掉了就回到内置默认，不能让上一次调大的值一直粘着
+        opts.llmTimeouts = llmTimeoutsOf(saved)
+        llm.cfg.firstByteMs = opts.llmTimeouts.firstByteMs ?? LLM_DEFAULT_TIMEOUTS.firstByteMs
+        llm.cfg.idleMs = opts.llmTimeouts.idleMs ?? LLM_DEFAULT_TIMEOUTS.idleMs
+        llm.cfg.timeoutMs = opts.llmTimeouts.timeoutMs ?? LLM_DEFAULT_TIMEOUTS.timeoutMs
         agent = await buildAgent()
         send({
           type: 'config-loaded',
@@ -661,6 +755,10 @@ async function main(): Promise<void> {
           verify: opts.verify,
           vision: opts.vision,
           logsDir: audit.logsDir,
+          // 把客户端当前实际生效的毫秒超时折成秒报回去：界面/测试据此确认 config.json 里的值已经落地
+          firstByteSecs: Math.round((llm.cfg.firstByteMs ?? LLM_DEFAULT_TIMEOUTS.firstByteMs) / 1000),
+          idleSecs: Math.round((llm.cfg.idleMs ?? LLM_DEFAULT_TIMEOUTS.idleMs) / 1000),
+          requestSecs: Math.round((llm.cfg.timeoutMs ?? LLM_DEFAULT_TIMEOUTS.timeoutMs) / 1000),
         })
         break
       }
@@ -727,13 +825,11 @@ async function main(): Promise<void> {
           send({ type: 'error', message: '这一轮没停下来（可能有工具不响应），稍后再切目录' })
           break
         }
-        opts.root = dir
-        policy.setRoot(dir)
-        // createDefaultTools 返回的是 ToolRegistry，不是 Map。原来这里是 for..of 遍历它，
-        // 直接抛 "t is not iterable"（换目录必现）。整个换掉，再重建 agent 让它用上新工具
-        memory = new MemoryStore(opts.dataDir, dir)
-        tools = createDefaultTools({ root: dir, memory })
+        applyRoot(dir)
         agent = await buildAgent()
+        // 这个会话从此认这个目录：切走再切回来还在这里
+        await Session.setMeta(opts.dataDir, session.id, { cwd: dir })
+        session.meta.cwd = dir
         send({ type: 'cwd', cwd: dir })
         break
       }
@@ -753,6 +849,8 @@ async function main(): Promise<void> {
         }
         try {
           await Session.remove(opts.dataDir, id)
+          // 会话没了，它那份策略也不用留着
+          sessionPolicies.delete(id)
           // 删掉的正好是当前会话：得换一个新的，否则 agent 还指着已删除的文件
           if (id === session.id) {
             session = await Session.create(opts.dataDir, meta())
@@ -805,6 +903,8 @@ async function main(): Promise<void> {
         // 切回来还能接着看、接着停。要停就切回去点停止。
         try {
           session = await Session.open(opts.dataDir, String(cmd.id ?? ''))
+          // 切到它自己的工作目录：不同会话可以待在不同项目里
+          await adoptSessionRoot(session)
           agent = await buildAgent()
           send(state())
         } catch (e) {

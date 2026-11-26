@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { Session } from '../src/core/session.ts'
-import { DEFAULT_VISION, loadSettings, loadSettingsSync, maskKey, saveSettings, settingsPath, visionFrom } from '../src/core/settings.ts'
+import { DEFAULT_VISION, llmTimeoutsOf, loadSettings, loadSettingsSync, maskKey, saveSettings, settingsPath, TIMEOUT_RANGES, visionFrom } from '../src/core/settings.ts'
 
 const tmp = (): Promise<string> => mkdtemp(join(tmpdir(), 'pl-settings-'))
 
@@ -130,4 +130,45 @@ test('session: 删除会话会连 checkpoint 一起删，非法 id 直接拒', a
 
   // 删不存在的（合法 id）不该抛
   await Session.remove(dataDir, 's-abc123-zzzz')
+})
+
+test('settings: 超时字段能存能读，没写的就不出现在设置里（交给客户端默认值）', async () => {
+  const dir = await tmp()
+  // 手改 config.json：只写了首字节和空闲两个
+  await writeFile(settingsPath(dir), JSON.stringify({ firstByteSecs: 240, idleSecs: 120 }), 'utf8')
+  const s = await loadSettings(dir)
+  assert.equal(s.firstByteSecs, 240)
+  assert.equal(s.idleSecs, 120)
+  assert.equal(s.requestSecs, undefined)
+  assert.deepEqual(llmTimeoutsOf(s), { firstByteMs: 240_000, idleMs: 120_000 })
+
+  // 界面/脚本再存一项：不能把已有的两项洗掉
+  await saveSettings(dir, { requestSecs: 1200 })
+  const back = await loadSettings(dir)
+  assert.equal(back.requestSecs, 1200)
+  assert.equal(back.firstByteSecs, 240)
+  assert.equal(back.idleSecs, 120)
+  assert.deepEqual(llmTimeoutsOf(back), { firstByteMs: 240_000, idleMs: 120_000, timeoutMs: 1_200_000 })
+})
+
+test('settings: 超时数值写坏了被裁到合法范围，不会变成 0 秒或几十小时', async () => {
+  const dir = await tmp()
+  await writeFile(
+    settingsPath(dir),
+    JSON.stringify({ firstByteSecs: 0, idleSecs: 999_999, requestSecs: '600' }),
+    'utf8',
+  )
+  const s = await loadSettings(dir)
+  assert.equal(s.firstByteSecs, TIMEOUT_RANGES.firstByteSecs[0], '太小抬到下限')
+  assert.equal(s.idleSecs, TIMEOUT_RANGES.idleSecs[1], '太大压到上限')
+  assert.equal(s.requestSecs, undefined, '字符串不认（当没写过）')
+
+  // 非数字（手改成 null / 布尔）一律忽略，不能给客户端传个 NaN 上去
+  await writeFile(settingsPath(dir), JSON.stringify({ firstByteSecs: null, idleSecs: true }), 'utf8')
+  assert.deepEqual(llmTimeoutsOf(await loadSettings(dir)), {})
+})
+
+test('settings: 从没配过超时：llmTimeoutsOf 返回空对象，客户端用内置默认', async () => {
+  const dir = await tmp()
+  assert.deepEqual(llmTimeoutsOf(await loadSettings(dir)), {})
 })

@@ -1041,49 +1041,284 @@ function Add-AssistantMessage {
   return $tb
 }
 
-# 工具行：平时收在「N 次工具调用」分组里，展开后一行一条
-function Add-ToolRow([string]$name, [string]$summary, [object]$parent = $null) {
+# 工具行：平时收在「N 次工具调用」聚合卡里，展开后一行一条。
+# 左边状态图标（运行中转圈 / 成功绿勾 / 失败红叉），中间工具名与目标摘要，
+# 右边耗时；点这一行展开看这次调用的入参和返回结果。
+$script:spinFrames = @('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
+$script:spinIndex = 0
+
+function Add-ToolRow([string]$name, [string]$summary, [string]$argsText = '', [object]$parent = $null) {
   $outer = New-Object System.Windows.Controls.Border
   $outer.Background = (Brush '#12141A')
   $outer.BorderBrush = (Brush '#0FFFFFFF')
   $outer.BorderThickness = '1'
   $outer.CornerRadius = '6'
-  $outer.Padding = '9,5'
+  $outer.Padding = '0'
   $outer.Margin = '0,0,0,4'
   $outer.HorizontalAlignment = 'Stretch'
 
+  $sp = New-Object System.Windows.Controls.StackPanel
+
+  $head = New-Object System.Windows.Controls.Button
+  $head.Background = [System.Windows.Media.Brushes]::Transparent
+  $head.BorderThickness = '0'
+  $head.Padding = '9,5'
+  $head.Cursor = 'Hand'
+  $head.HorizontalContentAlignment = 'Stretch'
+  $head.Template = (New-FlatTemplate)
+  $head.ToolTip = '点一下看这次调用的入参和结果'
+
   $dp = New-Object System.Windows.Controls.DockPanel
-  $status = New-Text '运行中…' 10.5 '#7C838E' 'Normal' 'Cascadia Mono, Consolas' 0
+  # 右边：耗时（跑完才填）
+  $status = New-Text '' 10 '#5B626D' 'Normal' 'Cascadia Mono, Consolas' 0
   $status.VerticalAlignment = 'Center'
   [System.Windows.Controls.DockPanel]::SetDock($status, 'Right')
   $dp.Children.Add($status) | Out-Null
 
-  $icon = New-Text '⚙' 11 '#7C838E' 'Normal' 'Segoe UI' 0
+  # 左边：状态图标。运行中是转圈帧，跑完换成绿勾 / 红叉
+  $icon = New-Text $script:spinFrames[0] 11 '#7C838E' 'Normal' 'Segoe UI' 0
   $icon.VerticalAlignment = 'Center'
+  $icon.Width = 14
+  $icon.TextAlignment = 'Center'
   $icon.Margin = '0,0,6,0'
   [System.Windows.Controls.DockPanel]::SetDock($icon, 'Left')
   $dp.Children.Add($icon) | Out-Null
 
-  $nameTb = New-Text $name 11 '#9BA3B4' 'Normal' 'Cascadia Mono, Consolas' 0
+  $nameTb = New-Text $name 11 '#8FA6FF' 'Normal' 'Cascadia Mono, Consolas' 0
   $nameTb.VerticalAlignment = 'Center'
-  $nameTb.Margin = '0,0,8,0'
+  $nameTb.Margin = '0,0,9,0'
   [System.Windows.Controls.DockPanel]::SetDock($nameTb, 'Left')
   $dp.Children.Add($nameTb) | Out-Null
 
-  $sumTb = New-Text $summary 11 '#CFD3D6' 'Normal' 'Cascadia Mono, Consolas' 0
+  # 剩下的一格：目标（路径 / 搜索词 / 命令），长了省略
+  $sumTb = New-Text $summary 11 '#9BA3B4' 'Normal' 'Cascadia Mono, Consolas' 0
   $sumTb.TextTrimming = 'CharacterEllipsis'
   $sumTb.TextWrapping = 'NoWrap'
   $sumTb.VerticalAlignment = 'Center'
   $dp.Children.Add($sumTb) | Out-Null
+  $head.Content = $dp
+  $sp.Children.Add($head) | Out-Null
 
-  $outer.Child = $dp
+  # 展开区：入参和结果各限高可滚（结果动辄几千字，不能把整轮撑爆）
+  $detail = New-Object System.Windows.Controls.StackPanel
+  $detail.Margin = '9,0,9,6'
+  $detail.Visibility = 'Collapsed'
+
+  $detail.Children.Add((New-Text '参数' 9.5 '#5B626D' 'SemiBold' 'Segoe UI' 2)) | Out-Null
+  $argsTb = New-Text '' 10.5 '#9BA3B4' 'Normal' 'Cascadia Mono, Consolas' 0
+  $argsTb.TextWrapping = 'Wrap'
+  $argsSv = New-Object System.Windows.Controls.ScrollViewer
+  $argsSv.MaxHeight = 110
+  $argsSv.VerticalScrollBarVisibility = 'Auto'
+  $argsSv.Content = $argsTb
+  $detail.Children.Add($argsSv) | Out-Null
+
+  $resHead = New-Text '结果' 9.5 '#5B626D' 'SemiBold' 'Segoe UI' 2
+  $resHead.Margin = '0,7,0,2'
+  $detail.Children.Add($resHead) | Out-Null
+  $resTb = New-Text '' 10.5 '#C7CBD2' 'Normal' 'Cascadia Mono, Consolas' 0
+  $resTb.TextWrapping = 'Wrap'
+  $resSv = New-Object System.Windows.Controls.ScrollViewer
+  $resSv.MaxHeight = 150
+  $resSv.VerticalScrollBarVisibility = 'Auto'
+  $resSv.Content = $resTb
+  $detail.Children.Add($resSv) | Out-Null
+  $sp.Children.Add($detail) | Out-Null
+
+  $outer.Child = $sp
   $box = @{ text = "$name  $summary" }
   # 右键可复制这一行的「工具名 + 参数 + 结果」；文本随着状态变，放在 $box 里跟着更新
   Set-CopyMenu $outer $box
   if ($parent) { $parent.Children.Add($outer) | Out-Null }
   else { $script:renderHost.Children.Add($outer) | Out-Null }
-  $status.Tag = @{ box = $box }
-  return $status
+
+  $row = New-Object PSObject -Property @{
+    Border = $outer; Button = $head; Icon = $icon; Name = $nameTb; Sum = $sumTb; Status = $status
+    Detail = $detail; ArgsTb = $argsTb; ResTb = $resTb
+    Open = $false; State = 'running'; Group = $null; Box = $box
+  }
+  if ($argsText) { $row.ArgsTb.Text = $argsText }
+  $head.Tag = $row
+  $head.Add_Click({ param($s, $e) Toggle-ToolRow $s.Tag })
+  return $row
+}
+
+# 一行展开 / 收起：平时时间线是紧凑的，点开才看这一次的入参和返回
+function Toggle-ToolRow($row) {
+  if (-not $row) { return }
+  $row.Open = -not $row.Open
+  $row.Detail.Visibility = $(if ($row.Open) { 'Visible' } else { 'Collapsed' })
+}
+
+# 运行中的行每 100ms 转一格（一圈一秒），跑完的行不再动
+function Step-ToolRows {
+  if ($script:toolRows.Count -eq 0) { return }
+  $script:spinIndex = ($script:spinIndex + 1) % $script:spinFrames.Count
+  $glyph = $script:spinFrames[$script:spinIndex]
+  foreach ($k in @($script:toolRows.Keys)) {
+    $row = $script:toolRows[$k]
+    if ($row -and $row.State -eq 'running') { $row.Icon.Text = $glyph }
+  }
+}
+
+# ---------------------------------------------------------------- 轮次时间线
+# 一轮的「思考过程 + 工具调用」画成一条时间线（跟 Kite 那种组件一样）：
+#   顶部状态行   ● 思考中… 1:30                     本轮  ● 本机
+#   思考摘要卡   ⋯ 思考了片刻  <最新一段思考，单行省略>                 ▸
+#   工具聚合卡   ▸ 21 次工具调用 · 共 8.4s         fs.read ×9 · fs.grep ×7
+# 点摘要卡看整段思考，点聚合卡展开每一行，点某一行看这次的入参和结果。
+# 正文回答不进这条时间线——那是要一直看见的东西。
+$script:turnProc = $null
+
+# 过程元素往哪挂：本轮有卡就挂卡里，没有（正文、系统行、历史外的事件）就挂聊天区
+function Get-ProcPanel {
+  if ($script:turnProc -and -not $script:turnProc.Done) { return $script:turnProc.Body }
+  return $script:renderHost
+}
+
+# 状态行那颗计时器：「1:30」；超过一小时「1:02:03」
+function Format-Clock([double]$secs) {
+  $total = [int][math]::Floor([math]::Max(0, $secs))
+  $s = $total % 60
+  $m = [int][math]::Floor($total / 60) % 60
+  $h = [int][math]::Floor($total / 3600)
+  $head = $(if ($h -gt 0) { [string]$h + ':' + ('{0:00}' -f $m) } else { [string]$m })
+  return $head + ':' + ('{0:00}' -f $s)
+}
+
+# 状态行右边那两颗小胶囊：「本轮」「● 本机」
+function New-ProcPill([string]$text, [string]$dotColor = '') {
+  $b = New-Object System.Windows.Controls.Border
+  $b.CornerRadius = '9'
+  $b.Padding = '7,1'
+  $b.Margin = '6,0,0,0'
+  $b.Background = (Brush '#12FFFFFF')
+  $b.BorderBrush = (Brush '#10FFFFFF')
+  $b.BorderThickness = '1'
+  $b.VerticalAlignment = 'Center'
+  if ($dotColor) {
+    $sp = New-Object System.Windows.Controls.StackPanel
+    $sp.Orientation = 'Horizontal'
+    $d = New-Object System.Windows.Controls.Border
+    $d.Width = 5
+    $d.Height = 5
+    $d.CornerRadius = '2.5'
+    $d.Background = (Brush $dotColor)
+    $d.VerticalAlignment = 'Center'
+    $d.Margin = '0,0,5,0'
+    $sp.Children.Add($d) | Out-Null
+    $sp.Children.Add((New-Text $text 10 '#8A93A2' 'Normal' 'Segoe UI' 0)) | Out-Null
+    $b.Child = $sp
+  } else {
+    $b.Child = New-Text $text 10 '#8A93A2' 'Normal' 'Segoe UI' 0
+  }
+  return $b
+}
+
+# 刷新状态行：阶段词 + 计时；结束了就把绿点熄掉、词换成「已完成」
+function Update-TurnProc($t) {
+  if (-not $t) { return }
+  $verb = $(if ($t.Done) { '已完成' } else { $script:thinkVerb })
+  if (-not $verb) { $verb = '思考中' }
+  # 跑着的阶段词句尾点一下；「执行 fs.read」这种不再加点
+  $tail = $(if ($t.Done) { '' } elseif ($verb -eq '思考中' -or $verb -eq '回答中' -or $verb -eq '验证中') { '…' } else { '' })
+  $t.Verb.Text = $verb + $tail
+  $t.Verb.Foreground = $(if ($t.Done) { Brush '#6B7280' } else { Brush '#C7CBD2' })
+  $secs = $(if ($t.Done) { [double]$t.Ms / 1000.0 } else { ((Get-Date) - $t.T0).TotalSeconds })
+  # 历史回放没有墙钟：这一轮走了多久按事件时间戳之差算
+  if ($t.At0 -gt 0 -and $t.AtLast -ge $t.At0) { $secs = ([double]$t.AtLast - $t.At0) / 1000.0 }
+  $t.Clock.Text = (Format-Clock $secs)
+  if ($t.Done) {
+    # 呼吸灯停不下来就是还在跑：结束这一轮时熄掉
+    $t.Dot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+    $t.Dot.Opacity = 1
+    $t.Dot.Background = (Brush '#3F4650')
+  }
+}
+
+function New-TurnProc {
+  $box = New-Object System.Windows.Controls.StackPanel
+  $box.Margin = '0,2,0,9'
+  $box.HorizontalAlignment = 'Stretch'
+
+  # 状态行：● 思考中… 1:30                本轮  ● 本机
+  $row = New-Object System.Windows.Controls.DockPanel
+  $row.Margin = '2,0,2,7'
+
+  $pills = New-Object System.Windows.Controls.StackPanel
+  $pills.Orientation = 'Horizontal'
+  $pills.HorizontalAlignment = 'Right'
+  [System.Windows.Controls.DockPanel]::SetDock($pills, 'Right')
+  $pills.Children.Add((New-ProcPill '本轮')) | Out-Null
+  $pill = New-ProcPill '本机' '#3DDC84'
+  $pill.ToolTip = $(if ($env:COMPUTERNAME) { '这台机器：' + $env:COMPUTERNAME } else { '在这台机器上跑' })
+  $pills.Children.Add($pill) | Out-Null
+  $row.Children.Add($pills) | Out-Null
+
+  $left = New-Object System.Windows.Controls.StackPanel
+  $left.Orientation = 'Horizontal'
+  # 呼吸绿灯：透明度 1 → 0.32 → 1 无限循环；这一轮结束（Update-TurnProc 的 Done）就熄
+  $dot = New-Object System.Windows.Controls.Border
+  $dot.Width = 8
+  $dot.Height = 8
+  $dot.CornerRadius = '4'
+  $dot.Background = (Brush '#3DDC84')
+  $dot.VerticalAlignment = 'Center'
+  $dot.Margin = '0,0,7,0'
+  $breath = New-Object System.Windows.Media.Animation.DoubleAnimation
+  $breath.From = 1.0
+  $breath.To = 0.32
+  $breath.Duration = [System.Windows.Duration]::new([TimeSpan]::FromMilliseconds(900))
+  $breath.AutoReverse = $true
+  $breath.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+  $dot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $breath)
+  $left.Children.Add($dot) | Out-Null
+  $verb = New-Text '思考中…' 11.5 '#C7CBD2' 'Normal' 'Segoe UI' 0
+  $verb.VerticalAlignment = 'Center'
+  $left.Children.Add($verb) | Out-Null
+  $clock = New-Text '0:00' 11 '#5B626D' 'Normal' 'Cascadia Mono, Consolas' 0
+  $clock.VerticalAlignment = 'Center'
+  $clock.Margin = '9,0,0,0'
+  $left.Children.Add($clock) | Out-Null
+  $row.Children.Add($left) | Out-Null
+  $box.Children.Add($row) | Out-Null
+
+  # 思考摘要卡和工具聚合卡都挂这里（Get-ProcPanel 返回的就是它）
+  $body = New-Object System.Windows.Controls.StackPanel
+  $box.Children.Add($body) | Out-Null
+
+  $script:renderHost.Children.Add($box) | Out-Null
+
+  $node = New-Object PSObject -Property @{
+    Box = $box; Body = $body; Dot = $dot; Verb = $verb; Clock = $clock
+    Thought = $null
+    Open = $true; Done = $false; Tools = 0; Steps = 0; Replay = $false
+    T0 = (Get-Date); Ms = 0; At0 = 0; AtLast = 0
+  }
+  $script:turnProc = $node
+  Update-TurnProc $node
+  return $node
+}
+
+function Get-TurnProc {
+  if (-not $script:turnProc -or $script:turnProc.Done) { New-TurnProc | Out-Null }
+  return $script:turnProc
+}
+
+# 一轮收尾：算出总耗时，状态行定格「已完成 1:30」，绿点熄掉
+function Close-TurnProc {
+  $t = $script:turnProc
+  if (-not $t -or $t.Done) { return }
+  $t.Done = $true
+  # 历史回放没有墙钟可用（拉起来才几十毫秒），按事件时间戳之差算这一轮的真实耗时
+  if ($t.Ms -le 0 -and $t.At0 -gt 0 -and $t.AtLast -ge $t.At0) { $t.Ms = [int]($t.AtLast - $t.At0) }
+  if ($t.Ms -le 0) { $t.Ms = [int]((Get-Date) - $t.T0).TotalMilliseconds }
+  # 这一轮的思考条和工具卡都留在原地（点开还能看），下一轮重新建
+  if ($t.Thought -and -not $t.Thought.Done) { Complete-Reasoning }
+  $script:reasonNode = $null
+  $script:toolGroup = $null
+  Update-TurnProc $t
+  $script:turnProc = $null
 }
 
 # ---------------------------------------------------------------- 工具调用分组
@@ -1158,7 +1393,7 @@ function New-ToolGroup {
   $sp.Children.Add($items) | Out-Null
 
   $outer.Child = $sp
-  $script:renderHost.Children.Add($outer) | Out-Null
+  (Get-ProcPanel).Children.Add($outer) | Out-Null
 
   $g = New-Object PSObject -Property @{
     Head = $title; Sum = $sum; Items = $items; Border = $outer
@@ -1178,28 +1413,38 @@ function Toggle-ToolGroup($g) {
   Update-ToolGroup $g
 }
 
-# 拿「当前这一组」：没有就新建。出现正文/思考/审批时调 Close-ToolGroup 断开
+# 拿「当前这一组」：一整轮只在第一件工具调用时建一块，之后所有调用都往这一块里加
 function Get-ToolGroup {
-  if (-not $script:toolGroup) { $script:toolGroup = New-ToolGroup }
+  if ($script:toolGroup) { return $script:toolGroup }
+  $script:toolGroup = New-ToolGroup
   return $script:toolGroup
 }
 
+# 切阶段（出正文 / 验证 / 审批…）只是把汇总行刷新一遍，块本身留着继续累加；
+# 早先这里是清空重建，一轮十步就变成十块往下平铺
 function Close-ToolGroup {
   if ($script:toolGroup) { Update-ToolGroup $script:toolGroup }
+}
+
+# 新的一轮开始：上一轮那块到此为止
+function Reset-ToolGroup {
+  Close-ToolGroup
   $script:toolGroup = $null
 }
 
-function Add-ToolLine([string]$name, [string]$summary) {
+function Add-ToolLine([string]$name, [string]$summary, [string]$argsText = '') {
   $g = Get-ToolGroup
   # 一组管一整轮：中间插进来的思考块会把组挤到上面，这里把它挪回末尾，
   # 于是多步调用始终显示成「思考 1 / 2 / 3 … + 一块工具汇总」，不会一步一块往下平铺
-  $panel = $script:renderHost
-  if ($g.Border.Parent -eq $panel -and $panel.Children.IndexOf($g.Border) -ne ($panel.Children.Count - 1)) {
+  $panel = $g.Border.Parent
+  if ($panel -and $panel.Children.IndexOf($g.Border) -ne ($panel.Children.Count - 1)) {
     $panel.Children.Remove($g.Border) | Out-Null
     $panel.Children.Add($g.Border) | Out-Null
   }
-  $st = Add-ToolRow $name $summary $g.Items
+  $st = Add-ToolRow $name $summary $argsText $g.Items
   $g.Count++
+  # 轮次时间线的「N 次工具」按这一轮累计
+  if ($script:turnProc -and -not $script:turnProc.Done) { $script:turnProc.Tools++ }
   if (-not $g.Counts.ContainsKey($name)) {
     $g.Counts[$name] = 0
     [void]$g.Order.Add($name)
@@ -1207,20 +1452,27 @@ function Add-ToolLine([string]$name, [string]$summary) {
   $g.Counts[$name] = $g.Counts[$name] + 1
   $g.Running++
   # 组引挂在行上：组关闭后回来的结果也能把计数器减回去
-  $st.Tag.group = $g
+  $st.Group = $g
   Update-ToolGroup $g
   return $st
 }
 
-function Set-ToolLineDone([string]$id, [string]$text, [bool]$ok, [int]$ms = 0) {
-  $st = $script:toolRows[$id]
-  if (-not $st) { return }
-  $st.Text = $text
-  $st.Foreground = $(if ($ok) { Brush '#4ADE80' } else { Brush '#F87171' })
-  $tag = $st.Tag
-  if (-not $tag) { return }
-  if ($tag.box) { $tag.box.text = $tag.box.text + " -> $text" }
-  $g = $tag.group
+function Set-ToolLineDone([string]$id, [string]$text, [bool]$ok, [int]$ms = 0, [string]$preview = '') {
+  $row = $script:toolRows[$id]
+  if (-not $row) { return }
+  # 行首图标三态：运行中转圈 → 成功绿勾 / 失败红叉；右边报这次耗时
+  $row.State = $(if ($ok) { 'done' } else { 'failed' })
+  $row.Icon.Text = $(if ($ok) { '✔' } else { '✖' })
+  $row.Icon.Foreground = $(if ($ok) { Brush '#4ADE80' } else { Brush '#F87171' })
+  $row.Status.Text = $(if ($ms -gt 0) { Format-ToolSecs ([double]$ms) } else { '' })
+  $row.Status.Foreground = $(if ($ok) { Brush '#5B626D' } else { Brush '#F87171' })
+  # 展开区里的结果：有就给一段开头，没有就说明一下
+  if ($preview) { $row.ResTb.Text = $preview }
+  elseif (-not $ok) { $row.ResTb.Text = '(失败，没有输出)' }
+  else { $row.ResTb.Text = '(没有输出)' }
+  $row.ResTb.Foreground = $(if ($ok) { Brush '#C7CBD2' } else { Brush '#F0A0A0' })
+  if ($row.Box) { $row.Box.text = $row.Box.text + " -> $text" }
+  $g = $row.Group
   if (-not $g) { return }
   $g.Running = [math]::Max(0, $g.Running - 1)
   if (-not $ok) { $g.Failed++ }
@@ -1246,21 +1498,32 @@ function Format-ReasonSecs([double]$secs) {
   return (Format-Elapsed $secs)
 }
 
+# 这一段思考的纯文本（整轮只有一张条，只取当前这一段）
+function Get-ReasonSegText($n) {
+  $t = [string]$n.Body.Text
+  $seg = $t
+  if ($n.SegStart -gt 0 -and $n.SegStart -lt $t.Length) { $seg = $t.Substring($n.SegStart) }
+  return ($seg -replace "\s+", ' ').Trim()
+}
+
 function Update-ReasoningHeader($n) {
   if (-not $n) { return }
   if ($n.Done) {
-    $n.Title.Text = '思考了' + (Format-ReasonSecs $n.Secs)
+    # 秒数收进 tooltip，标题只留一个状态词（跟截图一致）
+    $n.Title.Text = '思考了片刻'
     $n.Title.Foreground = (Brush '#9BA3B4')
+    if ($n.Head) { $n.Head.ToolTip = '思考了 ' + (Format-ReasonSecs $n.Secs) + '，点一下展开全文' }
   } else {
     $n.Title.Text = '思考中…'
-    $n.Title.Foreground = (Brush '#8FA6FF')
+    $n.Title.Foreground = (Brush '#C7CBD2')
   }
-  # 耗时已经写进标题了，右边这一格只留展开/收起箭头，免得一处时间报两遍
-  $tail = $(if (-not $n.Done -and $n.Secs -ge 0.1) { "$([math]::Round($n.Secs, 1))s " } else { '' })
-  $n.Time.Text = $tail + $(if ($n.Open) { '▾' } else { '▸' })
-  # 收起时用正文开头一句当摘要（压成单行，超长截断）
-  $s = ($n.Body.Text -replace "\s+", ' ').Trim()
-  if ($s.Length -gt 110) { $s = $s.Substring(0, 110) + '…' }
+  # 右边这一格只留展开/收起箭头：耗时已经进状态行和 tooltip 了
+  $n.Time.Text = $(if ($n.Open) { '▾' } else { '▸' })
+  # 收起时右边只挂一行摘要：想完了取这一段的开头，还在想就取最新那一小段（单行、超长截断）
+  $s = Get-ReasonSegText $n
+  if ($s.Length -gt 110) {
+    if ($n.Done) { $s = $s.Substring(0, 110) + '…' } else { $s = '…' + $s.Substring($s.Length - 110) }
+  }
   $n.Sum.Text = $s
   $n.Sum.Visibility = $(if ($n.Open) { 'Collapsed' } else { 'Visible' })
   $n.Body.Visibility = $(if ($n.Open) { 'Visible' } else { 'Collapsed' })
@@ -1270,9 +1533,8 @@ function Update-ReasoningHeader($n) {
 # 不重算摘要（正文一直在长，每 250ms 压一遍整个思考链太浪费）
 function Update-ReasoningTime($n) {
   if (-not $n -or $n.Done) { return }
+  # 秒数已经不上屏了（耗时在状态行和 tooltip），这里只把时长记准确
   $n.Secs = ((Get-Date) - $n.T0).TotalSeconds
-  $tail = $(if ($n.Secs -ge 0.1) { "$([math]::Round($n.Secs, 1))s " } else { '' })
-  $n.Time.Text = $tail + $(if ($n.Open) { '▾' } else { '▸' })
 }
 
 function Toggle-Reasoning($n) {
@@ -1282,6 +1544,22 @@ function Toggle-Reasoning($n) {
 }
 
 function Add-ReasoningBlock {
+  # 一整轮只有一张思考条：后面几段思考接着往同一张里写（段间空一行），
+  # 不会每想一段就多出一张卡往下平铺
+  $tp = Get-TurnProc
+  if ($tp.Thought) {
+    $n = $tp.Thought
+    $n.Done = $false
+    $n.Open = $false
+    $n.T0 = (Get-Date)
+    $n.Secs = 0
+    if ($n.Body.Text) { $n.Body.Text = $n.Body.Text + "`r`n`r`n" }
+    $n.SegStart = $n.Body.Text.Length
+    if ($n.Caret) { $n.Caret.Visibility = 'Visible' }
+    $script:reasonNode = $n
+    Update-ReasoningHeader $n
+    return $n
+  }
   $outer = New-Object System.Windows.Controls.Border
   $outer.Background = (Brush '#12141A')
   $outer.BorderBrush = (Brush '#12FFFFFF')
@@ -1307,12 +1585,22 @@ function Add-ReasoningBlock {
   $time.VerticalAlignment = 'Center'
   [System.Windows.Controls.DockPanel]::SetDock($time, 'Right')
   $dp.Children.Add($time) | Out-Null
-  $icon = New-Text '⋯' 12 '#7C838E' 'SemiBold' 'Segoe UI' 0
-  $icon.VerticalAlignment = 'Center'
-  $icon.Margin = '0,0,7,0'
-  [System.Windows.Controls.DockPanel]::SetDock($icon, 'Left')
-  $dp.Children.Add($icon) | Out-Null
-  $title = New-Text '思考中…' 11.5 '#8FA6FF' 'SemiBold' 'Segoe UI' 0
+  # 左侧图标：小圆角方格里一个「⋯」，跟截图里思考条的图标一样
+  $iconBox = New-Object System.Windows.Controls.Border
+  $iconBox.Width = 18
+  $iconBox.Height = 18
+  $iconBox.CornerRadius = '5'
+  $iconBox.Background = (Brush '#1AFFFFFF')
+  $iconBox.VerticalAlignment = 'Center'
+  $iconBox.Margin = '0,0,8,0'
+  $glyph = New-Text '⋯' 11 '#8A93A2' 'SemiBold' 'Segoe UI' 0
+  $glyph.HorizontalAlignment = 'Center'
+  $glyph.VerticalAlignment = 'Center'
+  $glyph.TextWrapping = 'NoWrap'
+  $iconBox.Child = $glyph
+  [System.Windows.Controls.DockPanel]::SetDock($iconBox, 'Left')
+  $dp.Children.Add($iconBox) | Out-Null
+  $title = New-Text '思考中…' 11.5 '#C7CBD2' 'SemiBold' 'Segoe UI' 0
   $title.VerticalAlignment = 'Center'
   $title.Margin = '0,0,10,0'
   [System.Windows.Controls.DockPanel]::SetDock($title, 'Left')
@@ -1354,16 +1642,18 @@ function Add-ReasoningBlock {
   $outer.Child = $stack
   $box = @{ text = '' }
   Set-CopyMenu $outer $box
-  $script:renderHost.Children.Add($outer) | Out-Null
+  (Get-ProcPanel).Children.Add($outer) | Out-Null
 
+  # 默认收起：标题一行「思考了片刻」+ 一行摘要（跟截图一致），点开才铺全文
   $node = New-Object PSObject -Property @{
     Head = $head; Title = $title; Time = $time; Sum = $sum; Body = $body; Caret = $caret
     Border = $outer; Box = $box
-    T0 = (Get-Date); Open = $true; Done = $false; Secs = 0
+    T0 = (Get-Date); Open = $false; Done = $false; Secs = 0; SegStart = 0
   }
   # 节点挂在标题自己的 Tag 上：PS 5.1 下这个事件里的 GetNewClosure 拿不到 $node，点了会抛异常
   $head.Tag = $node
   $head.Add_Click({ param($s, $e) Toggle-Reasoning $s.Tag })
+  $tp.Thought = $node
   $script:reasonNode = $node
   Update-ReasoningHeader $node
   return $node
@@ -1404,6 +1694,8 @@ function Step-ReasonTyping {
   $rn.Body.Text = $rn.Body.Text + $script:reasonQueue.ToString(0, $take)
   $script:reasonQueue.Remove(0, $take) | Out-Null
   $script:reasonTypingTick++
+  # 收起态右侧那行摘要跟着流式刷新（每 6 帧一次，别每帧重排）
+  if (($script:reasonTypingTick % 6) -eq 0) { Update-ReasoningHeader $rn }
   # 停在底部才跟着滚（用户往上翻旧内容时别硬拉回来），也别每帧都触发一次排版
   if (($script:reasonTypingTick % 3) -eq 0) {
     if (($Scroller.VerticalOffset + $Scroller.ViewportHeight) -ge ($Scroller.ExtentHeight - 120)) { $Scroller.ScrollToEnd() }
@@ -2251,17 +2543,28 @@ $script:userElements = @{}
 
 # 画一个历史事件。初次切换会话时会分多个 UI 时间片调用，避免一口气创建几百个控件卡住窗口。
 function Render-ReplayEvent($ev) {
+  # 回放的卡没有墙钟耗时：拿事件自带的时间戳记下这一轮的头尾
+  $at = [double]$ev.at
+  $cur = $script:turnProc
+  if ($cur -and -not $cur.Done -and $at -gt 0) { $cur.AtLast = $at }
   if ($ev.kind -eq 'user/message') {
-    # 一轮从用户消息开始：上一轮的工具块在这里收掉，回放时也是一轮一块
-    Close-ToolGroup
+    # 一轮从用户消息开始：上一轮的过程卡和工具块在这里收掉，回放也是一轮一张
+    Close-TurnProc
+    Reset-ToolGroup
     Add-UserMessage ([string]$ev.text) $ev.files
     $script:replayHasUser = $true
   }
   elseif ($ev.kind -eq 'assistant/message') {
     # 历史里的思考过程也要能看，默认收起成一行摘要；超长的先只放前一段
     if ($ev.reasoning) {
+      Get-TurnProc | Out-Null
+      $tp = $script:turnProc
+      $tp.Replay = $true
+      if ($tp.At0 -le 0) { $tp.At0 = $at }
+      $tp.Steps++
       $rn = Add-ReasoningBlock
-      $rn.Body.Text = (Clip-LongText ([string]$ev.reasoning) $script:reasonFoldChars)
+      # 一轮里几段思考接着往同一张条里写（Add-ReasoningBlock 已补过段间空行）
+      $rn.Body.Text = $rn.Body.Text + (Clip-LongText ([string]$ev.reasoning) $script:reasonFoldChars)
       $rn.Secs = [math]::Round(([double]$ev.ms) / 1000.0, 1)
       Complete-Reasoning
     }
@@ -2280,16 +2583,33 @@ function Render-ReplayEvent($ev) {
     }
   }
   elseif ($ev.kind -eq 'tool/call') {
+    Get-TurnProc | Out-Null
+    $tp = $script:turnProc
+    $tp.Replay = $true
+    if ($tp.At0 -le 0) { $tp.At0 = $at }
+    # 历史里只存了入参和结果：摘要取自关键字段，展开区放完整参数
     $sum = ''
-    if ($ev.call.args) { $sum = ($ev.call.args | ConvertTo-Json -Compress -Depth 4) }
-    $st = Add-ToolLine ([string]$ev.call.name) $sum
+    $argsText = ''
+    if ($ev.call.args) {
+      try { $argsText = ($ev.call.args | ConvertTo-Json -Compress -Depth 4) } catch { $argsText = '' }
+      if ($argsText.Length -gt 2000) { $argsText = $argsText.Substring(0, 2000) + '…' }
+      foreach ($k in @('path', 'pattern', 'cmd', 'command', 'query', 'url')) {
+        $p = $ev.call.args.PSObject.Properties[$k]
+        if ($p -and $p.Value) { $sum = [string]$p.Value; break }
+      }
+      if (-not $sum) { $sum = $argsText }
+    }
+    $st = Add-ToolLine ([string]$ev.call.name) $sum $argsText
     $script:toolRows[[string]$ev.call.id] = $st
   }
   elseif ($ev.kind -eq 'tool/result') {
     $st = $script:toolRows[[string]$ev.callId]
     if ($st) {
-      if ($ev.ok) { Set-ToolLineDone ([string]$ev.callId) "✓  $($ev.ms)ms" $true ([int]$ev.ms) }
-      else { Set-ToolLineDone ([string]$ev.callId) '✕  失败' $false ([int]$ev.ms) }
+      # 回放里结果正文就在事件里（content），截一段给展开区
+      $preview = [string]$ev.content
+      if ($preview.Length -gt 2000) { $preview = $preview.Substring(0, 2000) + '…' }
+      if ($ev.ok) { Set-ToolLineDone ([string]$ev.callId) "✓  $($ev.ms)ms" $true ([int]$ev.ms) $preview }
+      else { Set-ToolLineDone ([string]$ev.callId) '✕  失败' $false ([int]$ev.ms) $preview }
     }
   }
   elseif ($ev.kind -eq 'memory/saved') {
@@ -2717,6 +3037,7 @@ function Continue-ReplayRender {
     return
   }
 
+  Close-TurnProc
   Close-ToolGroup
   $script:currentAssistant = $null
   $script:replayRenderJob = $null
@@ -2830,6 +3151,7 @@ function Clear-Transcript {
   $script:reasonNode = $null
   $script:toolRows = @{}
   $script:toolGroup = $null
+  $script:turnProc = $null
   $script:assistantBox = $null
   $script:copyLog.Clear() | Out-Null
   $script:copyBoxOf = @{}
@@ -3691,6 +4013,8 @@ function Update-ThinkRow([string]$verb) {
 function Set-ThinkVerb([string]$verb) {
   $script:thinkVerb = $verb
   Update-ThinkRow $verb
+  # 时间线的状态行跟着换词（「执行 fs.read」「回答中」）
+  if ($script:turnProc -and -not $script:turnProc.Done) { Update-TurnProc $script:turnProc }
 }
 
 function Set-Busy([bool]$on) {
@@ -3836,7 +4160,20 @@ function Handle-Event([string]$line) {
       if ([string]$e.session -ne $script:sessionId -or [int]$e.requestId -ne $script:historyRequestId) { return }
       Start-HistoryRender $e
     }
+    'turn-start' {
+      # 新一轮开始：上一轮的过程卡收成一行，再给这一轮开一张
+      Close-TurnProc
+      Reset-ToolGroup
+      New-TurnProc | Out-Null
+      $Scroller.ScrollToEnd()
+    }
+    'step' {
+      $tp = Get-TurnProc
+      $tp.Steps = [math]::Max([int]$tp.Steps, [int]$e.step)
+      Update-TurnProc $tp
+    }
     'reasoning' {
+      Get-TurnProc | Out-Null
       # 思考不再断开工具组：整轮共用一块，块的位置由 Add-ToolLine 挪回末尾
       if (-not $script:reasonNode) { Add-ReasoningBlock | Out-Null }
       Set-ThinkVerb '思考中'
@@ -3875,21 +4212,30 @@ function Handle-Event([string]$line) {
       $script:currentAssistant = $null
     }
     'tool-start' {
+      Get-TurnProc | Out-Null
       Complete-Reasoning
       Set-ThinkVerb ('执行 ' + [string]$e.name)
       $script:currentAssistant = $null
-      $st = Add-ToolLine ([string]$e.name) ([string]$e.summary)
+      # 入参先存着：点开这一行才看得到（太长截一段，完整的在会话日志里）
+      $argsText = ''
+      if ($e.args) {
+        try { $argsText = ($e.args | ConvertTo-Json -Compress -Depth 4) } catch { $argsText = '' }
+        if ($argsText.Length -gt 2000) { $argsText = $argsText.Substring(0, 2000) + '…' }
+      }
+      $st = Add-ToolLine ([string]$e.name) ([string]$e.summary) $argsText
       $script:toolRows[[string]$e.id] = $st
       $Scroller.ScrollToEnd()
     }
     'tool-end' {
       Set-ThinkVerb '思考中'
+      # 结果开头一段随事件过来，点开这一行就能看（完整内容在会话日志里）
+      $preview = [string]$e.preview
       if ($e.ok) {
-        Set-ToolLineDone ([string]$e.id) "✓  $($e.ms)ms" $true ([int]$e.ms)
+        Set-ToolLineDone ([string]$e.id) "✓  $($e.ms)ms" $true ([int]$e.ms) $preview
       } else {
         $msg = ([string]$e.error).Split("`n")[0]
         if ($msg.Length -gt 40) { $msg = $msg.Substring(0, 40) + '…' }
-        Set-ToolLineDone ([string]$e.id) "✕  $msg" $false ([int]$e.ms)
+        Set-ToolLineDone ([string]$e.id) "✕  $msg" $false ([int]$e.ms) $preview
       }
       # todo_write 的结果里带结构化清单：画成计划卡（同一条任务重复写就原地更新）
       if ([string]$e.name -eq 'todo_write' -and $e.data -and $e.data.items) {
@@ -4012,6 +4358,9 @@ function Handle-Event([string]$line) {
     'turn-end' {
       Close-ToolGroup
       Complete-Reasoning
+      # host 报的整轮耗时比界面上卡自己的墙钟更准
+      if ($script:turnProc -and [int]$e.ms -gt 0) { $script:turnProc.Ms = [int]$e.ms }
+      Close-TurnProc
       if ($script:pendingText.Length -gt 0 -and $script:currentAssistant) {
         $script:currentAssistant.Text += $script:pendingText.ToString()
         $script:pendingText.Clear() | Out-Null
@@ -4192,13 +4541,17 @@ $timer.Add_Tick({
       $script:pendingText.Clear() | Out-Null
       $Scroller.ScrollToEnd()
     }
-    # 读秒：每 5 个 tick（约 0.25s）刷新一次就够了，数字只到秒
+    # 时间线：工具行上的小圈每 100ms 转一格，状态行计时与底栏每 250ms 刷一次
     if ($script:busy -and $script:thinkT0) {
       $script:tickCount2 = ([int]$script:tickCount2) + 1
+      if (($script:tickCount2 % 2) -eq 0) { Step-ToolRows }
       if (($script:tickCount2 % 5) -eq 0) {
         Update-ThinkRow $script:thinkVerb
-        # 流式中的思考块头部也一起跳，别一直停在 0.0s
         Update-ReasoningTime $script:reasonNode
+        $tp = $script:turnProc
+        if ($tp -and -not $tp.Done) {
+          $tp.Clock.Text = (Format-Clock ((Get-Date) - $tp.T0).TotalSeconds)
+        }
       }
     }
     if ($pumpOut.Finished -and -not $script:hostGone) {

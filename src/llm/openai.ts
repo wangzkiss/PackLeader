@@ -24,11 +24,18 @@ export interface OpenAiConfig {
   retries?: number
   /** 退避基数：第 n 次重试等 base × 3^(n-1)，默认 500ms */
   retryBaseMs?: number
-  /** 首字节超时：请求发出去多久还没等到第一个字节就算失败，默认 30s */
+  /** 首字节超时：请求发出去多久还没等到第一个字节就算失败，默认 120s（见 LLM_DEFAULT_TIMEOUTS） */
   firstByteMs?: number
-  /** 流空闲超时：两个数据块之间最多等多久，默认 90s */
+  /** 流空闲超时：两个数据块之间最多等多久，默认 180s */
   idleMs?: number
 }
+
+/**
+ * 内置超时。为什么不是原来的 30s / 90s / 300s：
+ * 一轮跑了几十次工具之后，上下文能有十几万 token，服务端光 prefill 就要一两分钟才派第一个 token，
+ * 30 秒就判死会把「慢但正常」的请求当成故障，重试三次也只是把失败推后一分半。
+ */
+export const LLM_DEFAULT_TIMEOUTS = { firstByteMs: 120_000, idleMs: 180_000, timeoutMs: 900_000 }
 
 /** 请求层错误：retryable 决定外层要不要退避重试 */
 export class LlmError extends Error {
@@ -44,6 +51,11 @@ export class LlmError extends Error {
 /** 退避：1 → base，2 → 3×base，3 → 9×base……封顶 30s */
 function backoffMs(base: number, attempt: number): number {
   return Math.min(30_000, base * 3 ** (attempt - 1))
+}
+
+/** 超时文案：整秒就说「120 秒」，不是整秒保留毫秒（测试里用的是几百毫秒的小值） */
+function fmtSecs(ms: number): string {
+  return ms % 1000 === 0 ? `${ms / 1000} 秒` : `${ms}ms`
 }
 
 export interface ChatOptions {
@@ -74,7 +86,14 @@ export class OpenAiClient {
   readonly cfg: OpenAiConfig
 
   constructor(cfg: OpenAiConfig) {
-    this.cfg = { timeoutMs: 300_000, temperature: 0.2, ...cfg }
+    // 逐个字段兜底（而不是 `{ ...默认, ...cfg }`）：调用方显式传 undefined 时不会把默认值打穿
+    this.cfg = {
+      ...cfg,
+      timeoutMs: cfg.timeoutMs ?? LLM_DEFAULT_TIMEOUTS.timeoutMs,
+      firstByteMs: cfg.firstByteMs ?? LLM_DEFAULT_TIMEOUTS.firstByteMs,
+      idleMs: cfg.idleMs ?? LLM_DEFAULT_TIMEOUTS.idleMs,
+      temperature: cfg.temperature ?? 0.2,
+    }
   }
 
   private toWire(messages: LlmMessage[]): WireMessage[] {
@@ -168,9 +187,9 @@ export class OpenAiClient {
       body.tool_choice = 'auto'
     }
 
-    const firstByteMs = this.cfg.firstByteMs ?? 30_000
-    const idleMs = this.cfg.idleMs ?? 90_000
-    const hardMs = this.cfg.timeoutMs ?? 300_000
+    const firstByteMs = this.cfg.firstByteMs ?? LLM_DEFAULT_TIMEOUTS.firstByteMs
+    const idleMs = this.cfg.idleMs ?? LLM_DEFAULT_TIMEOUTS.idleMs
+    const hardMs = this.cfg.timeoutMs ?? LLM_DEFAULT_TIMEOUTS.timeoutMs
 
     // 三层计时：首字节（连不上/不回包）、块间空闲、整体兜底；任一层到期都 abort
     const ctrl = new AbortController()
@@ -208,9 +227,13 @@ export class OpenAiClient {
     const translate = (e: unknown): LlmError => {
       if (e instanceof LlmError) return e
       if (why === 'user') return new LlmError('LLM 请求已取消', false)
-      if (why === 'first-byte') return new LlmError(`LLM 首字节超时（${firstByteMs}ms 内没收到任何数据）`, true)
-      if (why === 'idle') return new LlmError(`LLM 流空闲超时（${idleMs}ms 没收到新数据，连接已中断）`, false)
-      if (why === 'hard') return new LlmError(`LLM 请求超时（${hardMs}ms）`, true)
+      if (why === 'first-byte')
+        return new LlmError(
+          `LLM 首字节超时（${fmtSecs(firstByteMs)}内没收到任何数据；上下文很长时服务端 prefill 会变慢，可在 config.json 里调大 firstByteSecs 或换更快的模型）`,
+          true,
+        )
+      if (why === 'idle') return new LlmError(`LLM 流空闲超时（${fmtSecs(idleMs)}没收到新数据，连接已中断）`, false)
+      if (why === 'hard') return new LlmError(`LLM 请求超时（${fmtSecs(hardMs)}）`, true)
       const msg = e instanceof Error ? e.message : String(e)
       return new LlmError(`LLM 请求失败：${msg}`, true)
     }

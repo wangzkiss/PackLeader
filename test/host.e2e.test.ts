@@ -117,6 +117,19 @@ test('host: load-config reloads hand-edited settings and applies them to the run
     assert.equal(loaded.hasKey, true)
     assert.equal(loaded.verify, 'npm test')
     assert.equal(loaded.vision, false)
+    // 没在 config.json 里写超时：回报的是内置默认（首字节 120s / 空闲 180s / 整体 900s）
+    assert.equal(loaded.firstByteSecs, 120)
+    assert.equal(loaded.idleSecs, 180)
+    assert.equal(loaded.requestSecs, 900)
+
+    // 手改超时（长上下文 prefill 慢的网关）→ 不重启就作用到运行中的客户端
+    await writeFile(join(s.dataDir, 'config.json'), JSON.stringify({ firstByteSecs: 240, idleSecs: 300 }), 'utf8')
+    s.host.send({ cmd: 'load-config' })
+    const reloaded = await s.host.next('config-loaded')
+    assert.equal(reloaded.firstByteSecs, 240)
+    assert.equal(reloaded.idleSecs, 300)
+    assert.equal(reloaded.requestSecs, 900, '没写的字段回到默认，不粘着上一次的值')
+    assert.equal(reloaded.baseURL, 'https://edited.example/v1', '只改了超时的文件不该把端点冲掉')
   } finally {
     await s.close()
   }

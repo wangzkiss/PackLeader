@@ -20,7 +20,24 @@ export interface Settings {
   verify?: string
   /** 模型能不能看图；开了才把图片作为 image part 发过去。缺省＝开（见 DEFAULT_VISION） */
   vision?: boolean
+  /**
+   * 首字节超时（秒）：请求发出去多久还没等到第一个字节就算失败。
+   * 长上下文（几十次工具调用之后）服务端 prefill 很慢，30 秒那种默认值会把正常请求判死，
+   * 所以缺省给到 120 秒；真遇到更慢的网关就在 config.json 里写大一点。
+   */
+  firstByteSecs?: number
+  /** 流空闲超时（秒）：两个数据块之间最多等多久，缺省 180 */
+  idleSecs?: number
+  /** 单次请求整体上限（秒），缺省 900 */
+  requestSecs?: number
 }
+
+/** 超时类字段的取值范围（秒）：手改坏了也不会把客户端设成 0 秒或者 100 小时 */
+export const TIMEOUT_RANGES = {
+  firstByteSecs: [5, 3600],
+  idleSecs: [5, 3600],
+  requestSecs: [30, 7200],
+} as const
 
 /**
  * 看图默认开。
@@ -36,6 +53,15 @@ export const visionFrom = (s: Settings): boolean => (typeof s.vision === 'boolea
 
 export const settingsPath = (dataDir: string): string => join(dataDir, 'config.json')
 
+/** 把设置里的秒折算成客户端的毫秒超时；没配的字段不出现，交给客户端自己的默认值 */
+export function llmTimeoutsOf(s: Settings): { firstByteMs?: number; idleMs?: number; timeoutMs?: number } {
+  const out: { firstByteMs?: number; idleMs?: number; timeoutMs?: number } = {}
+  if (typeof s.firstByteSecs === 'number') out.firstByteMs = s.firstByteSecs * 1000
+  if (typeof s.idleSecs === 'number') out.idleMs = s.idleSecs * 1000
+  if (typeof s.requestSecs === 'number') out.timeoutMs = s.requestSecs * 1000
+  return out
+}
+
 function coerce(raw: unknown): Settings {
   const out: Settings = {}
   if (!raw || typeof raw !== 'object') return out
@@ -45,6 +71,12 @@ function coerce(raw: unknown): Settings {
     if (typeof v === 'string' && v.trim()) out[k] = v.trim()
   }
   if (typeof obj.vision === 'boolean') out.vision = obj.vision
+  for (const k of ['firstByteSecs', 'idleSecs', 'requestSecs'] as const) {
+    const v = obj[k]
+    if (typeof v !== 'number' || !Number.isFinite(v)) continue
+    const [lo, hi] = TIMEOUT_RANGES[k]
+    out[k] = Math.min(hi, Math.max(lo, Math.round(v)))
+  }
   return out
 }
 
@@ -83,6 +115,11 @@ export async function saveSettings(dataDir: string, patch: Settings): Promise<Se
   if (patch.verify !== undefined) {
     if (patch.verify.trim()) merged.verify = patch.verify.trim()
     else delete merged.verify
+  }
+  // 超时是纯数字配置：界面上暂不暴露，但手写 config.json / 以后加输入框都能走这条路
+  for (const k of ['firstByteSecs', 'idleSecs', 'requestSecs'] as const) {
+    const v = patch[k]
+    if (typeof v === 'number' && Number.isFinite(v)) merged[k] = v
   }
   await mkdir(dataDir, { recursive: true })
   await writeFile(settingsPath(dataDir), `${JSON.stringify(merged, null, 2)}\n`, 'utf8')

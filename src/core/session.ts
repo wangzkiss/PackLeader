@@ -20,6 +20,8 @@ export interface SessionMeta {
   title?: string
   /** 分组名；空/缺省 = 未分组 */
   group?: string
+  /** 这个会话的工作目录：切会话时工具根跟着它走（缺省 = 启动时的工作目录） */
+  cwd?: string
 }
 
 /** id 会直接拼进路径，所有对外接 id 的入口都得先过这道 */
@@ -93,8 +95,11 @@ export class Session {
     const id = newSessionId()
     const dir = join(dataDir, 'sessions', id)
     await mkdir(dir, { recursive: true })
-    const session = new Session(id, dir, [], {})
+    const session = new Session(id, dir, [], { cwd: meta.cwd })
     await session.append({ kind: 'session/start', id, ...meta })
+    // 工作目录另存一份到 meta.json：切会话时只读这个小文件就能恢复工具根，
+    // 不必为了拿一个路径把整份 session.jsonl 解析一遍
+    await writeFile(join(dir, 'meta.json'), `${JSON.stringify(session.meta, null, 2)}\n`, 'utf8')
     return session
   }
 
@@ -214,6 +219,11 @@ export class Session {
       const g = patch.group.trim()
       if (g) next.group = g
       else delete next.group
+    }
+    if (patch.cwd !== undefined) {
+      const c = patch.cwd.trim()
+      if (c) next.cwd = c
+      else delete next.cwd
     }
     await mkdir(dir, { recursive: true })
     await writeFile(join(dir, 'meta.json'), `${JSON.stringify(next, null, 2)}\n`, 'utf8')

@@ -27,7 +27,7 @@ import { Checkpoints } from './core/checkpoint.ts'
 import { Agent } from './core/loop.ts'
 import { Policy } from './core/policy.ts'
 import { Session } from './core/session.ts'
-import { loadSettingsSync } from './core/settings.ts'
+import { llmTimeoutsOf, loadSettingsSync } from './core/settings.ts'
 import type { Mode } from './core/types.ts'
 import { OpenAiClient } from './llm/openai.ts'
 import { createDefaultTools } from './tools/index.ts'
@@ -95,6 +95,8 @@ interface Config {
   approval: 'ask' | 'allow' | 'deny'
   maxSteps: number
   verify: string
+  /** LLM 三层超时（毫秒）：来自 config.json 的 *Secs；不带的字段由客户端自己兜默认 */
+  llmTimeouts: { firstByteMs?: number; idleMs?: number; timeoutMs?: number }
 }
 
 function resolveConfig(flags: Record<string, string | boolean>): Config {
@@ -127,6 +129,8 @@ function resolveConfig(flags: Record<string, string | boolean>): Config {
     maxSteps: num(flags, 'max-steps') ?? 100,
     // 空串 = 自动识别（detectVerifier）
     verify: flags['no-verify'] === true ? '' : (str(flags, 'verify') ?? saved.verify ?? ''),
+    // 长上下文首次出字很慢，超时能在 config.json 里调（首字节 / 块间空闲 / 整体）
+    llmTimeouts: llmTimeoutsOf(saved),
   }
 }
 
@@ -449,7 +453,7 @@ async function main(): Promise<void> {
   const audit = await Audit.open(join(cfg.dataDir, 'audit.sqlite'))
   const checkpoints = new Checkpoints(join(cfg.dataDir, 'ckpt'))
   const tools = createDefaultTools({ root: cfg.root })
-  const llm = new OpenAiClient({ baseURL: cfg.baseURL, apiKey: cfg.apiKey, model: cfg.model })
+  const llm = new OpenAiClient({ baseURL: cfg.baseURL, apiKey: cfg.apiKey, model: cfg.model, ...cfg.llmTimeouts })
   const policy = new Policy(cfg.root, cfg.mode)
 
   const wantsTty = !json && interactive

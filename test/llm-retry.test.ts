@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { test } from 'node:test'
-import { OpenAiClient } from '../src/llm/openai.ts'
+import { LLM_DEFAULT_TIMEOUTS, OpenAiClient } from '../src/llm/openai.ts'
 
 type Handler = (req: IncomingMessage, res: ServerResponse, n: number) => void | Promise<void>
 
@@ -159,4 +159,26 @@ test('流发到一半卡住：按空闲超时失败', async () => {
   } finally {
     await srv.close()
   }
+})
+
+test('默认超时跟得上长上下文：首字节 120 秒、空闲 180 秒、整体 900 秒', () => {
+  const client = new OpenAiClient({ baseURL: 'http://127.0.0.1:1/v1', apiKey: 'sk-t', model: 'm' })
+  // 原来的 30 秒会把「一轮跑了 35 次工具之后服务端 prefill 变慢」的正常请求判死
+  assert.equal(client.cfg.firstByteMs, LLM_DEFAULT_TIMEOUTS.firstByteMs)
+  assert.ok(client.cfg.firstByteMs! >= 120_000, `首字节默认 ${client.cfg.firstByteMs}ms 太短`)
+  assert.ok(client.cfg.idleMs! >= 180_000)
+  assert.ok(client.cfg.timeoutMs! >= 900_000)
+})
+
+test('配置能单独覆盖其中一个超时，其余的用默认（没传的字段不能把默认打穿）', () => {
+  const client = new OpenAiClient({
+    baseURL: 'http://127.0.0.1:1/v1',
+    apiKey: 'sk-t',
+    model: 'm',
+    firstByteMs: 240_000,
+    idleMs: undefined,
+  })
+  assert.equal(client.cfg.firstByteMs, 240_000)
+  assert.equal(client.cfg.idleMs, LLM_DEFAULT_TIMEOUTS.idleMs, '显式 undefined 要回到默认值')
+  assert.equal(client.cfg.timeoutMs, LLM_DEFAULT_TIMEOUTS.timeoutMs)
 })

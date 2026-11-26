@@ -20,7 +20,9 @@ param(
   [string]$BaseUrl = $env:PL_GUI_BASE_URL,
   [string]$ApiKey = $env:PL_GUI_API_KEY,
   [string]$Model = $env:PL_GUI_MODEL,
-  [string]$Session = $env:PL_GUI_SESSION
+  [string]$Session = $env:PL_GUI_SESSION,
+  # 演示模式：不连 host，只回放 scripts/timeline-demo.json（看多轮执行流的样子）
+  [switch]$Demo
 )
 
 
@@ -1340,16 +1342,23 @@ function Format-ToolSecs([double]$ms) {
 function Update-ToolGroup($g) {
   if (-not $g) { return }
   $arrow = $(if ($g.Open) { '▾' } else { '▸' })
-  # 只要有一条跑完了就报合计（全是 0ms 的极快调用也报「共 <1ms」，免得时有时无）
+  # 左侧固定成「N 次工具调用 · 共 8.4s」：合计只算已经回来的调用，
+  # 还在跑的那件由右边的红字和底部胶囊报，这串数字才不会每 100ms 自己往上跳
   $done = $g.Count - $g.Running
   $total = $(if ($done -gt 0) { ' · 共 ' + (Format-ToolSecs $g.TotalMs) } else { '' })
   $g.Head.Text = "$arrow  $($g.Count) 次工具调用$total"
+  # 右侧：有调用在跑就先亮红字「运行中... · 」，后面才是各工具计数
+  if ($g.Running -gt 0) {
+    $g.Run.Text = '运行中... · '
+    $g.Run.Visibility = 'Visible'
+  } else {
+    $g.Run.Visibility = 'Collapsed'
+  }
   $parts = @()
   foreach ($k in $g.Order) { $parts += ("$k ×" + $g.Counts[$k]) }
   $sum = ($parts -join ' · ')
-  if ($g.Running -gt 0) { $sum = $(if ($sum) { "运行中… · $sum" } else { '运行中…' }) }
-  if ($g.Failed -gt 0) { $sum = "$sum · $($g.Failed) 失败" }
-  if ($sum.Length -gt 72) { $sum = $sum.Substring(0, 72) + '…' }
+  if ($g.Failed -gt 0) { $sum = $(if ($sum) { "$sum · $($g.Failed) 失败" } else { "$($g.Failed) 失败" }) }
+  if ($sum.Length -gt 64) { $sum = $sum.Substring(0, 64) + '…' }
   $g.Sum.Text = $sum
   $g.Sum.Foreground = $(if ($g.Failed -gt 0) { Brush '#F87171' } else { Brush '#6B7280' })
 }
@@ -1374,12 +1383,19 @@ function New-ToolGroup {
   $head.HorizontalContentAlignment = 'Stretch'
   $head.Template = (New-FlatTemplate)
   $dp = New-Object System.Windows.Controls.DockPanel
+  # 右边两块：DockPanel 从右往左排，所以先加计数（最右），再加红字前缀（在它左边）
   $sum = New-Text '' 10.5 '#6B7280' 'Normal' 'Cascadia Mono, Consolas' 0
   $sum.VerticalAlignment = 'Center'
   $sum.TextTrimming = 'CharacterEllipsis'
   $sum.TextWrapping = 'NoWrap'
   [System.Windows.Controls.DockPanel]::SetDock($sum, 'Right')
   $dp.Children.Add($sum) | Out-Null
+  $run = New-Text '运行中... · ' 10.5 '#F87171' 'SemiBold' 'Cascadia Mono, Consolas' 0
+  $run.VerticalAlignment = 'Center'
+  $run.TextWrapping = 'NoWrap'
+  $run.Visibility = 'Collapsed'
+  [System.Windows.Controls.DockPanel]::SetDock($run, 'Right')
+  $dp.Children.Add($run) | Out-Null
   $title = New-Text '▸  0 次工具调用' 11.5 '#C7CBD2' 'SemiBold' 'Segoe UI' 0
   $title.VerticalAlignment = 'Center'
   [System.Windows.Controls.DockPanel]::SetDock($title, 'Left')
@@ -1396,7 +1412,7 @@ function New-ToolGroup {
   (Get-ProcPanel).Children.Add($outer) | Out-Null
 
   $g = New-Object PSObject -Property @{
-    Head = $title; Sum = $sum; Items = $items; Border = $outer
+    Head = $title; Sum = $sum; Run = $run; Items = $items; Border = $outer
     Count = 0; Counts = @{}; Order = (New-Object System.Collections.ArrayList)
     Running = 0; Failed = 0; Open = $false; TotalMs = 0
   }
@@ -1430,6 +1446,90 @@ function Close-ToolGroup {
 function Reset-ToolGroup {
   Close-ToolGroup
   $script:toolGroup = $null
+}
+
+# ---------------------------------------------------------------- 底部实时状态胶囊
+# 消息流最下面那颗「✦ 执行 shell · 用时 27分37秒…」：现在还在跑的那件活儿。
+# 只要还有调用没回来就贴着最底部（有新内容追加就把它挪回来），全回来就撤掉。
+$script:bottomPill = $null
+$script:liveCalls = @{}
+$script:liveSeq = 0
+
+function Get-BottomPill {
+  if ($script:bottomPill) { return $script:bottomPill }
+
+  $outer = New-Object System.Windows.Controls.Border
+  $outer.Background = (Brush '#121627')
+  $outer.BorderBrush = (Brush '#8B9CFF')
+  $outer.BorderThickness = '1'
+  $outer.CornerRadius = '14'
+  $outer.Padding = '10,4'
+  $outer.Margin = '2,0,2,10'
+  $outer.HorizontalAlignment = 'Left'
+  $outer.Visibility = 'Collapsed'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($outer, 'LivePill')
+  # 蓝紫光晕：深底上一圈柔和投影，才看得出「还在跑」
+  $glow = New-Object System.Windows.Media.Effects.DropShadowEffect
+  $glow.Color = [System.Windows.Media.Color]::FromRgb(0x6C, 0x7B, 0xFF)
+  $glow.BlurRadius = 12
+  $glow.ShadowDepth = 0
+  $glow.Opacity = 0.55
+  $outer.Effect = $glow
+
+  $sp = New-Object System.Windows.Controls.StackPanel
+  $sp.Orientation = 'Horizontal'
+  $mark = New-Text '✦' 10.5 '#A9B4FF' 'Normal' 'Segoe UI' 0
+  $mark.VerticalAlignment = 'Center'
+  $mark.Margin = '0,0,7,0'
+  $sp.Children.Add($mark) | Out-Null
+  $txt = New-Text '' 11 '#C7CBD2' 'Normal' 'Segoe UI' 0
+  $txt.VerticalAlignment = 'Center'
+  $sp.Children.Add($txt) | Out-Null
+  $outer.Child = $sp
+
+  $script:renderHost.Children.Add($outer) | Out-Null
+  $script:bottomPill = @{ Border = $outer; Text = $txt }
+  return $script:bottomPill
+}
+
+# 工具开始跑：登记一条（并行时胶囊报跑得最久的那件）
+function Set-LiveCall([string]$id, [string]$name) {
+  $script:liveSeq = [int]$script:liveSeq + 1
+  $script:liveCalls[$id] = @{ Name = $name; T0 = (Get-Date); Seq = $script:liveSeq }
+  Update-BottomPill
+}
+
+# 工具回来了：摘掉一条；没有在跑的就把胶囊收起来
+function Clear-LiveCall([string]$id) {
+  if ($script:liveCalls.ContainsKey($id)) { $script:liveCalls.Remove($id) }
+  Update-BottomPill
+}
+
+function Reset-LiveCalls {
+  $script:liveCalls = @{}
+  Update-BottomPill
+}
+
+function Update-BottomPill {
+  $p = Get-BottomPill
+  $cur = $null
+  foreach ($k in @($script:liveCalls.Keys)) {
+    $c = $script:liveCalls[$k]
+    if (-not $cur -or $c.Seq -lt $cur.Seq) { $cur = $c }
+  }
+  if (-not $cur) {
+    $p.Border.Visibility = 'Collapsed'
+    return
+  }
+  $secs = ((Get-Date) - $cur.T0).TotalSeconds
+  $p.Text.Text = '执行 ' + $cur.Name + ' · 用时 ' + (Format-Elapsed $secs) + '…'
+  $p.Border.Visibility = 'Visible'
+  # 永远贴着最下面：这一轮后面新加的卡片会插到它后面，把它挪回来
+  $hostPanel = $script:renderHost
+  if ($hostPanel -and $p.Border.Parent -eq $hostPanel -and $hostPanel.Children.IndexOf($p.Border) -ne ($hostPanel.Children.Count - 1)) {
+    $hostPanel.Children.Remove($p.Border) | Out-Null
+    $hostPanel.Children.Add($p.Border) | Out-Null
+  }
 }
 
 function Add-ToolLine([string]$name, [string]$summary, [string]$argsText = '') {
@@ -3289,6 +3389,9 @@ function Clear-Transcript {
   $script:userElements = @{}
   $Transcript.Children.Clear()
   $script:todoCard = $null
+  # 底部胶囊挂在聊天区最后，连同在跑的调用一起清掉（下一件工具开始会重新建）
+  $script:bottomPill = $null
+  $script:liveCalls = @{}
   $script:currentAssistant = $null
   $script:pendingText.Clear() | Out-Null
   $script:reasonNode = $null
@@ -3330,6 +3433,24 @@ function Add-EmptyState {
 }
 
 # ---------------------------------------------------------------- 与 host 通信
+# 演示模式（-Demo）：不连 host，只回放 scripts/timeline-demo.json 里那三轮事件，
+# 用来看多轮执行流的完整效果（正文流 / 执行方案 / 底部胶囊），不真跑任何工具。
+$script:demoLines = @()
+$script:demoIdx = 0
+$script:demoWiped = $false
+# 回放的停顿：工具刚开始跑时多停一拍，胶囊和「运行中...」才看得见
+$script:demoHold = 0
+if ($Demo) {
+  $demoPath = Join-Path $root 'scripts\timeline-demo.json'
+  if (Test-Path $demoPath) {
+    # PS 5.1 的 Get-Content 按 ANSI 读，中文会乱码；显式按 UTF-8 读
+    $script:demoLines = @([System.IO.File]::ReadAllLines($demoPath, [System.Text.Encoding]::UTF8))
+    Log ("演示模式：" + $script:demoLines.Count + " 条事件，来自 " + $demoPath)
+  } else {
+    Log ("演示模式：找不到 " + $demoPath)
+  }
+}
+
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $node = (Get-Command node -ErrorAction SilentlyContinue).Source
 if (-not $node) { $node = 'node.exe' }
@@ -3351,8 +3472,11 @@ $psi.Arguments = ($hostArgs | ForEach-Object {
   if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
 }) -join ' '
 
-$proc = [System.Diagnostics.Process]::Start($psi)
-Log "host 已启动 pid=$($proc.Id)"
+$proc = $null
+if (-not $Demo) {
+  $proc = [System.Diagnostics.Process]::Start($psi)
+  Log "host 已启动 pid=$($proc.Id)"
+}
 
 # 深色标题栏：WPF 自己的 chrome 是白色的，只能调 DWM
 Add-Type -Namespace PL -Name Dwm -MemberDefinition @'
@@ -3408,13 +3532,18 @@ public class LinePump
 }
 '@ -Language CSharp
 
-$pumpOut = New-Object LinePump -ArgumentList $proc.StandardOutput
-$pumpOut.Start()
-$pumpErr = New-Object LinePump -ArgumentList $proc.StandardError
-$pumpErr.Start()
-Log '输出泵已启动'
+$pumpOut = $null
+$pumpErr = $null
+if ($proc) {
+  $pumpOut = New-Object LinePump -ArgumentList $proc.StandardOutput
+  $pumpOut.Start()
+  $pumpErr = New-Object LinePump -ArgumentList $proc.StandardError
+  $pumpErr.Start()
+  Log '输出泵已启动'
+}
 
 function Send-Host($obj) {
+  if (-not $proc) { return }
   try {
     $line = ($obj | ConvertTo-Json -Compress -Depth 6)
     # 必须走 BaseStream 自己写 UTF-8 字节：.NET Framework 4.8 的 StandardInput 是
@@ -4370,6 +4499,8 @@ function Handle-Event([string]$line) {
       }
       $st = Add-ToolLine ([string]$e.name) ([string]$e.summary) $argsText
       $script:toolRows[[string]$e.id] = $st
+      # 底部胶囊亮起来：「✦ 执行 shell · 用时 0 秒…」
+      Set-LiveCall ([string]$e.id) ([string]$e.name)
       $Scroller.ScrollToEnd()
     }
     'tool-end' {
@@ -4387,6 +4518,8 @@ function Handle-Event([string]$line) {
       if ([string]$e.name -eq 'todo_write' -and $e.data -and $e.data.items) {
         Update-TodoCard $e.data.items
       }
+      # 这件回来了：底部的胶囊换成还在跑的那件，全完了就收起来
+      Clear-LiveCall ([string]$e.id)
       $script:currentAssistant = $null
       $Scroller.ScrollToEnd()
     }
@@ -4504,6 +4637,8 @@ function Handle-Event([string]$line) {
     'turn-end' {
       Close-ToolGroup
       Complete-Reasoning
+      # 这一轮结束了：底部胶囊收起来（停止键中断时也一样）
+      Reset-LiveCalls
       # host 报的整轮耗时比界面上卡自己的墙钟更准
       if ($script:turnProc -and [int]$e.ms -gt 0) { $script:turnProc.Ms = [int]$e.ms }
       Close-TurnProc
@@ -4689,15 +4824,37 @@ $timer.Add_Tick({
       try { $alive = -not (Get-Process -Id ([int]$env:PL_GUI_PARENT_PID) -ErrorAction Stop).HasExited } catch { $alive = $false }
       if (-not $alive) { Log '启动器已退出，关闭窗口'; $window.Close(); return }
     }
-    for ($i = 0; $i -lt 300; $i++) {
-      $l = $pumpOut.Take()
-      if ($null -eq $l) { break }
-      if ($l.Trim()) { Handle-Event $l }
+    if ($pumpOut) {
+      for ($i = 0; $i -lt 300; $i++) {
+        $l = $pumpOut.Take()
+        if ($null -eq $l) { break }
+        if ($l.Trim()) { Handle-Event $l }
+      }
     }
-    for ($i = 0; $i -lt 50; $i++) {
-      $l = $pumpErr.Take()
-      if ($null -eq $l) { break }
-      if ($l.Trim()) { Log ("stderr: " + $l) }
+    if ($pumpErr) {
+      for ($i = 0; $i -lt 50; $i++) {
+        $l = $pumpErr.Take()
+        if ($null -eq $l) { break }
+        if ($l.Trim()) { Log ("stderr: " + $l) }
+      }
+    }
+    # 演示模式：每 200ms 喂一条，顺序和真跑一轮一样；开演前先把空态清掉
+    if ($script:demoLines.Count -gt 0 -and $script:demoIdx -lt $script:demoLines.Count) {
+      if (-not $script:demoWiped) {
+        $script:demoWiped = $true
+        Clear-Transcript
+        $TitleText.Text = '演示：三轮排查与修复'
+      }
+      if ($script:demoHold -gt 0) {
+        $script:demoHold--
+      } elseif (($script:tickCount % 3) -eq 0) {
+        $line = [string]$script:demoLines[$script:demoIdx]
+        $script:demoIdx++
+        Handle-Event $line
+        # 工具刚开始跑就多停一会儿（降 600ms），底部的胶囊和组头的「运行中...」才看得清楚
+        if ($line -match '"type":"tool-start"') { $script:demoHold = 12 }
+        elseif ($line -match '"type":"reasoning"') { $script:demoHold = 3 }
+      }
     }
     Continue-ReplayRender
     if ($script:pendingText.Length -gt 0 -and $script:currentAssistant) {
@@ -4712,13 +4869,15 @@ $timer.Add_Tick({
       if (($script:tickCount2 % 5) -eq 0) {
         Update-ThinkRow $script:thinkVerb
         Update-ReasoningTime $script:reasonNode
+        # 底部胶囊的「用时」也走这一拍（只改一行字，不重排整段）
+        if ($script:liveCalls.Count -gt 0) { Update-BottomPill }
         $tp = $script:turnProc
         if ($tp -and -not $tp.Done) {
           $tp.Clock.Text = (Format-Clock ((Get-Date) - $tp.T0).TotalSeconds)
         }
       }
     }
-    if ($pumpOut.Finished -and -not $script:hostGone) {
+    if ($pumpOut -and $pumpOut.Finished -and -not $script:hostGone) {
       $script:hostGone = $true
       Add-SystemLine 'host 进程已退出' '#F87171'
       Set-Busy $false

@@ -264,12 +264,12 @@ $xaml = @'
       <Grid Grid.Row="1">
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="*"/>
-          <ColumnDefinition Width="18"/>
+          <ColumnDefinition Width="22"/>
         </Grid.ColumnDefinitions>
         <ScrollViewer Grid.Column="0" x:Name="Scroller" VerticalScrollBarVisibility="Auto" Padding="24,18,16,18">
           <StackPanel x:Name="Transcript"/>
         </ScrollViewer>
-        <Border Grid.Column="1" Width="12" Margin="0,12,3,12" Background="#0DFFFFFF" CornerRadius="6"
+        <Border Grid.Column="1" Width="16" Margin="0,12,2,12" Background="#14FFFFFF" CornerRadius="8"
                 ToolTip="提问索引：点击标记跳到对应问题">
           <Canvas x:Name="QuestionIndexCanvas" ClipToBounds="True"/>
         </Border>
@@ -277,20 +277,28 @@ $xaml = @'
 
       <!-- 输入区 -->
       <Grid Grid.Row="3" Margin="24,0,24,14">
-        <Border Background="#16181D" BorderBrush="#1FFFFFFF" BorderThickness="1" CornerRadius="12" Padding="14,10,12,8">
+        <Border Background="#14171D" BorderBrush="#24FFFFFF" BorderThickness="1" CornerRadius="16" Padding="14,12,12,10">
           <StackPanel>
             <WrapPanel x:Name="AttachList" Orientation="Horizontal" Margin="0,0,0,7" Visibility="Collapsed"/>
-          <TextBox x:Name="Input" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="46" MaxHeight="160"
+          <Grid>
+            <TextBox x:Name="Input" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="44" MaxHeight="160"
                      Background="Transparent" Foreground="#F9FAFB" BorderThickness="0"
                      VerticalScrollBarVisibility="Auto" FontSize="13.5" FontFamily="Segoe UI"
                      CaretBrush="#F9FAFB" SelectionBrush="#2B5CFF" Padding="0"/>
+            <!-- 占位提示：空输入时显示，和 Kite 一样把用法写在框里，省掉底下那条说明 -->
+            <TextBlock x:Name="InputPlaceholder" Text="说点什么…（Enter 发送 · Shift+Enter 换行）"
+                       Foreground="#5B626D" FontSize="13.5" FontFamily="Segoe UI"
+                       IsHitTestVisible="False" VerticalAlignment="Top" Margin="1,1,0,0"
+                       TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"/>
+          </Grid>
             <DockPanel Margin="0,6,0,0">
-              <Button x:Name="AttachBtn" DockPanel.Dock="Left" Content="+ 附件" Height="26" Padding="9,0"
-                      Cursor="Hand" FontSize="11.5" Margin="0,0,10,0"
-                      Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF" BorderThickness="1"/>
+              <Button x:Name="AttachBtn" DockPanel.Dock="Left" Content="＋" Height="26" Width="26" Padding="0"
+                      Cursor="Hand" FontSize="15" Margin="0,0,8,0" VerticalAlignment="Center"
+                      Background="Transparent" Foreground="#8A9099" BorderBrush="#1FFFFFFF" BorderThickness="1"
+                      ToolTip="添加附件（也可 Ctrl+V 贴图 / 拖文件进来）"/>
               <Button x:Name="PickFolderBtn" DockPanel.Dock="Left" Content="目录" Height="26" Padding="9,0"
-                      Cursor="Hand" FontSize="11" Margin="0,0,10,0" MaxWidth="240"
-                      Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF" BorderThickness="1"
+                      Cursor="Hand" FontSize="11" Margin="0,0,10,0" MaxWidth="240" VerticalAlignment="Center"
+                      Background="Transparent" Foreground="#8A9099" BorderBrush="#1FFFFFFF" BorderThickness="1"
                       ToolTip="切换工作目录"/>
               <!-- 模型和权限都放在输入框下面这条：发消息时就在手边，不用再往左上角去找 -->
               <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" HorizontalAlignment="Right">
@@ -313,12 +321,15 @@ $xaml = @'
                 <Button x:Name="StopBtn" Content="停止" Height="26" Padding="10,0" Cursor="Hand" FontSize="11.5"
                         Background="Transparent" Foreground="#F87171" BorderBrush="#66F87171" BorderThickness="1"
                         IsEnabled="False" Visibility="Collapsed"/>
-                <Button x:Name="SendBtn" Content="发送" Height="26" Padding="14,0" Cursor="Hand" FontSize="11.5"
-                        FontWeight="SemiBold" Background="#2B5CFF" Foreground="White" BorderThickness="0"/>
+                <!-- 发送键：圆形蓝底箭头（Segoe MDL2 的 E724），图标不随忙碌态改字，靠 ToolTip 区分发送/插话 -->
+                <Button x:Name="SendBtn" Content="&#xE724;" Height="28" Width="28" Padding="0" Cursor="Hand"
+                        FontSize="12" FontFamily="Segoe MDL2 Assets"
+                        Background="#2B5CFF" Foreground="White" BorderThickness="0"
+                        ToolTip="发送（Enter）"/>
               </StackPanel>
-              <TextBlock x:Name="Hint" DockPanel.Dock="Left" Text="Enter 发送（跑着时插话）· Shift+Enter 换行 · Ctrl+V 贴图/附件"
-                         Foreground="#5B626D" FontSize="10.5" VerticalAlignment="Center"
-                         TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"/>
+              <!-- 用法提示已并进输入框占位符，这里留空占位（有人按名字找它） -->
+              <TextBlock x:Name="Hint" DockPanel.Dock="Left" Text="" Visibility="Collapsed"
+                         Foreground="#5B626D" FontSize="10.5" VerticalAlignment="Center"/>
             </DockPanel>
           </StackPanel>
         </Border>
@@ -640,6 +651,13 @@ $Scroller.Add_PreviewMouseWheel({
   Load-OlderHistory
 })
 $InputBox = $window.FindName('Input')
+$script:inputPlaceholder = $window.FindName('InputPlaceholder')
+# 输入框空着就显示占位提示（PS 5.1 事件里拿不到局部变量，用 $script: 传）
+$InputBox.Add_TextChanged({
+  param($s, $e)
+  $ph = $script:inputPlaceholder
+  if ($ph) { $ph.Visibility = $(if ($s.Text -and $s.Text.Trim()) { 'Collapsed' } else { 'Visible' }) }
+})
 $SendBtn = $window.FindName('SendBtn')
 $StopBtn = $window.FindName('StopBtn')
 $UsageText = $window.FindName('UsageText')
@@ -837,13 +855,20 @@ function Show-CopyMenu([object]$el) {
 }
 function Add-UserMessage([string]$text, [object]$files = $null) {
   $sp = Add-Container 20
-  $label = New-Text '你' 10.5 '#6B7280' 'Normal' 'Segoe UI' 4
-  $sp.Children.Add($label) | Out-Null
+  # Kite 风：自己说的话是右侧一块蓝底圆角气泡，和助手的正文一眼分得开
+  $sp.HorizontalAlignment = 'Right'
+  $bubble = New-Object System.Windows.Controls.Border
+  $bubble.Background = (Brush '#2B5CFF')
+  $bubble.CornerRadius = '14'
+  $bubble.Padding = '13,9,13,9'
+  $bubble.HorizontalAlignment = 'Right'
+  $bubble.MaxWidth = 680
+  $inner = New-Object System.Windows.Controls.StackPanel
   if ($text.Trim()) {
-    $body = New-Text $text 14 '#F9FAFB' 'Normal' 'Segoe UI' 0
-    $body.LineHeight = 23
+    $body = New-Text $text 13.5 '#FFFFFF' 'Normal' 'Segoe UI' 0
+    $body.LineHeight = 22
     $body.LineStackingStrategy = 'BlockLineHeight'
-    $sp.Children.Add($body) | Out-Null
+    $inner.Children.Add($body) | Out-Null
   }
   # 附件：只显示名字和大小，不显示数据目录里那一长串路径
   # 老会话的 user/message 可能没有 files 字段（$null）：@($null) 会得到一个元素，
@@ -885,8 +910,10 @@ function Add-UserMessage([string]$text, [object]$files = $null) {
       }
       $wrap.Children.Add($b) | Out-Null
     }
-    $sp.Children.Add($wrap) | Out-Null
+    $inner.Children.Add($wrap) | Out-Null
   }
+  $bubble.Child = $inner
+  $sp.Children.Add($bubble) | Out-Null
   Set-CopyMenu $sp @{ text = "你：$text" }
   Append-CopyLog "你：$text"
   $script:lastUserElement = $sp
@@ -2155,25 +2182,97 @@ function Render-ReplayEvent($ev) {
 function Draw-QuestionIndex {
   if (-not $QuestionIndexCanvas) { return }
   $QuestionIndexCanvas.Children.Clear()
+  $script:qiBar = $null
   $h = $QuestionIndexCanvas.ActualHeight
   if ($h -le 0 -or $script:historyCount -le 0) { return }
+  # 视口框：半透明浅色块 + 一圈亮边，盖在点上面（ZIndex 10）。
+  # 只把颜色调淡的竖条在密集的点里根本看不出来，有边框才分得清「当前读到哪一段」
+  $bar = New-Object System.Windows.Shapes.Rectangle
+  $bar.Width = 12
+  $bar.Fill = (Brush '#14FFFFFF')
+  $bar.Stroke = (Brush '#59FFFFFF')
+  $bar.StrokeThickness = 1
+  $bar.RadiusX = 6
+  $bar.RadiusY = 6
+  $bar.IsHitTestVisible = $false
+  [System.Windows.Controls.Canvas]::SetLeft($bar, 1)
+  [System.Windows.Controls.Panel]::SetZIndex($bar, 10)
+  $QuestionIndexCanvas.Children.Add($bar) | Out-Null
+  $script:qiBar = $bar
+  $n = 0
+  # 问题特别多时（几百轮）点会重叠成一条蓝带：按可用高度压缩每个点的高度
+  $qCount = @($script:historyQuestions).Count
+  $dotH = 6.0
+  if ($qCount -gt 0) { $dotH = [math]::Max(1.5, [math]::Min(6.0, ($h - 8) / $qCount)) }
+  $script:qiDotH = $dotH
   foreach ($q in @($script:historyQuestions)) {
+    $n++
     $dot = New-Object System.Windows.Shapes.Ellipse
-    $dot.Width = 5
-    $dot.Height = 5
-    $dot.Fill = (Brush '#8FA6FF')
-    $dot.Opacity = 0.75
+    $dot.Width = 6
+    $dot.Height = $dotH
+    $dot.Fill = (Brush '#9DB4FF')
+    $dot.Opacity = 0.85
     $dot.Cursor = 'Hand'
-    $dot.ToolTip = [string]$q.text
+    $dot.ToolTip = "第 $n 个提问：$([string]$q.text)"
     $dot.Tag = [int]$q.eventIndex
-    [System.Windows.Controls.Canvas]::SetLeft($dot, 3)
-    [System.Windows.Controls.Canvas]::SetTop($dot, [math]::Max(0, [math]::Min($h - 5, ($q.eventIndex / [double]$script:historyCount) * $h)))
+    [System.Windows.Controls.Canvas]::SetLeft($dot, 5)
+    [System.Windows.Controls.Canvas]::SetTop($dot, [math]::Max(0, [math]::Min($h - $dotH, ($q.eventIndex / [double]$script:historyCount) * $h)))
+    # 鼠标划过时放大变亮：条很窄，不这样几乎点不中
+    $dot.Add_MouseEnter({
+      param($s, $e)
+      $s.Opacity = 1
+      $s.Width = 10
+      $s.Height = [math]::Max(10.0, [double]$script:qiDotH)
+      $s.Fill = (Brush '#FFFFFF')
+    })
+    $dot.Add_MouseLeave({
+      param($s, $e)
+      $s.Opacity = 0.85
+      $s.Width = 6
+      $s.Height = [double]$script:qiDotH
+      $s.Fill = (Brush '#9DB4FF')
+    })
     $dot.Add_MouseLeftButtonUp({ param($s, $e) Jump-ToQuestion ([int]$s.Tag) })
     $QuestionIndexCanvas.Children.Add($dot) | Out-Null
   }
+  Update-QuestionIndexBar
+}
+
+# 滚动时只挪那根视口条，不重画全部标记（不然长对话一滚就卡）
+function Update-QuestionIndexBar {
+  if (-not $script:qiBar) { return }
+  $h = $QuestionIndexCanvas.ActualHeight
+  $ext = [double]$Scroller.ExtentHeight
+  if ($h -le 0 -or $ext -le 0) {
+    $script:qiBar.Visibility = 'Collapsed'
+    return
+  }
+  $vh = [double]$Scroller.ViewportHeight
+  # 标记是按「全部事件」的位置等分画的，视口条必须用同一套坐标。
+  # 只渲染了尾巴（historyBefore > 0）时，直接拿已渲染内容的比例去定位会让
+  # 视口条占满整条、和点对不上：把窗口 [historyBefore, historyCount) 映射回全局，
+  # 起点 g0 = historyBefore / historyCount，窗口内的滚动比例 p 再线性摊进去。
+  $total = [double]$script:historyCount
+  $g0 = 0.0
+  if ($total -gt 0) {
+    $g0 = [math]::Max(0.0, [math]::Min(1.0, ([double]$script:historyBefore) / $total))
+  }
+  $span = [math]::Max(0.0, 1.0 - $g0)
+  $scrollable = $ext - $vh
+  $p = 0.0
+  if ($scrollable -gt 0) {
+    $p = [math]::Max(0.0, [math]::Min(1.0, ([double]$Scroller.VerticalOffset) / $scrollable))
+  }
+  $hh = [math]::Max(14.0, $span * ($vh / $ext) * $h)
+  if ($hh -gt $h) { $hh = $h }
+  $top = ($g0 + $span * $p) * $h
+  $script:qiBar.Visibility = 'Visible'
+  $script:qiBar.Height = $hh
+  [System.Windows.Controls.Canvas]::SetTop($script:qiBar, [math]::Max(0, [math]::Min($h - $hh, $top)))
 }
 
 $QuestionIndexCanvas.Add_SizeChanged({ Draw-QuestionIndex })
+$Scroller.Add_ScrollChanged({ Update-QuestionIndexBar })
 
 function Send-HistoryRequest([string]$mode, [int]$cursor = 0, [int]$target = 0) {
   if ($script:historyLoading) { return }
@@ -2237,8 +2336,25 @@ function Continue-ReplayRender {
     $Scroller.UpdateLayout()
     $delta = $Scroller.ExtentHeight - [double]$chunkExtent
     if ($delta -gt 0) { $Scroller.ScrollToVerticalOffset($chunkOffset + $delta) }
+  } elseif ($job.mode -eq 'tail' -or ($job.mode -eq 'after' -and $script:historyTailFill)) {
+    # 首屏边画边贴底：不然用户会看着内容从上往下填，而 Kite 切过去就是直接停在最新一条
+    $Scroller.ScrollToEnd()
   }
-  if ([int]$job.next -lt $job.events.Count) { return }
+  if ([int]$job.next -lt $job.events.Count) {
+    # 靠 50ms 定时器轮询接着画的话，每帧只干 12ms、空等 38ms，长历史切过去就是
+    # 一段一段往外冒（实测 198 个事件要 2.3 秒）。这里画完立刻排下一片，只在两片
+    # 之间让出一次输入响应，整段连着读完，体感从「慢慢长出来」变成「一下就有了」。
+    if (-not $script:renderQueued) {
+      $script:renderQueued = $true
+      [System.Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
+        [System.Windows.Threading.DispatcherPriority]::Background,
+        [Action]{
+          $script:renderQueued = $false
+          Continue-ReplayRender
+        }) | Out-Null
+    }
+    return
+  }
 
   Close-ToolGroup
   $script:currentAssistant = $null
@@ -2722,6 +2838,31 @@ function New-SendTemplate {
   return $script:sendTpl
 }
 
+# 圆形发送键：28x28 蓝底圆形箭头，悬停亮一点、禁用变暗蓝
+function New-SendCircleTemplate {
+  if ($script:sendCircleTpl) { return $script:sendCircleTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="14" Padding="{TemplateBinding Padding}">
+    <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#3D6CFF"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#2450E0"/>
+    </Trigger>
+    <Trigger Property="IsEnabled" Value="False">
+      <Setter TargetName="bd" Property="Background" Value="#2F3A5C"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:sendCircleTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:sendCircleTpl
+}
+
 # 危险操作（删除/确认删）：红底按钮，悬停亮一点；不走系统模板，避免悬停变白底
 function New-DangerTemplate {
   if ($script:dangerTpl) { return $script:dangerTpl }
@@ -2758,7 +2899,7 @@ $PickFolderBtn.Template = (New-FlatTemplate)
 $StopBtn.Template = (New-FlatTemplate)
 $NewChatBtn.Template = (New-FlatTemplate)
 $SettingsBtn.Template = (New-FlatTemplate)
-$SendBtn.Template = (New-SendTemplate)
+$SendBtn.Template = (New-SendCircleTemplate)
 # 设置面板、确认框、预览、输入浮层里的按钮也要同一套，不然一悬停就冒浅色块
 $CfgFetch.Template = (New-FlatTemplate)
 $CfgOpenLogs.Template = (New-FlatTemplate)
@@ -3196,7 +3337,7 @@ function Set-Busy([bool]$on) {
   # 跑着的时候不隐藏发送键：点它就是插话（插队），旁边另有「停止」
   $SendBtn.IsEnabled = $true
   $SendBtn.Visibility = 'Visible'
-  $SendBtn.Content = $(if ($on) { '插话' } else { '发送' })
+  $SendBtn.ToolTip = $(if ($on) { '插话（跑着时插队，模型下一步就看到）' } else { '发送（Enter）' })
   $StopBtn.IsEnabled = $on
   $StopBtn.Visibility = $(if ($on) { 'Visible' } else { 'Collapsed' })
   if ($on) {

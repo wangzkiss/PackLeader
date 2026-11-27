@@ -442,6 +442,13 @@ $xaml = @'
                      TextWrapping="Wrap"/>
           <TextBlock x:Name="InputHint" Text="" Foreground="#6B7280" FontSize="10.5" Margin="0,7,0,0"
                      TextWrapping="Wrap" LineHeight="16"/>
+          <!-- 已存的分组列在这里让人点，不用记名字；输入框里打名字仍然可以新建 -->
+          <Border x:Name="InputGroupBox" Visibility="Collapsed" Margin="0,12,0,0" Padding="8" CornerRadius="8"
+                  Background="#0F1115" BorderBrush="#1FFFFFFF" BorderThickness="1">
+            <ScrollViewer x:Name="InputGroupScroll" MaxHeight="148" VerticalScrollBarVisibility="Auto">
+              <StackPanel x:Name="InputGroupList" AutomationProperties.AutomationId="InputGroupList"/>
+            </ScrollViewer>
+          </Border>
           <TextBox x:Name="InputField" AutomationProperties.AutomationId="InputField" Height="30"
                    Margin="0,12,0,0" Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF"
                    BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center" FontSize="12"
@@ -726,6 +733,8 @@ $InputHint = $window.FindName('InputHint')
 $InputField = $window.FindName('InputField')
 $InputYes = $window.FindName('InputYes')
 $InputNo = $window.FindName('InputNo')
+$InputGroupBox = $window.FindName('InputGroupBox')
+$InputGroupList = $window.FindName('InputGroupList')
 
 # ---------------------------------------------------------------- 画东西的小工具
 # Brush / FontFamily 缓存：回放长会话要建几千个，每次都解析颜色字符串、每次新建 FontFamily 太浪费
@@ -3265,9 +3274,10 @@ function New-SessionMenu([object]$box) {
     param($s, $e)
     $b = $s.Tag
     $hint = $(if (@($script:sessionGroups).Count -gt 0) {
-      '已有分组：' + (@($script:sessionGroups) -join '、') + '。填新名字就是新建一个分组；留空＝移到未分组'
+      '点下面已有的分组，或直接打一个新名字（回车）＝新建分组；留空＝移到未分组'
     } else { '填一个组名（比如项目名）；留空＝未分组' })
     Show-Input -title '移到分组' -hint $hint -value ([string]$b.group) -okText '移动' `
+               -choices @($script:sessionGroups) -choiceCurrent ([string]$b.group) `
                -onOk { param($r) Send-Host @{ cmd = 'group-session'; id = [string]$r.arg.id; group = [string]$r.text } } `
                -arg @{ id = [string]$b.id }
   })
@@ -3358,7 +3368,7 @@ function New-SessionRow($it) {
   [System.Windows.Controls.Grid]::SetColumn($del, 1)
   $grid.Children.Add($del) | Out-Null
 
-  $row.Tag = @{ id = $sid; title = $stitle; group = ([string]$it.group); del = $del }
+  $row.Tag = @{ id = $sid; title = $stitle; group = ([string]$it.group); del = $del; dragging = $false; dragStart = $null }
   $del.Tag = $row.Tag
   $del.Add_Click({
     param($s, $ev)
@@ -3377,15 +3387,44 @@ function New-SessionRow($it) {
 
   $row.Add_MouseLeftButtonUp({
     param($s, $e)
+    # 刚拖完的那一下松手不算「点开这个会话」
+    if ($s.Tag.dragging) { $s.Tag.dragging = $false; return }
     Send-Host @{ cmd = 'load-session'; id = [string]$s.Tag.id }
   })
   $row.Add_MouseEnter({
     param($s, $e)
-    $s.Background = (Brush '#1B2029')
+    if (-not $s.Tag.dragging) { $s.Background = (Brush '#1B2029') }
     $s.Tag.del.Visibility = 'Visible'
+  })
+  # 拖动会话行到分组头上 = 移进那个分组（组头 Drop 里接手）。
+  # 按下先记起点，移动超过一行的判定阈值才真正启动拖动——否则手一抖就把「点」变成「拖」，
+  # 会话切不过去。松手后 $s.Tag.dragging 还留着 true，交给 MouseLeftButtonUp 跳过这一次点击。
+  $row.AllowDrop = $true
+  $row.Add_PreviewMouseLeftButtonDown({
+    param($s, $e)
+    $s.Tag.dragging = $false
+    $s.Tag.dragStart = $e.GetPosition($s)
+  })
+  $row.Add_PreviewMouseMove({
+    param($s, $e)
+    if ($e.LeftButton -ne [System.Windows.Input.MouseButtonState]::Pressed) { return }
+    $p0 = $s.Tag.dragStart
+    if (-not $p0) { return }
+    if ($s.Tag.dragging) { return }
+    $p = $e.GetPosition($s)
+    if ([math]::Abs($p.X - $p0.X) -lt 6 -and [math]::Abs($p.Y - $p0.Y) -lt 6) { return }
+    $s.Tag.dragging = $true
+    try {
+      [System.Windows.DragDrop]::DoDragDrop($s, [System.Windows.DataObject]::new('PackLeaderSession', [string]$s.Tag.id),
+        [System.Windows.DragDropEffects]::Move)
+    } catch {
+      Log ('拖动会话失败: ' + ($_ | Out-String))
+    }
+    $s.Tag.dragStart = $null
   })
   $row.Add_MouseLeave({
     param($s, $e)
+    $s.Tag.dragStart = $null
     $s.Tag.del.Visibility = 'Hidden'
     if ($s.Tag.id -eq [string]$script:sessionId) { $s.Background = (Brush '#263450') }
     else { $s.Background = [System.Windows.Media.Brushes]::Transparent }
@@ -3479,6 +3518,34 @@ function Set-Sessions($items) {
       $head.Content = $hline
       $head.Tag = @{ key = $g; panel = $panel; chevron = $ch }
       $head.Add_Click({ param($s, $e) Toggle-SessionGroup $s.Tag })
+      # 拖放目标：会话行拖到组头 = 移进这个组（未分组头的 key 是空串，正好对应「取消分组」）
+      $head.AllowDrop = $true
+      $head.Add_DragOver({
+        param($s, $e)
+        if (-not $e.Data.GetDataPresent('PackLeaderSession')) { return }
+        $e.Effects = [System.Windows.DragDropEffects]::Move
+        $e.Handled = $true
+      })
+      $head.Add_DragEnter({
+        param($s, $e)
+        if (-not $e.Data.GetDataPresent('PackLeaderSession')) { return }
+        $s.Background = (Brush '#263450')
+      })
+      $head.Add_DragLeave({
+        param($s, $e)
+        $s.Background = [System.Windows.Media.Brushes]::Transparent
+      })
+      $head.Add_Drop({
+        param($s, $e)
+        $s.Background = [System.Windows.Media.Brushes]::Transparent
+        if (-not $e.Data.GetDataPresent('PackLeaderSession')) { return }
+        $sid2 = [string]$e.Data.GetData('PackLeaderSession')
+        if (-not $sid2) { return }
+        $e.Handled = $true
+        # 拖进来等于一次显式移动：即使目标组和当前组相同也发一次（幂等），
+        # 省掉「怎么没反应」的困惑——组名一样时 host 只会重写同一个 meta
+        Send-Host @{ cmd = 'group-session'; id = $sid2; group = [string]$s.Tag.key }
+      })
       $SessionList.Children.Add($head) | Out-Null
       $panel.Visibility = $(if ($collapsed) { 'Collapsed' } else { 'Visible' })
     }
@@ -4633,14 +4700,58 @@ $ConfirmYes.Add_Click({
 $script:inputRun = $null
 $script:inputArg = $null
 
+# 已存分组的选择项：点一下就等于「在输入框里填了这个名字」
+# （回车/「移动」走的还是同一个 submit，不另开一条路径）
+function Set-InputChoices([string[]]$names, [string]$current) {
+  $InputGroupList.Children.Clear()
+  $list = @($names | Where-Object { $_ })
+  if ($list.Count -eq 0) {
+    $InputGroupBox.Visibility = 'Collapsed'
+    return
+  }
+  $InputGroupBox.Visibility = 'Visible'
+  # 「未分组」放最前：从某个组里退出来也是常见操作
+  $all = @('') + $list
+  foreach ($n in $all) {
+    $label = $(if ($n) { $n } else { '未分组' })
+    $isCur = ([string]$n -eq [string]$current)
+    $b = New-Object System.Windows.Controls.Button
+    $b.Content = $(if ($isCur) { $label + '  ✓' } else { $label })
+    $b.Tag = [string]$n
+    $b.Height = 26
+    $b.Margin = '0,0,0,4'
+    $b.Padding = '9,0'
+    $b.HorizontalContentAlignment = 'Left'
+    $b.Cursor = 'Hand'
+    $b.FontSize = 11.5
+    $b.BorderThickness = '1'
+    $b.Background = $(if ($isCur) { Brush '#263450' } else { [System.Windows.Media.Brushes]::Transparent })
+    $b.Foreground = $(if ($isCur) { Brush '#8AB4FF' } else { Brush '#C7CBD2' })
+    $b.BorderBrush = $(if ($isCur) { Brush '#4D8AB4FF' } else { Brush '#1FFFFFFF' })
+    $b.Template = (New-FlatTemplate)
+    [System.Windows.Automation.AutomationProperties]::SetAutomationId($b, 'InputGroupOption')
+    [System.Windows.Automation.AutomationProperties]::SetName($b, $label)
+    $b.Add_Click({
+      param($s, $e)
+      # 点选只是把名字填进输入框：用户还能改，或者点「移动」确认
+      $InputField.Text = [string]$s.Tag
+      $InputField.Focus() | Out-Null
+      $InputField.CaretIndex = ([string]$InputField.Text).Length
+    })
+    $InputGroupList.Children.Add($b) | Out-Null
+  }
+}
+
 # 回调参数：$r.arg 是调用方给的上下文，$r.text 是用户输入（已 Trim）
 function Show-Input {
-  param([string]$title, [string]$hint = '', [string]$value = '', [string]$okText = '确定', [scriptblock]$onOk, [object]$arg)
+  param([string]$title, [string]$hint = '', [string]$value = '', [string]$okText = '确定', [scriptblock]$onOk, [object]$arg,
+        [string[]]$choices = @(), [string]$choiceCurrent = '')
   $InputTitle.Text = $title
   $InputHint.Text = $hint
   $InputHint.Visibility = $(if ($hint) { 'Visible' } else { 'Collapsed' })
   $InputField.Text = $value
   $InputYes.Content = $okText
+  Set-InputChoices $choices $(if ($choiceCurrent) { $choiceCurrent } else { $value })
   $script:inputRun = $onOk
   $script:inputArg = $arg
   $InputOverlay.Visibility = 'Visible'
@@ -4650,6 +4761,8 @@ function Show-Input {
 
 function Hide-Input {
   $InputOverlay.Visibility = 'Collapsed'
+  $InputGroupBox.Visibility = 'Collapsed'
+  $InputGroupList.Children.Clear()
   $script:inputRun = $null
   $script:inputArg = $null
 }

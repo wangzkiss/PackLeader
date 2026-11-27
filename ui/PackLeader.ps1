@@ -230,25 +230,23 @@ $xaml = @'
         <RowDefinition Height="Auto"/>
       </Grid.RowDefinitions>
 
-      <!-- 顶栏 -->
+      <!-- 顶栏：logo 贴左、标题居中、设置贴右——三样都放同一个单元格各自对齐，
+           这样标题是「相对整个内容区」居中的；拆成三列时两侧列宽不等会把标题推偏。 -->
       <Border Grid.Row="0" BorderBrush="#12FFFFFF" BorderThickness="0,0,0,1" Padding="24,0" Height="48">
-        <DockPanel VerticalAlignment="Center">
-          <StackPanel Orientation="Horizontal" DockPanel.Dock="Left" VerticalAlignment="Center">
-            <Border Width="18" Height="18" CornerRadius="5" Background="#2B5CFF" VerticalAlignment="Center" Margin="0,0,9,0">
-              <TextBlock Text="P" Foreground="White" FontSize="11" FontWeight="Bold"
-                         HorizontalAlignment="Center" VerticalAlignment="Center"/>
-            </Border>
-            <TextBlock x:Name="TitleText" Text="新对话" Foreground="#F9FAFB" FontSize="13" FontWeight="SemiBold"
-                       VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="420"/>
-            <TextBlock x:Name="SubTitle" Text="" Foreground="#6B7280" FontSize="11" Margin="10,1,0,0"
-                       VerticalAlignment="Center"/>
-          </StackPanel>
-          <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" HorizontalAlignment="Right" VerticalAlignment="Center">
-            <Button x:Name="SettingsBtn" Content="设置" Height="24" Padding="8,0" Cursor="Hand" FontSize="11"
-                    Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF" BorderThickness="1"
-                    ToolTip="填写模型端点地址和 API Key"/>
-          </StackPanel>
-        </DockPanel>
+        <Grid>
+          <Border Width="18" Height="18" CornerRadius="5" Background="#2B5CFF"
+                  HorizontalAlignment="Left" VerticalAlignment="Center">
+            <TextBlock Text="P" Foreground="White" FontSize="11" FontWeight="Bold"
+                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
+          </Border>
+          <TextBlock x:Name="TitleText" Text="新对话" Foreground="#F9FAFB" FontSize="13"
+                     FontWeight="SemiBold" HorizontalAlignment="Center" VerticalAlignment="Center"
+                     TextTrimming="CharacterEllipsis" MaxWidth="520" Margin="72,0"/>
+          <Button x:Name="SettingsBtn" Content="设置" Height="24" Padding="8,0" Cursor="Hand"
+                  FontSize="11" Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF"
+                  BorderThickness="1" HorizontalAlignment="Right" VerticalAlignment="Center"
+                  ToolTip="填写模型端点地址和 API Key"/>
+        </Grid>
       </Border>
 
       <!-- 读秒条：这一轮在跑时贴在输入框上方显示「思考中 · 用时 12 秒」，空闲时收起（整行高度归零） -->
@@ -314,17 +312,12 @@ $xaml = @'
                 <Button x:Name="ModelPill" Content="模型" Height="26" Padding="9,0" Cursor="Hand" FontSize="11"
                         FontFamily="Cascadia Mono, Consolas" Background="#16181D" Foreground="#ADB2B8"
                         BorderBrush="#1FFFFFFF" BorderThickness="1" ToolTip="切换模型" Margin="0,0,8,0"/>
-                <Border Background="#16181D" BorderBrush="#1FFFFFFF" BorderThickness="1" CornerRadius="6"
-                        Padding="2,0" Margin="0,0,10,0">
-                  <StackPanel Orientation="Horizontal">
-                    <Button x:Name="ModeRead" Content="只读" Cursor="Hand" FontSize="10.5" Padding="7,2" Height="22"
-                            Background="Transparent" Foreground="#ADB2B8" BorderThickness="0" ToolTip="只能读，改动一律拒绕"/>
-                    <Button x:Name="ModeGuard" Content="询问" Cursor="Hand" FontSize="10.5" Padding="7,2" Height="22"
-                            Background="Transparent" Foreground="#ADB2B8" BorderThickness="0" ToolTip="改文件 / 跑命令前先问你"/>
-                    <Button x:Name="ModeFull" Content="完全" Cursor="Hand" FontSize="10.5" Padding="7,2" Height="22"
-                            Background="Transparent" Foreground="#ADB2B8" BorderThickness="0" ToolTip="全部放行，不再询问"/>
-                  </StackPanel>
-                </Border>
+                <!-- 权限：一个胶囊 + 向上弹出的菜单（三档带图标、当前项打勾）。
+                     原来三个按钮平铺，档位名一长（工作区内修改）就横着挤满一条，
+                     而且看不出「当前是哪一档」以外还有哪些可选。 -->
+                <Button x:Name="ModePill" Height="26" Padding="8,0" Cursor="Hand" FontSize="11"
+                        Background="#16181D" Foreground="#ADB2B8" BorderBrush="#1FFFFFFF"
+                        BorderThickness="1" ToolTip="点一下切换权限档位" Margin="0,0,10,0"/>
                 <Button x:Name="StopBtn" Content="停止" Height="26" Padding="10,0" Cursor="Hand" FontSize="11.5"
                         Background="Transparent" Foreground="#F87171" BorderBrush="#66F87171" BorderThickness="1"
                         IsEnabled="False" Visibility="Collapsed"/>
@@ -690,14 +683,12 @@ $UsageText = $window.FindName('UsageText')
 $ThinkRow = $window.FindName('ThinkRow')
 $ThinkText = $window.FindName('ThinkText')
 $PickFolderBtn = $window.FindName('PickFolderBtn')
-$ModeRead = $window.FindName('ModeRead')
-$ModeGuard = $window.FindName('ModeGuard')
-$ModeFull = $window.FindName('ModeFull')
+$ModePill = $window.FindName('ModePill')
 $ModelPill = $window.FindName('ModelPill')
 $NewChatBtn = $window.FindName('NewChatBtn')
 $SessionList = $window.FindName('SessionList')
 $TitleText = $window.FindName('TitleText')
-$SubTitle = $window.FindName('SubTitle')
+# 顶栏不再有权限副标题：档位改由输入框下面的权限胶囊全权表达（中文名 + 图标）
 $SettingsBtn = $window.FindName('SettingsBtn')
 $SettingsOverlay = $window.FindName('SettingsOverlay')
 $CfgUrl = $window.FindName('CfgUrl')
@@ -3422,6 +3413,14 @@ function Set-Sessions($items) {
   # id → 标题：后台会话跑完/还在跑时要在提示行里报出是哪一条
   $script:sessionTitles = @{}
   if ($items) { foreach ($it in @($items)) { $script:sessionTitles[[string]$it.id] = [string]$it.title } }
+  # 改名后顶栏标题要立刻跟上：host 改完 meta 就回一条 sessions，这里拿当前会话的新标题直接写回去。
+  # 不加这段的话，左栏名字变了、顶栏还挂着旧标题，得切一次会话才刷新（用户实测报过）。
+  $curId = [string]$script:sessionId
+  if ($curId -and $script:sessionTitles.ContainsKey($curId)) {
+    $newTitle = [string]$script:sessionTitles[$curId]
+    $want = if ($newTitle -and $newTitle -ne '(empty)' -and $newTitle.Trim() -ne '') { $newTitle } else { '新对话' }
+    if ([string]$TitleText.Text -ne $want) { $TitleText.Text = $want }
+  }
   $SessionList.Children.Clear()
   if (-not $items -or $items.Count -eq 0) {
     $empty = New-Text '还没有会话' 11 '#5B626D' 'Normal' 'Segoe UI' 0
@@ -4858,9 +4857,7 @@ function New-DangerTemplate {
 
 # 底栏、左栏的按钮统一自绘：系统模板一悬停就是浅灰/白底，跟深色界面对不上
 $ModelPill.Template = (New-FlatTemplate)
-$ModeRead.Template = (New-FlatTemplate)
-$ModeGuard.Template = (New-FlatTemplate)
-$ModeFull.Template = (New-FlatTemplate)
+$ModePill.Template = (New-FlatTemplate)
 $AttachBtn.Template = (New-FlatTemplate)
 
 $PickFolderBtn.Template = (New-FlatTemplate)
@@ -5253,22 +5250,161 @@ function Save-Settings {
   Send-Host $payload
 }
 
-$script:modeButtons = @{ 'read-only' = $ModeRead; 'guarded' = $ModeGuard; 'full' = $ModeFull }
+# 三档权限：名字（按设计稿的叫法）/ 图标 / 一句说明。
+# 图标用 GlyphTypeface 查过 segmdl2.ttf 确有该码位，并在 11px 下截图确认形状还认得出：
+#   0xE7B3 眼睛（只看）、0xE7EF 带框盾（范围受限）、0xE7BA 警示三角（全放开）
+# 说明文案照 policy.ts:gate 的真实行为写，别写成宽严颠倒：
+#   read-only：读一律放行，写/执行一律拒；
+#   guarded  ：写/执行只限工作区内且逐条询问，工作区外直接拒；
+#   full     ：不再逐条询问（危险命令仍会问一次）。
+$script:modeSpec = [ordered]@{
+  'read-only' = @{ label = '仅可查看'; icon = [string][char]0xE7B3; tip = '只能读，任何改动或命令都直接拒绝' }
+  'guarded'   = @{ label = '工作区内修改'; icon = [string][char]0xE7EF; tip = '写和命令只限当前工作目录，每次执行前都先问你' }
+  'full'      = @{ label = '完全权限'; icon = [string][char]0xE7BA; tip = '不再逐条询问，写和命令直接执行（危险命令仍会问一次）' }
+}
 
-function Set-ModeVisual([string]$m) {
-  foreach ($k in $script:modeButtons.Keys) {
-    $b = $script:modeButtons[$k]
-    if ($k -eq $m) {
-      # 选中：蓝底蓝字，模板也换成 Sel 版 —— 悬停时仍是蓝的，不会被灰色 hover 盖掉
-      $b.Background = (Brush '#263450')
-      $b.Foreground = (Brush '#8FA6FF')
-      $b.Template = (New-SelTemplate)
-    } else {
-      $b.Background = [System.Windows.Media.Brushes]::Transparent
-      $b.Foreground = (Brush '#ADB2B8')
-      $b.Template = (New-FlatTemplate)
-    }
+function Update-ModePill([string]$m) {
+  $spec = $script:modeSpec[$m]
+  if (-not $spec) { $spec = $script:modeSpec['guarded'] }
+  $panel = New-Object System.Windows.Controls.StackPanel
+  $panel.Orientation = 'Horizontal'
+  $panel.VerticalAlignment = 'Center'
+
+  $ico = New-Object System.Windows.Controls.TextBlock
+  $ico.Text = [string]$spec.icon
+  $ico.FontFamily = 'Segoe MDL2 Assets'
+  $ico.FontSize = 11.5
+  # 完全权限用暖色：这是最放得开的一档，别让它跟另外两档看起来一样温和
+  $ico.Foreground = $(if ($m -eq 'full') { Brush '#F0B860' } elseif ($m -eq 'read-only') { Brush '#7C838E' } else { Brush '#8FA6FF' })
+  $ico.VerticalAlignment = 'Center'
+  $ico.Margin = '0,0,6,0'
+  $panel.Children.Add($ico) | Out-Null
+
+  $txt = New-Object System.Windows.Controls.TextBlock
+  $txt.Text = [string]$spec.label
+  $txt.VerticalAlignment = 'Center'
+  $txt.FontSize = 11
+  $panel.Children.Add($txt) | Out-Null
+
+  $arr = New-Object System.Windows.Controls.TextBlock
+  $arr.Text = [char]0xE70E   # ChevronUp：菜单向上弹
+  $arr.FontFamily = 'Segoe MDL2 Assets'
+  $arr.FontSize = 8
+  $arr.Foreground = (Brush '#7C838E')
+  $arr.VerticalAlignment = 'Center'
+  $arr.Margin = '6,0,0,0'
+  $panel.Children.Add($arr) | Out-Null
+
+  $ModePill.Content = $panel
+  $ModePill.Tag = $m
+  $ModePill.ToolTip = '当前权限：' + $spec.label + '（' + $spec.tip + '）——点一下切换'
+}
+
+function Show-ModeMenu() {
+  if ($script:modePopup) { $script:modePopup.IsOpen = $false; $script:modePopup = $null }
+  $box = New-Object System.Windows.Controls.Border
+  $box.Background = (Brush '#1B1F27')
+  $box.BorderBrush = (Brush '#33FFFFFF')
+  $box.BorderThickness = '1'
+  $box.CornerRadius = '10'
+  $box.Padding = '5'
+  $box.MinWidth = 232
+  $col = New-Object System.Windows.Controls.StackPanel
+
+  $cur = [string]$ModePill.Tag
+  foreach ($m in $script:modeSpec.Keys) {
+    $spec = $script:modeSpec[$m]
+    $row = New-Object System.Windows.Controls.Button
+    $row.Padding = '8,7'
+    $row.HorizontalContentAlignment = 'Left'
+    $row.Cursor = 'Hand'
+    $row.Background = [System.Windows.Media.Brushes]::Transparent
+    $row.BorderThickness = '0'
+    $row.Template = (New-FlatTemplate)
+    # 当前项底色稍亮一点，让"选中"在菜单打开的一瞬间就看得出来
+    if ($m -eq $cur) { $row.Background = (Brush '#232833') }
+
+    $line = New-Object System.Windows.Controls.DockPanel
+    $ico = New-Object System.Windows.Controls.TextBlock
+    $ico.Text = [string]$spec.icon
+    $ico.FontFamily = 'Segoe MDL2 Assets'
+    $ico.FontSize = 13
+    $ico.Width = 22
+    $ico.Foreground = $(if ($m -eq 'full') { Brush '#F0B860' } elseif ($m -eq 'read-only') { Brush '#9AA1AC' } else { Brush '#8FA6FF' })
+    $ico.VerticalAlignment = 'Center'
+    [System.Windows.Controls.DockPanel]::SetDock($ico, 'Left')
+    $line.Children.Add($ico) | Out-Null
+
+    # 打勾贴在右侧（跟设计稿一样在行尾）。现在每档的图标各不相同，勾不会跟档位图标看混
+    $mk = New-Object System.Windows.Controls.TextBlock
+    $mk.Text = $(if ($m -eq $cur) { [string][char]0xE73E } else { '' })
+    $mk.FontFamily = 'Segoe MDL2 Assets'
+    $mk.FontSize = 12
+    $mk.Width = 20
+    $mk.TextAlignment = 'Right'
+    $mk.Foreground = (Brush '#8FA6FF')
+    $mk.VerticalAlignment = 'Center'
+    [System.Windows.Controls.DockPanel]::SetDock($mk, 'Right')
+    $line.Children.Add($mk) | Out-Null
+
+    $txt = New-Object System.Windows.Controls.TextBlock
+    $txt.Text = [string]$spec.label
+    $txt.FontSize = 12.5
+    $txt.Foreground = (Brush '#E6E8EA')
+    $txt.VerticalAlignment = 'Center'
+    $line.Children.Add($txt) | Out-Null
+
+    # 名字下面再挂一行小字说明：只靠悬停 tooltip 时，用户得先把鼠标停上去才知道每档放行什么
+    $stack = New-Object System.Windows.Controls.StackPanel
+    $stack.VerticalAlignment = 'Center'
+    $stack.Children.Add($line) | Out-Null
+    $hint = New-Object System.Windows.Controls.TextBlock
+    $hint.Text = [string]$spec.tip
+    $hint.FontSize = 10.5
+    $hint.Foreground = (Brush '#6B7280')
+    $hint.TextTrimming = 'CharacterEllipsis'
+    $hint.MaxWidth = 268
+    $hint.Margin = '22,2,0,0'
+    $stack.Children.Add($hint) | Out-Null
+
+    $row.Content = $stack
+    $row.ToolTip = [string]$spec.tip
+    $row.Tag = $m
+    $row.Add_Click({
+      param($s, $e)
+      if ($script:modePopup) { $script:modePopup.IsOpen = $false; $script:modePopup = $null }
+      $mm = [string]$s.Tag
+      Set-ModeVisual $mm
+      # 只在真的换了档时才通知 host，点中当前档位不该白跑一趟
+      if ($mm -ne [string]$script:modeSent) {
+        $script:modeSent = $mm
+        Send-Host @{ cmd = 'mode'; mode = $mm }
+      }
+    })
+    $col.Children.Add($row) | Out-Null
   }
+
+  $box.Child = $col
+  $pop = New-Object System.Windows.Controls.Primitives.Popup
+  $pop.PlacementTarget = $ModePill
+  $pop.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Top
+  # 胶囊贴着窗口右下角，Top 默认以胶囊左边为基准，菜单会伸出窗口右缘被裁掉。
+  # 用 HorizontalOffset 把它往左推，让右缘大致与胶囊右缘齐（胶囊宽约 118，菜单 260）。
+  $box.Measure((New-Object System.Windows.Size([double]::PositiveInfinity, [double]::PositiveInfinity)))
+  $pop.HorizontalOffset = $ModePill.ActualWidth - $box.DesiredSize.Width
+  $pop.VerticalOffset = -6
+  $pop.StaysOpen = $false
+  $pop.AllowsTransparency = $true
+  $pop.Child = $box
+  $script:modePopup = $pop
+  $pop.IsOpen = $true
+}
+
+# 设置档位并刷新胶囊（菜单选中、host 回报、启动初始化都走这一处）
+function Set-ModeVisual([string]$m) {
+  if (-not $script:modeSpec.Contains($m)) { $m = 'guarded' }
+  $script:modeSent = $m
+  Update-ModePill $m
 }
 
 # ---------------------------------------------------------------- 读秒
@@ -5417,7 +5553,6 @@ function Handle-Event([string]$line) {
       Update-CwdPill ([string]$e.cwd)
       Update-ModelPill ([string]$e.model)
       $TitleText.Text = $(if ($e.title -and $e.title -ne '(empty)') { [string]$e.title } else { '新对话' })
-      $SubTitle.Text = [string]$e.mode
       Set-ModeVisual ([string]$e.mode)
       # 第一次用（没 Key）：直接把设置面板弹出来，别让用户对着输入框发呆
       if (-not $script:hasKey) { Open-Settings }
@@ -5726,7 +5861,7 @@ function Handle-Event([string]$line) {
     'memory-saved' { Add-MemoryCard $e.items }
     'memory-undone' { Set-MemoryUndone @($e.ids) }
     'sessions' { Set-Sessions $e.items }
-    'mode' { Set-ModeVisual ([string]$e.mode); $SubTitle.Text = [string]$e.mode }
+    'mode' { Set-ModeVisual ([string]$e.mode) }
     'model' { $script:modelName = [string]$e.model; Update-ModelPill ([string]$e.model) }
     'cwd' {
       Update-CwdPill ([string]$e.cwd)
@@ -5858,15 +5993,12 @@ $NewChatBtn.Add_Click({
   $TitleText.Text = '新对话'
 })
 
-foreach ($pair in @(@('read-only', $ModeRead), @('guarded', $ModeGuard), @('full', $ModeFull))) {
-  $pair[1].Tag = [string]$pair[0]
-  $pair[1].Add_Click({
-    param($s, $e)
-    $m = [string]$s.Tag
-    Set-ModeVisual $m
-    Send-Host @{ cmd = 'mode'; mode = $m }
-  })
-}
+# 权限胶囊：点一下向上弹出三档菜单
+$ModePill.Add_Click({
+  param($s, $e)
+  if ($script:modePopup -and $script:modePopup.IsOpen) { $script:modePopup.IsOpen = $false; $script:modePopup = $null }
+  else { Show-ModeMenu }
+})
 
 $PickFolderBtn.Add_Click({
   $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -6134,7 +6266,6 @@ $window.Add_Loaded({
   Update-CwdPill $Cwd
   Update-ModelPill ([string]$Model)
   Set-ModeVisual $Mode
-  $SubTitle.Text = $Mode
   Clear-Transcript
   Restore-SideWidth
   # 列表建好、布局落定后再量一次：标题宽度决定左栏能拉到多宽

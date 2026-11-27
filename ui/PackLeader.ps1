@@ -297,40 +297,28 @@ $xaml = @'
         Title="PackLeader" Height="720" Width="1120" MinHeight="520" MinWidth="860"
         WindowStartupLocation="CenterScreen"
         WindowStyle="None" ResizeMode="CanResize"
-        Background="#070910" FontFamily="Segoe UI Variable Text, Microsoft YaHei UI, Segoe UI" FontSize="13"
+        Background="#0E1015" FontFamily="Segoe UI Variable Text, Microsoft YaHei UI, Segoe UI" FontSize="13"
         UseLayoutRounding="True" SnapsToDevicePixels="True"
         TextOptions.TextFormattingMode="Ideal">
   <!-- 自绘标题栏：标题栏原来是系统画的（只有 PackLeader 名字和 - □ ×），
        会话标题和设置只能另占一行。WindowStyle=None + WindowChrome 把非客户区收进客户区，
-       于是标题、设置、窗口按钮都能自己排；CaptionHeight=40 表示顶部 40px 仍由系统当
+       于是标题、设置、窗口按钮都能自己排；CaptionHeight=44 表示顶部 44px 仍由系统当
        标题栏处理（拖动 / 双击最大化 / 右键系统菜单都不用手写）。
        ResizeBorderThickness=6 留出四边的拉伸手柄。 -->
   <shell:WindowChrome.WindowChrome>
-    <shell:WindowChrome CaptionHeight="40" ResizeBorderThickness="6" GlassFrameThickness="0"
-                        CornerRadius="0" UseAeroCaptionButtons="False"/>
+    <shell:WindowChrome CaptionHeight="44" ResizeBorderThickness="6" GlassFrameThickness="0"
+                        CornerRadius="16" UseAeroCaptionButtons="False"/>
   </shell:WindowChrome.WindowChrome>
   <Window.Resources>
-    <LinearGradientBrush x:Key="WindowSurface" StartPoint="0,0" EndPoint="1,1">
-      <GradientStop Color="#111522" Offset="0"/>
-      <GradientStop Color="#090B11" Offset="0.48"/>
-      <GradientStop Color="#06070B" Offset="1"/>
-    </LinearGradientBrush>
-    <LinearGradientBrush x:Key="TitleSurface" StartPoint="0,0" EndPoint="0,1">
-      <GradientStop Color="#F21A1E2A" Offset="0"/>
-      <GradientStop Color="#F20D1017" Offset="1"/>
-    </LinearGradientBrush>
-    <LinearGradientBrush x:Key="SidebarSurface" StartPoint="0,0" EndPoint="0,1">
-      <GradientStop Color="#F21A1E2A" Offset="0"/>
-      <GradientStop Color="#FA0F121A" Offset="1"/>
-    </LinearGradientBrush>
-    <LinearGradientBrush x:Key="RaisedSurface" StartPoint="0,0" EndPoint="0,1">
-      <GradientStop Color="#202737" Offset="0"/>
-      <GradientStop Color="#121722" Offset="1"/>
-    </LinearGradientBrush>
+    <SolidColorBrush x:Key="WindowSurface" Color="#13151A"/>
+    <SolidColorBrush x:Key="TitleSurface" Color="#14171D"/>
+    <SolidColorBrush x:Key="SidebarSurface" Color="#161920"/>
+    <SolidColorBrush x:Key="RaisedSurface" Color="#1B1E27"/>
+    <SolidColorBrush x:Key="CardSurface" Color="#191C24"/>
+    <SolidColorBrush x:Key="StepSurface" Color="#20242E"/>
     <LinearGradientBrush x:Key="BlueSurface" StartPoint="0,0" EndPoint="1,1">
-      <GradientStop Color="#4A8CFF" Offset="0"/>
-      <GradientStop Color="#2864E8" Offset="0.52"/>
-      <GradientStop Color="#214FC7" Offset="1"/>
+      <GradientStop Color="#3B82F6" Offset="0"/>
+      <GradientStop Color="#2B6CB0" Offset="1"/>
     </LinearGradientBrush>
     <!-- 默认焦点虚线框在深色底上很跳，去掉 -->
     <Style TargetType="Button">
@@ -405,16 +393,6 @@ $xaml = @'
     </Grid.ColumnDefinitions>
 
     <Border Grid.RowSpan="2" Grid.ColumnSpan="3" Background="{StaticResource WindowSurface}"/>
-    <Ellipse Grid.RowSpan="2" Grid.ColumnSpan="3" Width="720" Height="300"
-             HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,-145,110,0"
-             IsHitTestVisible="False">
-      <Ellipse.Fill>
-        <RadialGradientBrush>
-          <GradientStop Color="#382B68FF" Offset="0"/>
-          <GradientStop Color="#002B68FF" Offset="1"/>
-        </RadialGradientBrush>
-      </Ellipse.Fill>
-    </Ellipse>
 
     <!-- ================= 标题栏（自绘） ================= -->
     <!-- 三种角色挤在一条 40px 里：左边是原来系统画的那份（logo + 名字），中间会话标题，
@@ -422,28 +400,22 @@ $xaml = @'
          否则点击会被系统当成拖标题栏。
          标题 MaxWidth 之外还留了左右 Margin：窗口窄时它先收、不会顶到两边的按钮。 -->
     <Border Grid.Row="0" Grid.ColumnSpan="3" Height="44" Background="{StaticResource TitleSurface}"
-            BorderBrush="#18FFFFFF" BorderThickness="0,0,0,1">
+            BorderBrush="#0BFFFFFF" BorderThickness="0,0,0,1">
       <Grid>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Center"
                     Margin="14,0,0,0" IsHitTestVisible="False">
-          <Border Width="26" Height="26" Margin="0,0,9,0" CornerRadius="8"
-                  Background="{StaticResource BlueSurface}" BorderBrush="#5EAEDBFF" BorderThickness="1">
-            <Border.Effect><DropShadowEffect BlurRadius="12" ShadowDepth="3" Opacity="0.6" Color="#2864E8"/></Border.Effect>
+          <Border Width="26" Height="26" Margin="0,0,9,0" CornerRadius="9"
+                  Background="{StaticResource BlueSurface}" BorderBrush="#407DBAFF" BorderThickness="1">
             <Image x:Name="TitleLogo" Width="16" Height="16" HorizontalAlignment="Center" VerticalAlignment="Center"
                    RenderOptions.BitmapScalingMode="HighQuality"/>
           </Border>
           <TextBlock Text="PackLeader" Foreground="#F1F5FF" FontSize="12.5" FontWeight="SemiBold" VerticalAlignment="Center"/>
-          <Border Margin="8,0,0,0" Padding="6,2" CornerRadius="5" Background="#222B68FF" BorderBrush="#3D67A7FF" BorderThickness="1">
-            <TextBlock Text="PRO" Foreground="#9CC3FF" FontSize="8.5" FontWeight="SemiBold"/>
-          </Border>
         </StackPanel>
-        <Border HorizontalAlignment="Center" VerticalAlignment="Center" CornerRadius="12" Padding="12,4"
-                Background="#0FFFFFFF" BorderBrush="#14FFFFFF" BorderThickness="1" Margin="160,0">
+        <Border HorizontalAlignment="Center" VerticalAlignment="Center" CornerRadius="16" Padding="14,5"
+                Background="#0AFFFFFF" BorderBrush="#0AFFFFFF" BorderThickness="1" Margin="160,0">
           <StackPanel Orientation="Horizontal">
-            <Ellipse Width="6" Height="6" Fill="#45D89C" Margin="0,0,8,0" VerticalAlignment="Center">
-              <Ellipse.Effect><DropShadowEffect BlurRadius="8" ShadowDepth="0" Opacity="0.9" Color="#45D89C"/></Ellipse.Effect>
-            </Ellipse>
-            <TextBlock x:Name="TitleText" Text="新对话" Foreground="#DDE7F8" FontSize="11.5"
+            <Ellipse Width="6" Height="6" Fill="#34D399" Margin="0,0,8,0" VerticalAlignment="Center"/>
+            <TextBlock x:Name="TitleText" Text="新对话" Foreground="#C9CDD6" FontSize="11.5"
                        VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="380"/>
           </StackPanel>
         </Border>
@@ -473,8 +445,7 @@ $xaml = @'
     </Border>
 
     <!-- ================= 左侧栏 ================= -->
-    <Border Grid.Row="1" Grid.Column="0" Background="{StaticResource SidebarSurface}" BorderBrush="#14FFFFFF" BorderThickness="0,0,1,0">
-      <Border.Effect><DropShadowEffect BlurRadius="24" ShadowDepth="8" Direction="0" Opacity="0.35" Color="Black"/></Border.Effect>
+    <Border Grid.Row="1" Grid.Column="0" Background="{StaticResource SidebarSurface}" BorderBrush="#0BFFFFFF" BorderThickness="0,0,1,0">
       <Grid>
         <Grid.RowDefinitions>
           <RowDefinition Height="Auto"/>
@@ -486,24 +457,23 @@ $xaml = @'
         <!-- 新对话 -->
         <Button Grid.Row="1" x:Name="NewChatBtn" Margin="12,16,12,10" Height="36" Cursor="Hand"
                 HorizontalContentAlignment="Left" Padding="10,0"
-                Background="#162033" Foreground="#E8F1FF" BorderBrush="#386DA8FF" BorderThickness="1">
+                Background="#0BFFFFFF" Foreground="#D8DCE4" BorderBrush="#0AFFFFFF" BorderThickness="1">
           <Button.Template>
             <ControlTemplate TargetType="Button">
               <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
-                      BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="10">
-                <Border.Effect><DropShadowEffect BlurRadius="12" ShadowDepth="3" Opacity="0.32" Color="#122C61"/></Border.Effect>
+                      BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="18">
                 <ContentPresenter Margin="{TemplateBinding Padding}" VerticalAlignment="Center"/>
               </Border>
               <ControlTemplate.Triggers>
                 <Trigger Property="IsMouseOver" Value="True">
-                  <Setter TargetName="bd" Property="Background" Value="#20304B"/>
-                  <Setter TargetName="bd" Property="BorderBrush" Value="#628FC2FF"/>
+                  <Setter TargetName="bd" Property="Background" Value="#16FFFFFF"/>
+                  <Setter TargetName="bd" Property="BorderBrush" Value="#14FFFFFF"/>
                 </Trigger>
               </ControlTemplate.Triggers>
             </ControlTemplate>
           </Button.Template>
           <StackPanel Orientation="Horizontal">
-            <TextBlock Text="＋" FontSize="14" Foreground="#8DB8FF" VerticalAlignment="Center"/>
+            <TextBlock Text="＋" FontSize="14" Foreground="#A8B8D3" VerticalAlignment="Center"/>
             <TextBlock Text="新对话" Margin="6,0,0,0" FontSize="12.5" VerticalAlignment="Center"/>
           </StackPanel>
         </Button>
@@ -511,7 +481,7 @@ $xaml = @'
         <!-- 会话列表 -->
         <ScrollViewer Grid.Row="2" x:Name="SideScroll" VerticalScrollBarVisibility="Auto" Padding="8,4,8,8">
           <StackPanel>
-            <TextBlock Text="最近会话" Foreground="#65718A" FontSize="10" FontWeight="SemiBold" Margin="8,8,0,7"/>
+            <TextBlock Text="最近" Foreground="#747B88" FontSize="10.5" Margin="8,8,0,7"/>
             <StackPanel x:Name="SessionList"/>
           </StackPanel>
         </ScrollViewer>
@@ -551,9 +521,8 @@ $xaml = @'
 
       <!-- 读秒条：这一轮在跑时贴在输入框上方显示「思考中 · 用时 12 秒」，空闲时收起（整行高度归零） -->
       <Border Grid.Row="1" x:Name="ThinkRow" Visibility="Collapsed" HorizontalAlignment="Left"
-              Margin="24,0,24,9" Background="#182338" BorderBrush="#356FA8FF" BorderThickness="1"
-              CornerRadius="12" Padding="11,5">
-        <Border.Effect><DropShadowEffect BlurRadius="14" ShadowDepth="3" Opacity="0.38" Color="#142A58"/></Border.Effect>
+              Margin="24,0,24,9" Background="#1B1F2B" BorderBrush="#0CFFFFFF" BorderThickness="1"
+              CornerRadius="18" Padding="13,6">
         <StackPanel Orientation="Horizontal">
           <TextBlock Text="✦" Foreground="#8FA6FF" FontSize="10.5" VerticalAlignment="Center" Margin="0,0,6,0"/>
           <TextBlock x:Name="ThinkText" Text="思考中 · 用时 0 秒" Foreground="#8FA6FF" FontSize="11.5"
@@ -583,8 +552,8 @@ $xaml = @'
 
       <!-- 输入区 -->
       <Grid Grid.Row="2" Margin="24,0,24,14">
-        <Border Background="{StaticResource RaisedSurface}" BorderBrush="#30FFFFFF" BorderThickness="1" CornerRadius="18" Padding="15,13,12,11">
-          <Border.Effect><DropShadowEffect BlurRadius="26" ShadowDepth="8" Opacity="0.58" Color="Black"/></Border.Effect>
+        <Border Background="{StaticResource RaisedSurface}" BorderBrush="#10FFFFFF" BorderThickness="1" CornerRadius="26" Padding="14,13,12,11">
+          <Border.Effect><DropShadowEffect BlurRadius="22" ShadowDepth="5" Opacity="0.24" Color="Black"/></Border.Effect>
           <StackPanel>
             <WrapPanel x:Name="AttachList" Orientation="Horizontal" Margin="0,0,0,7" Visibility="Collapsed"/>
           <Grid>
@@ -612,13 +581,13 @@ $xaml = @'
                 <TextBlock x:Name="UsageText" Text="" Foreground="#5B626D" FontSize="10.5"
                            VerticalAlignment="Center" Margin="0,0,8,0"/>
                 <Button x:Name="ModelPill" Content="模型" Height="26" Padding="9,0" Cursor="Hand" FontSize="11"
-                        FontFamily="Cascadia Mono, Consolas" Background="#172033" Foreground="#B9C9E6"
-                        BorderBrush="#2AFFFFFF" BorderThickness="1" ToolTip="切换模型" Margin="0,0,8,0"/>
+                        FontFamily="Cascadia Mono, Consolas" Background="#0BFFFFFF" Foreground="#B8C0CE"
+                        BorderBrush="#0AFFFFFF" BorderThickness="1" ToolTip="切换模型" Margin="0,0,8,0"/>
                 <!-- 权限：一个胶囊 + 向上弹出的菜单（三档带图标、当前项打勾）。
                      原来三个按钮平铺，档位名一长（工作区内修改）就横着挤满一条，
                      而且看不出「当前是哪一档」以外还有哪些可选。 -->
                 <Button x:Name="ModePill" Height="26" Padding="8,0" Cursor="Hand" FontSize="11"
-                        Background="#172033" Foreground="#B9C9E6" BorderBrush="#2AFFFFFF"
+                        Background="#0BFFFFFF" Foreground="#B8C0CE" BorderBrush="#0AFFFFFF"
                         BorderThickness="1" ToolTip="点一下切换权限档位" Margin="0,0,10,0"/>
                 <!-- 停止键：暗红胶囊 + 小方块图标，和发送圆钮之间留 10px，
                      否则两个按钮贴在一起看不出是两件事（原来只有一圈细红边，hover 还会变灰） -->
@@ -630,7 +599,7 @@ $xaml = @'
                 <!-- 发送键：圆形蓝底箭头（Segoe MDL2 的 E724），图标不随忙碌态改字，靠 ToolTip 区分发送/插话 -->
                 <Button x:Name="SendBtn" Content="&#xE724;" Height="28" Width="28" Padding="0" Cursor="Hand"
                         FontSize="12" FontFamily="Segoe MDL2 Assets"
-                        Background="{StaticResource BlueSurface}" Foreground="White" BorderBrush="#5EAEDBFF" BorderThickness="1"
+                        Background="{StaticResource BlueSurface}" Foreground="White" BorderBrush="#287DBAFF" BorderThickness="1"
                         ToolTip="发送（Enter）"/>
               </StackPanel>
               <!-- 用法提示已并进输入框占位符，这里留空占位（有人按名字找它） -->
@@ -643,7 +612,7 @@ $xaml = @'
     </Grid>
 
     <!-- 设置面板：做成遮罩层而不是第二个窗口，省掉嵌套消息循环那堆坑 -->
-    <Grid x:Name="SettingsOverlay" Grid.Row="1" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#B8000000">
+    <Grid x:Name="SettingsOverlay" Grid.Row="1" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#A80E1015">
       <Border Width="452" Background="#16181D" BorderBrush="#26FFFFFF" BorderThickness="1" CornerRadius="12"
               HorizontalAlignment="Center" VerticalAlignment="Stretch" Margin="0,20" Padding="22,18,22,16">
         <Grid>
@@ -1216,7 +1185,7 @@ function New-MenuItemTemplate {
   </Border>
   <ControlTemplate.Triggers>
     <Trigger Property="IsHighlighted" Value="True">
-      <Setter TargetName="bd" Property="Background" Value="#1B2029"/>
+      <Setter TargetName="bd" Property="Background" Value="#252933"/>
     </Trigger>
   </ControlTemplate.Triggers>
 </ControlTemplate>
@@ -1274,14 +1243,14 @@ function Add-UserMessage([string]$text, [object]$files = $null) {
   # Kite 风：自己说的话是右侧一块蓝底圆角气泡，和助手的正文一眼分得开
   $sp.HorizontalAlignment = 'Right'
   $bubble = New-Object System.Windows.Controls.Border
-  $bubble.Background = (Brush '#2E73EF')
-  $bubble.BorderBrush = (Brush '#6B9EFF')
+  $bubble.Background = (Brush '#3B82F6')
+  $bubble.BorderBrush = (Brush '#332B6CB0')
   $bubble.BorderThickness = '1'
-  $bubble.CornerRadius = '16'
-  $bubble.Padding = '14,10,14,10'
+  $bubble.CornerRadius = '22,22,6,22'
+  $bubble.Padding = '16,12,16,12'
   $bubble.HorizontalAlignment = 'Right'
   $bubble.MaxWidth = 680
-  $bubble.Effect = New-Object System.Windows.Media.Effects.DropShadowEffect -Property @{ BlurRadius = 22; ShadowDepth = 7; Opacity = 0.34; Color = [System.Windows.Media.Color]::FromRgb(37, 99, 235) }
+  $bubble.Effect = New-Object System.Windows.Media.Effects.DropShadowEffect -Property @{ BlurRadius = 18; ShadowDepth = 4; Opacity = 0.24; Color = [System.Windows.Media.Color]::FromRgb(37, 99, 235) }
   $inner = New-Object System.Windows.Controls.StackPanel
   if ($text.Trim()) {
     $body = New-Text $text 13.5 '#FFFFFF' 'Normal' 'Segoe UI' 0
@@ -1946,13 +1915,12 @@ function New-StepBlock {
   }
 
   $card = New-Object System.Windows.Controls.Border
-  $card.Background = (Brush '#141A26')
-  $card.BorderBrush = (Brush '#20FFFFFF')
+  $card.Background = (Brush '#20242E')
+  $card.BorderBrush = (Brush '#08FFFFFF')
   $card.BorderThickness = '1'
-  $card.CornerRadius = '12'
+  $card.CornerRadius = '14'
   $card.Padding = '0'
-  $card.Margin = '0,0,0,8'
-  $card.Effect = New-Object System.Windows.Media.Effects.DropShadowEffect -Property @{ BlurRadius = 18; ShadowDepth = 5; Opacity = 0.36; Color = [System.Windows.Media.Colors]::Black }
+  $card.Margin = '0,0,0,6'
   $card.HorizontalAlignment = 'Stretch'
   $card.Tag = 'step'
   $tp.Body.Children.Add($card) | Out-Null
@@ -2337,13 +2305,12 @@ function Update-ToolGroup($g) {
 
 function New-ToolGroupAt([object]$where = $null) {
   $outer = New-Object System.Windows.Controls.Border
-  $outer.Background = (Brush '#141A24')
-  $outer.BorderBrush = (Brush '#1FFFFFFF')
+  $outer.Background = (Brush '#191C24')
+  $outer.BorderBrush = (Brush '#0BFFFFFF')
   $outer.BorderThickness = '1'
-  $outer.CornerRadius = '10'
-  $outer.Margin = '0,0,0,8'
+  $outer.CornerRadius = '16'
+  $outer.Margin = '0,0,0,6'
   $outer.HorizontalAlignment = 'Stretch'
-  $outer.Effect = New-Object System.Windows.Media.Effects.DropShadowEffect -Property @{ BlurRadius = 14; ShadowDepth = 4; Opacity = 0.3; Color = [System.Windows.Media.Colors]::Black }
 
   $sp = New-Object System.Windows.Controls.StackPanel
 
@@ -2377,7 +2344,7 @@ function New-ToolGroupAt([object]$where = $null) {
   $sp.Children.Add($head) | Out-Null
 
   $items = New-Object System.Windows.Controls.StackPanel
-  $items.Margin = '8,0,8,7'
+  $items.Margin = '8,0,8,8'
   $items.Visibility = 'Collapsed'
   $sp.Children.Add($items) | Out-Null
 
@@ -2690,14 +2657,13 @@ function Add-ReasoningBlock {
     return $n
   }
   $outer = New-Object System.Windows.Controls.Border
-  $outer.Background = (Brush '#18202D')
-  $outer.BorderBrush = (Brush '#24FFFFFF')
+  $outer.Background = (Brush '#191C24')
+  $outer.BorderBrush = (Brush '#0BFFFFFF')
   $outer.BorderThickness = '1'
-  $outer.CornerRadius = '12'
-  $outer.Padding = '12,9'
+  $outer.CornerRadius = '22'
+  $outer.Padding = '14,12'
   $outer.Margin = '0,0,0,8'
   $outer.HorizontalAlignment = 'Stretch'
-  $outer.Effect = New-Object System.Windows.Media.Effects.DropShadowEffect -Property @{ BlurRadius = 20; ShadowDepth = 6; Opacity = 0.4; Color = [System.Windows.Media.Colors]::Black }
 
   $stack = New-Object System.Windows.Controls.StackPanel
 
@@ -3268,10 +3234,10 @@ function New-OptionTemplate {
   </Border>
   <ControlTemplate.Triggers>
     <Trigger Property="IsMouseOver" Value="True">
-      <Setter TargetName="bd" Property="Background" Value="#1B2029"/>
+      <Setter TargetName="bd" Property="Background" Value="#252933"/>
     </Trigger>
     <Trigger Property="IsPressed" Value="True">
-      <Setter TargetName="bd" Property="Background" Value="#263450"/>
+      <Setter TargetName="bd" Property="Background" Value="#28323F"/>
     </Trigger>
   </ControlTemplate.Triggers>
 </ControlTemplate>
@@ -3341,7 +3307,7 @@ function New-ChoiceCard([string]$title, [string]$desc, [string]$badge = '') {
 function Finish-Approval($picked, $ctx, [string]$label, [string]$borderColor) {
   $ctx.done = $true
   $picked.BorderBrush = (Brush $borderColor)
-  $picked.Background = (Brush '#263450')
+  $picked.Background = (Brush '#28323F')
   $picked.Tag.check.Visibility = 'Visible'
   foreach ($b in @($ctx.yes, $ctx.session, $ctx.no)) {
     if ($b -ne $picked) {
@@ -3537,7 +3503,7 @@ function Add-QuestionCard($e) {
       $c.done = $true
       Send-Host @{ cmd = 'answer'; reqId = $c.reqId; value = [string]$s.Tag.label }
       $s.BorderBrush = (Brush '#4F7DF0')
-      $s.Background = (Brush '#263450')
+      $s.Background = (Brush '#2160A5FA')
       $s.Tag.check.Visibility = 'Visible'
       foreach ($x in $c.buttons) {
         if ($x -ne $s) {
@@ -3737,19 +3703,15 @@ function New-SessionMenu([object]$box) {
 # 左栏一行会话：标题 + N 轮 · 时间，悬停露出 ×，右键出菜单
 function New-SessionRow($it) {
   $row = New-Object System.Windows.Controls.Border
-  $row.CornerRadius = '10'
-  $row.Padding = '10,8'
-  $row.Margin = '0,3,0,3'
+  $row.CornerRadius = '16'
+  $row.Padding = '11,8'
+  $row.Margin = '0,2,0,2'
   $row.Cursor = 'Hand'
   $sid = [string]$it.id
   $stitle = [string]$it.title
   $selected = ($sid -eq [string]$script:sessionId)
-  $row.Background = $(if ($selected) { Brush '#252E4B' } else { [System.Windows.Media.Brushes]::Transparent })
-  if ($selected) {
-    $row.BorderBrush = (Brush '#4D8BBEFF')
-    $row.BorderThickness = '1'
-    $row.Effect = New-Object System.Windows.Media.Effects.DropShadowEffect -Property @{ BlurRadius = 16; ShadowDepth = 4; Opacity = 0.36; Color = [System.Windows.Media.Colors]::Black }
-  }
+  $row.Background = $(if ($selected) { Brush '#2160A5FA' } else { [System.Windows.Media.Brushes]::Transparent })
+  $row.BorderThickness = '0'
 
   $grid = New-Object System.Windows.Controls.Grid
   $c1 = New-Object System.Windows.Controls.ColumnDefinition
@@ -3816,7 +3778,7 @@ function New-SessionRow($it) {
   })
   $row.Add_MouseEnter({
     param($s, $e)
-    if (-not $s.Tag.dragging) { $s.Background = (Brush '#1C2535') }
+    if (-not $s.Tag.dragging) { $s.Background = (Brush '#0AFFFFFF') }
     $s.Tag.del.Visibility = 'Visible'
   })
   # 拖动会话行到分组头上 = 移进那个分组（组头 Drop 里接手）。
@@ -3849,7 +3811,7 @@ function New-SessionRow($it) {
     param($s, $e)
     $s.Tag.dragStart = $null
     $s.Tag.del.Visibility = 'Hidden'
-    if ($s.Tag.id -eq [string]$script:sessionId) { $s.Background = (Brush '#263450') }
+    if ($s.Tag.id -eq [string]$script:sessionId) { $s.Background = (Brush '#2160A5FA') }
     else { $s.Background = [System.Windows.Media.Brushes]::Transparent }
   })
   return $row
@@ -3952,7 +3914,7 @@ function Set-Sessions($items) {
       $head.Add_DragEnter({
         param($s, $e)
         if (-not $e.Data.GetDataPresent('PackLeaderSession')) { return }
-        $s.Background = (Brush '#263450')
+        $s.Background = (Brush '#2160A5FA')
       })
       $head.Add_DragLeave({
         param($s, $e)
@@ -5233,7 +5195,7 @@ function Set-InputChoices([string[]]$names, [string]$current) {
     $b.Cursor = 'Hand'
     $b.FontSize = 11.5
     $b.BorderThickness = '1'
-    $b.Background = $(if ($isCur) { Brush '#263450' } else { [System.Windows.Media.Brushes]::Transparent })
+    $b.Background = $(if ($isCur) { Brush '#28323F' } else { [System.Windows.Media.Brushes]::Transparent })
     $b.Foreground = $(if ($isCur) { Brush '#8AB4FF' } else { Brush '#C7CBD2' })
     $b.BorderBrush = $(if ($isCur) { Brush '#4D8AB4FF' } else { Brush '#1FFFFFFF' })
     $b.Template = (New-FlatTemplate)
@@ -5533,12 +5495,12 @@ function New-FlatTemplate {
   if ($script:flatTpl) { return $script:flatTpl }
   $xaml = @'
 <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
-  <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="6" Padding="{TemplateBinding Padding}">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="14" Padding="{TemplateBinding Padding}">
     <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
   </Border>
   <ControlTemplate.Triggers>
     <Trigger Property="IsMouseOver" Value="True">
-      <Setter TargetName="bd" Property="Background" Value="#1B2029"/>
+      <Setter TargetName="bd" Property="Background" Value="#252933"/>
     </Trigger>
     <Trigger Property="IsPressed" Value="True">
       <Setter TargetName="bd" Property="Background" Value="#2C333F"/>
@@ -5555,15 +5517,15 @@ function New-SelTemplate {
   if ($script:selTpl) { return $script:selTpl }
   $xaml = @'
 <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
-  <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="6" Padding="{TemplateBinding Padding}">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="14" Padding="{TemplateBinding Padding}">
     <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
   </Border>
   <ControlTemplate.Triggers>
     <Trigger Property="IsMouseOver" Value="True">
-      <Setter TargetName="bd" Property="Background" Value="#2E3D5C"/>
+      <Setter TargetName="bd" Property="Background" Value="#252D3B"/>
     </Trigger>
     <Trigger Property="IsPressed" Value="True">
-      <Setter TargetName="bd" Property="Background" Value="#35466B"/>
+      <Setter TargetName="bd" Property="Background" Value="#2A3443"/>
     </Trigger>
   </ControlTemplate.Triggers>
 </ControlTemplate>

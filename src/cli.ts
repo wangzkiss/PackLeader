@@ -108,7 +108,10 @@ interface Config {
 }
 
 function resolveConfig(flags: Record<string, string | boolean>): Config {
-  const dataDir = resolve(str(flags, 'data-dir') ?? process.env.PACKLEADER_HOME ?? join(homedir(), '.packleader'))
+  // 环境变量按「空串＝没设」处理：脚本里 `PL_API_KEY=` 这种写法很常见，
+  // 用 ?? 判的话空串会占住位置，config.json 里存的 Key 就再也轮不到（真机上是 401）。
+  const env = (k: string): string | undefined => process.env[k]?.trim() || undefined
+  const dataDir = resolve(str(flags, 'data-dir') ?? env('PACKLEADER_HOME') ?? join(homedir(), '.packleader'))
   // 优先级：命令行 > 环境变量 > <data>/config.json > 内置默认。
   // 界面里填的端点/Key 也写这个文件，所以装完之后不设任何环境变量也能用。
   const saved = loadSettingsSync(dataDir)
@@ -127,23 +130,24 @@ function resolveConfig(flags: Record<string, string | boolean>): Config {
     dataDir,
     root: resolve(str(flags, 'cwd') ?? process.cwd()),
     mode,
+    // 优先级：命令行 / PL_API_KEY（显式）> config.json（界面里存过的）> 第三方环境变量。
+    // DEEPSEEK_API_KEY / OPENAI_API_KEY 压到 providerKey 前面的话，开发机上装了别家工具时
+    // 就会拿别家的 Key 去打这里配的端点（401），host 那条路同理。
     apiKey:
       str(flags, 'api-key') ??
-      process.env.PL_API_KEY ??
-      process.env.DEEPSEEK_API_KEY ??
-      process.env.OPENAI_API_KEY ??
+      env('PL_API_KEY') ??
       providerKey ??
+      env('DEEPSEEK_API_KEY') ??
+      env('OPENAI_API_KEY') ??
       '',
     baseURL:
       str(flags, 'base-url') ??
-      process.env.PL_BASE_URL ??
-      process.env.DEEPSEEK_BASE_URL ??
+      env('PL_BASE_URL') ??
+      env('DEEPSEEK_BASE_URL') ??
       providerUrl ??
       'https://api.deepseek.com/v1',
-    baseExplicit: Boolean(
-      str(flags, 'base-url') || process.env.PL_BASE_URL || process.env.DEEPSEEK_BASE_URL || providerUrl,
-    ),
-    model: str(flags, 'model') ?? process.env.PL_MODEL ?? providerModel ?? 'deepseek-chat',
+    baseExplicit: Boolean(str(flags, 'base-url') || env('PL_BASE_URL') || env('DEEPSEEK_BASE_URL') || providerUrl),
+    model: str(flags, 'model') ?? env('PL_MODEL') ?? providerModel ?? 'deepseek-chat',
     approval,
     maxSteps: num(flags, 'max-steps') ?? 100,
     // 空串 = 自动识别（detectVerifier）

@@ -273,9 +273,9 @@ trap { if ($script:boot) { & $script:boot ("异常: " + ($_ | Out-String)) } els
 
 if (-not $Cwd) { $Cwd = (Get-Location).Path }
 if (-not $Mode) { $Mode = 'guarded' }
-if (-not $DataDir) { $DataDir = Join-Path (Split-Path -Parent $PSScriptRoot) '.pl-data' }
-if (-not $BaseUrl) { $BaseUrl = 'http://127.0.0.1:19790/v1' }
-if (-not $Model) { $Model = 'deepseek-flash' }
+# 数据目录 / 端点 / 模型留空＝交给 host（默认数据目录 + config.json 里存的那家）。
+# 以前这里塞了内置默认（.pl-data、127.0.0.1:19790、deepseek-flash），而 --base-url / --model
+# 传下去就是「显式指定」，会压过 config.json：用户在设置里换的供应商，下次打开又被顶回内置端点。
 if (-not $ApiKey) { $ApiKey = $env:PL_API_KEY }
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -442,16 +442,11 @@ $xaml = @'
         <RowDefinition Height="Auto"/>
       </Grid.RowDefinitions>
 
-      <!-- 顶栏：logo 贴左、标题居中、设置贴右——三样都放同一个单元格各自对齐，
+      <!-- 顶栏：标题居中、设置贴右——两样都放同一个单元格各自对齐，
            这样标题是「相对整个内容区」居中的；拆成三列时两侧列宽不等会把标题推偏。 -->
       <Border Grid.Row="0" BorderBrush="#12FFFFFF" BorderThickness="0,0,0,1" Padding="24,0" Height="48">
         <Grid>
-          <Border Width="18" Height="18" CornerRadius="5" Background="#2B5CFF"
-                  HorizontalAlignment="Left" VerticalAlignment="Center">
-            <TextBlock Text="P" Foreground="White" FontSize="11" FontWeight="Bold"
-                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
-          </Border>
-          <TextBlock x:Name="TitleText" Text="新对话" Foreground="#F9FAFB" FontSize="13"
+          <TextBlock x:Name="TitleText" Text="新对话" Foreground="#F9FAFB" FontSize="16"
                      FontWeight="SemiBold" HorizontalAlignment="Center" VerticalAlignment="Center"
                      TextTrimming="CharacterEllipsis" MaxWidth="520" Margin="72,0"/>
           <Button x:Name="SettingsBtn" Content="设置" Height="24" Padding="8,0" Cursor="Hand"
@@ -4833,8 +4828,11 @@ if ($script:perfMode -ne 'off') {
   if ($script:perfRun) { $psi.EnvironmentVariables['PL_PERF_RUN'] = [string]$script:perfRun }
   if ($script:perfT0 -gt 0) { $psi.EnvironmentVariables['PL_PERF_T0'] = [string]$script:perfT0 }
 }
-$hostArgs = @('--disable-warning=ExperimentalWarning', $hostTs, '--cwd', $Cwd, '--mode', $Mode, '--data-dir', $DataDir,
-              '--base-url', $BaseUrl, '--model', $Model)
+$hostArgs = @('--disable-warning=ExperimentalWarning', $hostTs, '--cwd', $Cwd, '--mode', $Mode)
+# 只把「真正给了值」的传下去：空串传成 --data-dir '' 会被 host 解析成当前目录
+if ($DataDir) { $hostArgs += @('--data-dir', $DataDir) }
+if ($BaseUrl) { $hostArgs += @('--base-url', $BaseUrl) }
+if ($Model) { $hostArgs += @('--model', $Model) }
 if ($ApiKey) { $hostArgs += @('--api-key', $ApiKey) }
 if ($Session) { $hostArgs += @('--resume', $Session) }
 # .NET Framework 4.8 没有 ArgumentList（那是 .NET Core 的），只能自己拼带引号的字符串

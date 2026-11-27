@@ -92,7 +92,8 @@ turn → step → tool batch，事件全量落盘，`--max-steps` 保护；步�
 ### 模型与超时配置
 OpenAI 兼容流式适配器：`tool_calls` 按 index 分片聚合、`reasoning_content`、缓存命中统计。
 
-配置写在 `<数据目录>/config.json`（默认 `~/.packleader/config.json`），优先级 **命令行 > 环境变量 > config.json > 内置默认**：
+配置写在 `<数据目录>/config.json`（默认 `~/.packleader/config.json`），优先级 **命令行 / `PL_*` 环境变量 > config.json > 通用别名环境变量（`DEEPSEEK_API_KEY`、`OPENAI_API_KEY` 等）> 内置默认**——
+别名只做兜底：机器上装着别的工具时它们常有值，压过 config.json 就会「拿别家的 Key 打这里配的端点」，开局一发 401：
 
 ```json
 {

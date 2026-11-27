@@ -413,6 +413,40 @@ test('host: use-model 切到另一家的模型，下一轮真的打到那家，�
   }
 })
 
+test('host: 机器上有 OPENAI_API_KEY 时仍用 config.json 里的 Key（别拿别家的 Key 打界面配的端点）', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pl-envkey-ws-'))
+  const dataDir = await mkdtemp(join(tmpdir(), 'pl-envkey-data-'))
+  const llm = await startFakeLlm([{ text: '好' }])
+  await writeFile(
+    join(dataDir, 'config.json'),
+    JSON.stringify({
+      providers: [{ id: 'p-cfg', name: '配置里那家', baseURL: llm.url, apiKey: 'sk-cfg-key-1234', model: 'm-cfg' }],
+      activeProvider: 'p-cfg',
+    }),
+    'utf8',
+  )
+  // 开发机装了别的工具时常有 OPENAI_API_KEY。以前它排在 config.json 前面，
+  // 结果拿着别家的 Key 去打界面上配的端点，开局一发 401（界面上点一下设置、重读磁盘才好）。
+  const host = new HostProc(['--cwd', root, '--data-dir', dataDir, '--mode', 'read-only'], {
+    PL_API_KEY: '',
+    DEEPSEEK_API_KEY: '',
+    OPENAI_API_KEY: 'sk-openai-env-9999',
+  })
+  try {
+    const ready = await host.next('ready')
+    assert.equal(ready.baseURL, llm.url, '端点和模型都该来自 config.json')
+    assert.equal(ready.model, 'm-cfg')
+    assert.equal(ready.apiKeyMasked, 'sk-c…1234', 'Key 用 config.json 里的那把')
+    host.send({ cmd: 'task', text: '你好' })
+    await host.next('turn-end')
+    assert.equal(llm.requests.length, 1)
+    assert.equal(llm.headers[0]?.authorization, 'Bearer sk-cfg-key-1234', '请求带的是 config.json 里的 Key')
+  } finally {
+    await host.close()
+    await llm.close()
+  }
+})
+
 test('host: config 一家可以存多个模型；界面没带 models 的那家沿用旧列表（别被保存抹掉）', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pl-modelsave-ws-'))
   const dataDir = await mkdtemp(join(tmpdir(), 'pl-modelsave-data-'))

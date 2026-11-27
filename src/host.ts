@@ -73,8 +73,13 @@ interface Opts {
   mode: Mode
   /** mode 是否由命令行/环境变量显式指定（否则就以 config.json 里记的档为准） */
   modeSet: boolean
+  /** 显式给的 Key（--api-key / PL_API_KEY）；空串＝没指定，交给 config.json 决定 */
   apiKey: string
+  /** DEEPSEEK_API_KEY / OPENAI_API_KEY 这类第三方变量：只在 config.json 也没配 Key 时兜底 */
+  apiKeyEnv: string
+  /** 显式给的端点；空串＝没指定，交给 config.json（再不行用内置 DeepSeek 端点） */
   baseURL: string
+  /** 显式给的模型；空串＝没指定，交给 config.json（再不行用 deepseek-chat） */
   model: string
   maxSteps: number
   session?: string
@@ -115,9 +120,10 @@ function parseArgs(argv: string[]): Opts {
     root: resolve(s('cwd') ?? process.cwd()),
     mode,
     modeSet: s('mode') !== undefined || process.env.PL_MODE !== undefined,
-    apiKey: s('api-key') ?? process.env.PL_API_KEY ?? process.env.DEEPSEEK_API_KEY ?? process.env.OPENAI_API_KEY ?? '',
-    baseURL: s('base-url') ?? process.env.PL_BASE_URL ?? process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com/v1',
-    model: s('model') ?? process.env.PL_MODEL ?? 'deepseek-chat',
+    apiKey: s('api-key') ?? process.env.PL_API_KEY ?? '',
+    apiKeyEnv: process.env.DEEPSEEK_API_KEY ?? process.env.OPENAI_API_KEY ?? '',
+    baseURL: s('base-url') ?? process.env.PL_BASE_URL ?? process.env.DEEPSEEK_BASE_URL ?? '',
+    model: s('model') ?? process.env.PL_MODEL ?? '',
     maxSteps: Number(s('max-steps') ?? 100) || 100,
     session: s('resume'),
     cont: flags.continue === true,
@@ -233,22 +239,22 @@ async function main(): Promise<void> {
   // 没有 key 也要开窗口：第一次用的人是先在界面上填端点/Key 的。
   // 真正拦在 runTask 里（见下），而不是启动时直接死掉。
   //
-  // 供应商列表：命令行/环境变量没给 Key 时（＝没显式配置过）就用列表里「当前选中」的那家。
-  // 一家都没配（老版本只有顶层 baseURL/apiKey）时 providersOf 会把它折成唯一一家，行为不变。
+  // 取值优先级：命令行 / PL_* 环境变量（用户显式）> config.json（界面里存过的）> 第三方环境变量 > 内置默认。
+  // DEEPSEEK_API_KEY / OPENAI_API_KEY 只做兜底：开发机上跑过别家工具时它们常有值，
+  // 要是排到 config.json 前面，就会拿别家的 Key 去打界面上配的端点，开局就是一发 401
+  // （界面上「点一下设置」能好，正是因为 load-config 会从磁盘重读一遍）。
+  //
+  // 供应商列表：一家都没配（老版本只有顶层 baseURL/apiKey）时 providersOf 会把它折成唯一一家，行为不变。
   const { list: savedProviders, active: savedActive } = providersOf(saved)
   const curProvider = savedProviders.find((p) => p.id === savedActive)
-  if (!opts.apiKey) {
-    if (curProvider) {
-      opts.apiKey = curProvider.apiKey
-      if (curProvider.baseURL) opts.baseURL = curProvider.baseURL
-      if (curProvider.model) opts.model = curProvider.model
-    } else {
-      if (saved.apiKey) opts.apiKey = saved.apiKey
-      if (saved.baseURL) opts.baseURL = saved.baseURL
-      if (saved.model) opts.model = saved.model
-    }
-    if (saved.verify && !opts.noVerify) opts.verify = saved.verify
-  }
+  const cfgKey = curProvider?.apiKey || saved.apiKey || ''
+  const cfgBase = curProvider?.baseURL || saved.baseURL || ''
+  const cfgModel = curProvider?.model || saved.model || ''
+  if (!opts.apiKey) opts.apiKey = cfgKey || opts.apiKeyEnv
+  if (!opts.baseURL) opts.baseURL = cfgBase || 'https://api.deepseek.com/v1'
+  if (!opts.model) opts.model = cfgModel || 'deepseek-chat'
+  // verify 同理：命令行没给 --verify 就听 config.json 的（--no-verify 仍然压过它）
+  if (saved.verify && !opts.noVerify && !opts.verify) opts.verify = saved.verify
   // 看图：命令行/环境变量没显式指定就听 config.json 的，那里也没有就按默认（开）。
   // 注意这条不能塞进上面的 if：Key 来自环境变量时也得读到用户存过的开关。
   // 权限档同理：界面上切过一次就记进了 config.json，命令行没显式指定时按它来。

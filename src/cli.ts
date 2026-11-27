@@ -28,6 +28,10 @@ import { Agent } from './core/loop.ts'
 import { Policy } from './core/policy.ts'
 import { Session } from './core/session.ts'
 import { llmTimeoutsOf, loadSettingsSync } from './core/settings.ts'
+import { PERF_MODES } from './core/settings.ts'
+import type { PerfMode } from './core/settings.ts'
+import { PerfLog, newRunId, perfDir } from './core/perf.ts'
+import { analyze, loadPerfRecords, renderPerfReport } from './core/perfreport.ts'
 import type { Mode } from './core/types.ts'
 import { OpenAiClient } from './llm/openai.ts'
 import { createDefaultTools } from './tools/index.ts'
@@ -41,7 +45,7 @@ const BOOL_FLAGS = new Set([
 ])
 
 interface Parsed {
-  command: 'run' | 'audit' | 'undo' | 'sessions' | 'help' | 'version' | 'doctor' | 'gui'
+  command: 'run' | 'audit' | 'undo' | 'sessions' | 'help' | 'version' | 'doctor' | 'gui' | 'perf'
   flags: Record<string, string | boolean>
   positional: string[]
 }
@@ -68,7 +72,7 @@ function parse(argv: string[]): Parsed {
       }
     } else positional.push(a)
   }
-  const known = ['audit', 'undo', 'sessions', 'help', 'version', 'doctor', 'gui']
+  const known = ['audit', 'undo', 'sessions', 'help', 'version', 'doctor', 'gui', 'perf']
   const head = positional[0]
   const command = (head && known.includes(head) ? positional.shift()! : 'run') as Parsed['command']
   return { command, flags, positional }
@@ -97,6 +101,8 @@ interface Config {
   verify: string
   /** LLM 三层超时（毫秒）：来自 config.json 的 *Secs；不带的字段由客户端自己兜默认 */
   llmTimeouts: { firstByteMs?: number; idleMs?: number; timeoutMs?: number }
+  /** 性能日志档（off / basic / full），启动时传给界面进程 */
+  perf: PerfMode
 }
 
 function resolveConfig(flags: Record<string, string | boolean>): Config {
@@ -132,6 +138,11 @@ function resolveConfig(flags: Record<string, string | boolean>): Config {
     verify: flags['no-verify'] === true ? '' : (str(flags, 'verify') ?? saved.verify ?? ''),
     // 长上下文首次出字很慢，超时能在 config.json 里调（首字节 / 块间空闲 / 整体）
     llmTimeouts: llmTimeoutsOf(saved),
+    // 性能日得：命令行 > PL_PERF > config.json > basic（写坏了当没写）
+    perf: ((): PerfMode => {
+      const raw = str(flags, 'perf') ?? process.env.PL_PERF ?? saved.perf ?? 'basic'
+      return (PERF_MODES as readonly string[]).includes(raw) ? (raw as PerfMode) : 'basic'
+    })(),
   }
 }
 
@@ -146,6 +157,7 @@ ${bold('用法')}
   pl sessions                列出历史会话
   pl doctor                  自检（node / shell / 数据目录 / 端点 / 模型）
   pl gui                     打开桌面窗口（里面可以填端点/Key）
+  pl perf [--runs N]         启动 / 卡顿 / 慢工具的性能报告（默认看最近 3 次启动）
 
 ${bold('选项')}
   --cwd <dir>          工作目录（默认当前目录）
@@ -195,15 +207,28 @@ async function cmdGui(cfg: Config, flags: Record<string, string | boolean>): Pro
     return
   }
 
+  // 一次启动 = 一个 run：run / t0 从这里往下传（启动器 exe 已经给过就沿用它的，
+  // 这样「双击 → 窗口出现」是一条完整时间轴，而不是两边各算各的）
+  if (!process.env.PL_PERF_RUN) process.env.PL_PERF_RUN = newRunId()
+  if (!process.env.PL_PERF_T0) process.env.PL_PERF_T0 = String(Date.now())
+  const perf = new PerfLog('node', { mode: cfg.perf })
+
   // PowerShell 5.1 只把「带 BOM 的 UTF-8」当 UTF-8，否则中文全变乱码并破坏引号。
   // 与其要求编辑器保存成 BOM，不如启动时生成一份带 BOM 的临时副本（源码编码再怎么变都不影响）。
+  const copyT0 = Date.now()
   const text = (await readFile(ps1, 'utf8')).replace(/^\uFEFF+/, '')
   const tempScript = join(tmpdir(), `packleader-ui-${process.pid}.ps1`)
   await writeFile(tempScript, `\uFEFF${text}`, 'utf8')
+  perf.span('script-copy', Date.now() - copyT0, { bytes: text.length })
 
+  const spawnT0 = Date.now()
   const child = spawn(ps, ['-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', tempScript], {
     env: {
       ...process.env,
+      // 性能日得：界面进程写自己那份，档位与 run / t0 必须一致
+      PL_PERF: cfg.perf,
+      PL_PERF_RUN: process.env.PL_PERF_RUN ?? '',
+      PL_PERF_T0: process.env.PL_PERF_T0 ?? '',
       PL_GUI_ROOT: repoRoot,
       PL_GUI_CWD: cfg.root,
       PL_GUI_MODE: cfg.mode,
@@ -217,9 +242,32 @@ async function cmdGui(cfg: Config, flags: Record<string, string | boolean>): Pro
     // 从启动器 exe（无控制台进程）拉起时会新开一个黑窗，这里压掉
     windowsHide: true,
   })
+  perf.span('ps-spawn', Date.now() - spawnT0, { pid: child.pid ?? 0 })
   process.stdout.write(`${dim('已打开窗口；关闭窗口即退出。')}\n`)
   await new Promise<void>((r) => child.on('close', () => r()))
+  perf.span('ui-lifetime', Date.now() - spawnT0)
+  await perf.close()
   await rm(tempScript, { force: true })
+}
+
+/**
+ * 性能报告：读 %LOCALAPPDATA%\PackLeader\perf 下的 JSONL，按「一次启动」聚合成报告。
+ * 只读，不改任何东西；数据不在就给怎么开、怎么看。
+ */
+async function cmdPerf(cfg: Config, flags: Record<string, string | boolean>): Promise<void> {
+  const dir = str(flags, 'dir') ?? perfDir()
+  const runs = num(flags, 'runs') ?? 3
+  const days = num(flags, 'days') ?? 7
+  const records = await loadPerfRecords(dir, { days })
+  if (!records.length) {
+    process.stdout.write(
+      `${yellow('还没有性能日志')}\n` +
+        `  当前档位 ${bold(cfg.perf)}（config.json 里的 perf 字段，或 --perf off / basic / full）\n` +
+        `  目录：${dir}\n  用一次界面（pl gui）之后再来，关窗时会把缓冲落盘。\n`,
+    )
+    return
+  }
+  for (const line of renderPerfReport(analyze(records), { runs, dir })) process.stdout.write(`${line}\n`)
 }
 
 async function cmdDoctor(cfg: Config, flags: Record<string, string | boolean>): Promise<void> {
@@ -403,6 +451,7 @@ async function main(): Promise<void> {
   if (command === 'undo') return cmdUndo(cfg, flags)
   if (command === 'doctor') return cmdDoctor(cfg, flags)
   if (command === 'gui') return cmdGui(cfg, flags)
+  if (command === 'perf') return cmdPerf(cfg, flags)
 
   if (!cfg.apiKey) {
     process.stderr.write(

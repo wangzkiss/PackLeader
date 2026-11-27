@@ -15,7 +15,8 @@ function runCli(
 ): Promise<{ code: number; out: string; err: string }> {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', CLI, ...args], {
-      env: { ...process.env, NO_COLOR: '1', ...env },
+      // PL_PERF=off：测试起的 cli 不要往用户真实的 perf 目录里写日志
+      env: { ...process.env, NO_COLOR: '1', PL_PERF: 'off', ...env },
       windowsHide: true,
     })
     let out = ''

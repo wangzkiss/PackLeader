@@ -23,7 +23,9 @@ import { Agent, type Renderer } from './core/loop.ts'
 import { Policy } from './core/policy.ts'
 import { Session } from './core/session.ts'
 import { ingestFiles } from './core/attach.ts'
-import { llmTimeoutsOf, loadSettings, maskKey, saveSettings, visionFrom } from './core/settings.ts'
+import { PERF_MODES, llmTimeoutsOf, loadSettings, maskKey, saveSettings, visionFrom } from './core/settings.ts'
+import type { PerfMode } from './core/settings.ts'
+import { PerfLog } from './core/perf.ts'
 import { registerSecret } from './core/redact.ts'
 import type { AskRequest } from './core/tools.ts'
 import { MemoryStore } from './core/memory.ts'
@@ -209,6 +211,15 @@ export function summarizeCall(name: string, args: Record<string, unknown>): stri
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv.slice(2))
   const saved = await loadSettings(opts.dataDir)
+  // 性能日志：界面进程通过 PL_PERF* 把档位与 run 带下来（「双击 → 窗口 → 一轮回答」是同一条时间轴），
+  // 命令行直接跑时按 config.json。写不出来一律静默降级，不影响主流程。
+  const perfMode = ((): PerfMode => {
+    const raw = process.env.PL_PERF ?? saved.perf ?? 'basic'
+    return (PERF_MODES as readonly string[]).includes(raw) ? (raw as PerfMode) : 'basic'
+  })()
+  const perf = new PerfLog('host', { mode: perfMode })
+  const bootT0 = Date.now()
+  perf.point('start', { mode: perfMode, pid: process.pid, node: process.version })
   // 没有 key 也要开窗口：第一次用的人是先在界面上填端点/Key 的。
   // 真正拦在 runTask 里（见下），而不是启动时直接死掉。
   if (!opts.apiKey) {
@@ -239,6 +250,37 @@ async function main(): Promise<void> {
 
   // 会话对象在下面才创建，但下面的 applyRoot / policyOf 都要引用它：先声明、后赋值
   let session!: Session
+
+  // ---------- 性能采样：event loop lag 与资源占用 ----------
+  // 主线程被同步代码占住时，定时器会跪到；跪多少就是「这次卡了多久」的直接证据。
+  const lagState = { busy: false }
+  let lagPrev = Date.now()
+  const lagTimer = setInterval(() => {
+    const now = Date.now()
+    const lag = now - lagPrev - 100
+    lagPrev = now
+    if (lag >= 100) perf.point('loop-lag', { lag_ms: Math.round(lag), busy: lagState.busy })
+  }, 100)
+  lagTimer.unref?.()
+
+  // 每 5 秒一条资源采样：内存涨不停 / CPU 顶满，是「越用越卡」的两条主线
+  let cpuPrev = process.cpuUsage()
+  let cpuPrevAt = Date.now()
+  const resTimer = setInterval(() => {
+    const now = Date.now()
+    const du = process.cpuUsage(cpuPrev)
+    const gap = now - cpuPrevAt
+    cpuPrev = process.cpuUsage()
+    cpuPrevAt = now
+    const m = process.memoryUsage()
+    perf.point('res', {
+      cpu: gap > 0 ? Math.round(((du.user + du.system) / 1000 / gap) * 100) / 10 : 0,
+      rss_mb: Math.round(m.rss / 1048576),
+      heap_mb: Math.round(m.heapUsed / 1048576),
+      busy: lagState.busy,
+    })
+  }, 5000)
+  resTimer.unref?.()
 
   // 每个会话记住自己的工作目录：切会话时工具根跟着它走。
   // 没记过（老会话）就落到当前默认目录，从此固定在这个会话上。
@@ -314,8 +356,13 @@ async function main(): Promise<void> {
     reasonT0 = 0
   }
 
+  // 这一轮的耗时账：首字多久出来、一共多少个 delta——「看着像卡住」多半是首字慢
+  let turnPerf: { t0: number; deltas: number; texts: number; firstMs: number } | null = null
+
   const renderer: Renderer = {
     onTurnStart: (_turn, text, files) => {
+      turnPerf = { t0: Date.now(), deltas: 0, texts: 0, firstMs: 0 }
+      lagState.busy = true
       send({ type: 'turn-start', text, files: files ?? [] })
       // 提问索引（界面左侧那列白杠）是按会话事件算的，原先只在开关会话时给一次。
       // 用户刚发的这句话要是不重发，白杠就得等重新打开会话才长出来。
@@ -329,11 +376,23 @@ async function main(): Promise<void> {
       // 出正文就是开始回答了，前面那段思考到此为止
       closeThought()
       timeline?.answer()
+      if (turnPerf) {
+        turnPerf.texts++
+        if (!turnPerf.firstMs) turnPerf.firstMs = Date.now() - turnPerf.t0
+      }
       send({ type: 'text', delta })
     },
     onReasoning: (delta) => {
       if (!reasonT0) reasonT0 = Date.now()
       timeline?.reason(delta)
+      if (turnPerf) {
+        turnPerf.deltas++
+        if (!turnPerf.firstMs) {
+          // 首字延迟：上游 / 代理慢不慢，看这一条就知道
+          turnPerf.firstMs = Date.now() - turnPerf.t0
+          perf.span('first-delta', turnPerf.firstMs, { model: llm.cfg.model, kind: 'reasoning' })
+        }
+      }
       send({ type: 'reasoning', delta })
     },
     onAssistantEnd: (text) => send({ type: 'assistant-end', text }),
@@ -346,6 +405,8 @@ async function main(): Promise<void> {
     },
     onToolEnd: (call: ToolCall, result) => {
       timeline?.toolEnd(call.id, { ok: result.ok, ms: result.ms, content: result.content })
+      // 慢工具单独记一条：一轮卡这么久，多半就卡在这（键用 tool，别用 name——会盖掉记录自己的 name）
+      if (result.ms >= 5000) perf.span('slow-tool', result.ms, { tool: call.name, ok: result.ok })
       send({
         type: 'tool-end',
         id: call.id,
@@ -485,6 +546,7 @@ async function main(): Promise<void> {
   })
 
   send(state())
+  perf.point('ready', { ms: Date.now() - bootT0, events: session.events.length, tools: tools.all().length })
 
   let controller: AbortController | undefined
   let current: Promise<void> | undefined
@@ -568,8 +630,29 @@ async function main(): Promise<void> {
       } catch (e) {
         send({ type: 'error', message: `记忆收尾失败：${(e as Error).message}` })
       }
+      if (turnPerf) {
+        perf.span('turn', Date.now() - turnPerf.t0, {
+          reason: r.reason,
+          first_ms: turnPerf.firstMs,
+          deltas: turnPerf.deltas,
+          texts: turnPerf.texts,
+          steps: runningStep,
+        })
+        turnPerf = null
+      }
+      lagState.busy = false
       send({ type: 'turn-end', reason: r.reason, ms: Date.now() - t0, text: r.text, stats: timeline?.stats() ?? null })
     } catch (e) {
+      if (turnPerf) {
+        perf.span('turn', Date.now() - turnPerf.t0, {
+          reason: 'error',
+          first_ms: turnPerf.firstMs,
+          deltas: turnPerf.deltas,
+          error: (e as Error).message.slice(0, 200),
+        })
+        turnPerf = null
+      }
+      lagState.busy = false
       send({ type: 'error', message: (e as Error).message })
       send({ type: 'turn-end', reason: 'error', ms: Date.now() - t0, text: '', stats: timeline?.stats() ?? null })
     } finally {
@@ -1049,6 +1132,10 @@ async function main(): Promise<void> {
   controller?.abort()
   await current
   approver.rejectAll()
+  perf.summary({ uptime_ms: Date.now() - bootT0 })
+  await perf.close()
+  clearInterval(lagTimer)
+  clearInterval(resTimer)
   audit.close()
 }
 

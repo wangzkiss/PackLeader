@@ -29,7 +29,8 @@ class HostProc {
 
   constructor(args: string[]) {
     this.child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', HOST, ...args], {
-      env: { ...process.env, NO_COLOR: '1' },
+      // PL_PERF=off：测试起的 host 不要往用户真实的 perf 目录里写日志
+      env: { ...process.env, NO_COLOR: '1', PL_PERF: 'off' },
       windowsHide: true,
     })
     this.child.stdout.on('data', (b: Buffer) => {

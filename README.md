@@ -65,6 +65,16 @@ turn → step → tool batch，事件全量落盘，`--max-steps` 保护；步�
 ### 自动验证闭环
 本轮只要有 `write` / `edit` 成功落盘，收尾前自动跑一遍项目测试：认 `package.json` 的 `scripts.test`（按 lockfile 选 npm / pnpm / yarn）、`Cargo.toml`、`go.mod`、`pytest.ini`；认不出就跳过并说明。失败输出回灌给模型让它自己修，默认只重试 1 轮（`maxVerifyRounds`），超时 180s。关掉用 `--no-verify`，指定命令用 `--verify "node --test"`。
 
+### 性能日志与卡顿定位
+
+启动慢、用着卡、一轮没反应——光靠 `%TEMP%\packleader-ui.log`（每次启动清空、只有启动打点和异常）没法复盘。所以另有一套结构化的 perf 日志：
+
+- **在哪**：`%LOCALAPPDATA%\PackLeader\perf\`，按天分文件、一行一条 JSONL（`launcher-` / `ui-` / `host-` / `node-` 各写各的），保留 7 天、单文件封顶 20 MB。几个进程写同一个 `run` 与同一个 t0，所以按 `mono`（距离双击多少毫秒）能把「双击 → 窗口 → 一轮回答」拼成一条时间轴。
+- **档位**：`config.json` 的 `perf` 字段（`off` / `basic`（默认）/ `full`），也可以 `--perf full`。`basic` 记启动分段、卡顿、帧率（10 秒一条）、事件、首字、慢工具；`full` 连每条事件、每秒帧率、队列深度都记。
+- **记了什么**：启动各段（启动器 / PS 进程 / WPF 载入 / XAML / 首帧 / host 就绪）、界面主线程断档（一次断档一条，带当时是否在跑）、帧率、输出队列积压、每条事件画了多久、交互动作、从点发送到第一段可见输出、每轮的 delta 数与首字延迟、慢工具（≥5 s）、host 的 event loop 迟到、每 5 秒一次的 CPU / 内存。
+- **三种「卡」分开记**：主线程心跳断档＝脚本占住了 UI 线程；帧率掉＝画得慢但主线程活着；队列变长＝ host 吐得快、界面消化不掉。只记其中一种会把原因误指到别处。
+- **怎么看**：`pl perf`（默认最近 3 次启动）打印启动分解、卡顿/帧率/队列、每轮首字、慢工具和规则化建议；`--runs N` 看更多次，`--dir` 换目录。建议只报「量确实超了」的项，并指向具体那一段（比如「启动到窗口 1.24s（PS 进程 165ms · WPF 载入 230ms）」），不写「建议优化性能」这种空话。
+
 ### 桌面窗口（`pl gui`）
 - 左侧会话列表：分组（右键重命名 / 移到分组 / 取消分组 / 删除）、悬停露出垃圾桶图标删除（深色界面上 `×` 太像关窗口，所以换掉了）、当前会话删掉会自动新建一个
 - 消息流 + Markdown 渲染、代码块卡片（右键复制 / 复制整段对话）、工具行 `⚙ read src/host.ts ✓ 1ms`
@@ -103,6 +113,7 @@ OpenAI 兼容流式适配器：`tool_calls` 按 index 分片聚合、`reasoning_
 | `firstByteSecs` | 请求发出到收到第一个字节（取值 5–3600） | 120 秒 |
 | `idleSecs` | 流式输出中两段数据之间最长间隔（取值 5–3600） | 180 秒 |
 | `requestSecs` | 单次请求整体上限（取值 30–7200） | 900 秒 |
+| `perf` | 性能日志档：`off` / `basic` / `full` | `basic` |
 
 超时项在界面上暂不暴露，手改 `config.json` 即可；别的字段在设置面板里都能改。长上下文一轮下来上下文十几万 token 时，服务端 prefill 就可能一两分钟才吐第一个字，所以默认放宽到 120 秒；网关更慢就写 300 / 600。界面上 Key 输入框永远留空，只显示 `sk-p…3456` 这类掩码。
 
@@ -207,6 +218,7 @@ dist\PackLeader-Setup-0.1.0.exe --uninstall /S # 静默卸载
 | `pl` | 交互模式（`/exit`（也可 `/quit`） `/undo` `/sessions` `/help`） |
 | `pl --repl` | 强制交互模式（stdin 不是终端也行，便于脚本驱动） |
 | `pl gui` | 打开桌面窗口 |
+| `pl perf [--runs N] [--dir <d>]` | 性能报告：启动分解 / 卡顿 / 帧率 / 首字 / 慢工具 + 规则化建议 |
 | `pl doctor` | 自检：node 版本 / shell 解析 / 数据目录可写 / 端点可达 / 模型存在 |
 | `pl audit [-n N] [--tool X] [--session <id>] [--cost] [--json]` | 审计账本：工具调用 / 成本 |
 | `pl audit rebuild` | 从会话日志重建审计库 |

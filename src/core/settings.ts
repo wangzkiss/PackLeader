@@ -16,6 +16,15 @@ import type { Mode } from './types.ts'
 /** 三档权限；config.json 里写坏了就当没写 */
 export const MODES = ['read-only', 'guarded', 'full'] as const
 
+/**
+ * 性能日志三档：
+ *   off   全关，一条不写（自己排查兼容性时用）
+ *   basic 只记启动分段、卡顿、交互响应与轮次汇总（缺省，一天几 MB 以内）
+ *   full  再加逐 tick 明细与每 5s 的资源采样（查内存泄漏/CPU 尖峰时开）
+ */
+export const PERF_MODES = ['off', 'basic', 'full'] as const
+export type PerfMode = (typeof PERF_MODES)[number]
+
 export interface Settings {
   baseURL?: string
   apiKey?: string
@@ -30,6 +39,8 @@ export interface Settings {
   verify?: string
   /** 模型能不能看图；开了才把图片作为 image part 发过去。缺省＝开（见 DEFAULT_VISION） */
   vision?: boolean
+  /** 性能日志：见 PERF_MODES；缺省＝basic */
+  perf?: PerfMode
   /**
    * 首字节超时（秒）：请求发出去多久还没等到第一个字节就算失败。
    * 长上下文（几十次工具调用之后）服务端 prefill 很慢，30 秒那种默认值会把正常请求判死，
@@ -81,6 +92,9 @@ function coerce(raw: unknown): Settings {
     if (typeof v === 'string' && v.trim()) out[k] = v.trim()
   }
   if (typeof obj.vision === 'boolean') out.vision = obj.vision
+  if (typeof obj.perf === 'string' && (PERF_MODES as readonly string[]).includes(obj.perf)) {
+    out.perf = obj.perf as PerfMode
+  }
   if (typeof obj.mode === 'string' && (MODES as readonly string[]).includes(obj.mode)) {
     out.mode = obj.mode as Mode
   }
@@ -131,6 +145,8 @@ export async function saveSettings(dataDir: string, patch: Settings): Promise<Se
     if (patch.verify.trim()) merged.verify = patch.verify.trim()
     else delete merged.verify
   }
+  // 性能日志开关：三档，写坏了就当没写（不能因为一个手改错的字段把采集带进未知状态）
+  if (patch.perf !== undefined && (PERF_MODES as readonly string[]).includes(patch.perf)) merged.perf = patch.perf
   // 超时是纯数字配置：界面上暂不暴露，但手写 config.json / 以后加输入框都能走这条路
   for (const k of ['firstByteSecs', 'idleSecs', 'requestSecs'] as const) {
     const v = patch[k]

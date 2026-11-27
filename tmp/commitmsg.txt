@@ -1,0 +1,5 @@
+fix(session): 投影层补占位 tool 消息，避免孤儿 tool_call 让会话永久 400
+
+- Session.deriveMessages 在投影时给缺结果的工具调用补一条「中断」占位，并丢弃没有对应 assistant 的无主 tool 消息；日志本身不改，原样回放不受影响
+- 顺带把插话归并逻辑改成按 toolCallId 认领，不相关的 tool 不再被卷进这一批
+- GUI 历史回放：整轮默认收起、思考正文懒渲染、执行方案卡补最终状态尾巴，顶栏与窗口配色统一

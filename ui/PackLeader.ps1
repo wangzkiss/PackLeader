@@ -1578,6 +1578,10 @@ function New-StepBlock {
     # 历史里的步骤卡一建出来就是 Done：不会再显示「正在做…」
     Open = $true; Done = $finished
     Tools = 0; ReasonSecs = 0.0; Snip = ''
+    # 历史回放出来的步骤卡：卡头不显示「思考 Ns」这种读秒。
+    # 不能用 $finished 判断——建卡那一刻轮卡还是 Live（Set-TurnHistorical 之后才翻），
+    # 回放期间 renderEventIndex 才是准的信号；实时跑出来的卡照旧带读秒。
+    Historical = [bool]$finished -or ($null -ne $script:renderEventIndex -and $script:renderEventIndex -ge 0)
   }
   $head.Tag = $node
   $head.Add_Click({ param($s, $e) Toggle-StepBlock $s.Tag })
@@ -1623,7 +1627,9 @@ function Update-StepHead($n) {
   $n.Title.Foreground = $(if ($n.Done) { Brush '#9BA3B4' } else { Brush '#C7CBD2' })
   $parts = @()
   if ([int]$n.Tools -gt 0) { $parts += ("$($n.Tools) 次调用") }
-  if ([double]$n.ReasonSecs -gt 0.05) { $parts += ('思考 ' + (Format-ReasonSecs $n.ReasonSecs)) }
+  # 思考耗时只对「正在跑的那一轮」有意义：历史回放里它是个定局数字，
+  # 摆出来就像还在读秒，所以历史步骤卡不显示。
+  if (-not $n.Historical -and [double]$n.ReasonSecs -gt 0.05) { $parts += ('思考 ' + (Format-ReasonSecs $n.ReasonSecs)) }
   $n.Meta.Text = ($parts -join ' · ')
 }
 

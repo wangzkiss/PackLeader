@@ -650,9 +650,10 @@ $window.Dispatcher.add_UnhandledException({
 $Transcript = $window.FindName('Transcript')
 # 回放旧历史时要往「临时面板」里画（画完一次性插到顶部），平时就是 Transcript
 $script:renderHost = $Transcript
-# 历史回放：单条正文/思考超过 6000 / 4000 字先只画前面一段，点「展开」再画剩下的
+# 历史回放：单条正文超过 6000 字先只画前面一段，点「展开」再画剩下的。
+# 思考过程不折叠也不延迟渲染：打开旧会话就整段写好，点展开当场就看到全文，
+# 不会出现「点开之后内容才一段段长出来」的加载动作。
 $script:replayFoldChars = 6000
-$script:reasonFoldChars = 4000
 # 一次 history-slice 的耗时统计（跟着 UI 日志走，方便以后看趋势）
 $script:historyT0 = $null
 $script:historyFetched = 0
@@ -1033,26 +1034,13 @@ function Add-AssistantMessage {
   # 正文挂当前这一步：一段思考、几次调用、结论要按步挨在一起
   $sp = New-Object System.Windows.Controls.StackPanel
   $sp.Margin = "0,0,0,10"
-  # 标记成结论块：轮尾的 Close-TurnProc 会把最后一块搬进 Final 区（不随轮头折叠）
+  # 标记成结论块：轮尾的 Close-TurnProc 会把最后一块留在 Final 区（不随轮头折叠）
   $sp.Tag = 'assistant'
-  (Get-ProcPanel).Children.Add($sp) | Out-Null
-  # 头行：左边模型名，右边一颗折叠箭头。多步任务里中间那些结论可以逐个收起，
-  # 收起后后面几步往上顶，一屏能看更多；默认展开。
+  (Get-ProcPanel 'text').Children.Add($sp) | Out-Null
+  # 头行只留模型名：收/放由所在步骤卡的卡头统一管（一步一个折叠点，
+  # 不再让每段正文各带一颗箭头——多步任务里那就是一排排小三角）
   $hd = New-Object System.Windows.Controls.DockPanel
   $sp.Children.Add($hd) | Out-Null
-  $toggle = New-Object System.Windows.Controls.Button
-  $toggle.Background = [System.Windows.Media.Brushes]::Transparent
-  $toggle.BorderThickness = '0'
-  $toggle.Padding = '2,0,2,0'
-  $toggle.Cursor = 'Hand'
-  $toggle.Template = (New-FlatTemplate)
-  $toggle.ToolTip = '收起这段结论'
-  [System.Windows.Controls.DockPanel]::SetDock($toggle, 'Right')
-  $arrow = New-Text '▾' 10 '#5B626D' 'Normal' 'Segoe UI' 0
-  $arrow.VerticalAlignment = 'Center'
-  $toggle.Content = $arrow
-  $hd.Children.Add($toggle) | Out-Null
-  # 收起后这一行只留摘要：取这段结论的第一行，超长截断
   $snip = New-Text '' 11 '#6F7684' 'Normal' 'Segoe UI' 0
   $snip.VerticalAlignment = 'Center'
   $snip.TextTrimming = 'CharacterEllipsis'
@@ -1072,26 +1060,17 @@ function Add-AssistantMessage {
   $script:assistantBody = $body
   $script:assistantBox = @{ text = '' }
   Set-CopyMenu $sp $script:assistantBox
-  # 收/放这一段结论：箭头换向，正文整块收起（这一块的「思考 / 工具」不动）
-  $state = @{ Body = $body; Arrow = $arrow; Open = $true; Toggle = $toggle; Snip = $snip; Box = $script:assistantBox }
-  $toggle.Tag = $state
-  $toggle.Add_Click({
-    param($s, $e)
-    $st = $s.Tag
-    if (-not $st) { return }
-    Set-AssistantFold $st (-not $st.Open)
-  })
-  $script:assistantFold = $state
+  $script:assistantFold = @{ Body = $body; Open = $true; Snip = $snip; Box = $script:assistantBox }
   return $tb
 }
 
-# 收 / 放一段结论：箭头换向、正文整块收起，收起后这一行挂一句摘要
+# 收 / 放一段结论：正文整块收起，收起后这一行挂一句摘要。
+# 收起这一步的正文归步骤卡头管（Set-StepConclusion / Toggle-StepBlock），
+# 这里只留给「没有步骤卡」的兜底路径（正文直接挂在轮过程区或聊天区时）。
 function Set-AssistantFold($st, [bool]$open) {
   if (-not $st) { return }
   $st.Open = $open
   $st.Body.Visibility = $(if ($open) { 'Visible' } else { 'Collapsed' })
-  $st.Arrow.Text = $(if ($open) { '▾' } else { '▸' })
-  if ($st.Toggle) { $st.Toggle.ToolTip = $(if ($open) { '收起这段结论' } else { '展开这段结论' }) }
   if ($st.Snip) {
     if ($open) {
       $st.Snip.Visibility = 'Collapsed'
@@ -1203,7 +1182,7 @@ function Add-ToolRow([string]$name, [string]$summary, [string]$argsText = '', [o
   # 右键可复制这一行的「工具名 + 参数 + 结果」；文本随着状态变，放在 $box 里跟着更新
   Set-CopyMenu $outer $box
   if ($parent) { $parent.Children.Add($outer) | Out-Null }
-  else { $script:renderHost.Children.Add($outer) | Out-Null }
+  else { (Get-ProcPanel 'tool').Children.Add($outer) | Out-Null }
 
   $row = New-Object PSObject -Property @{
     Border = $outer; Button = $head; Icon = $icon; Name = $nameTb; Sum = $sumTb; Status = $status
@@ -1244,12 +1223,21 @@ function Step-ToolRows {
 # 中间各步的结论跟着「过程」一起被轮头收起，最后一段结论在轮尾时搬到 Final 区，
 # 折叠轮头也只收过程，最后结论永远留在屏幕上。
 $script:turnProc = $null
-# 当前这一「步」的容器：思考 / 工具 / 结论都落在一块里，下一步再开新的
+# 当前这一「步」：同一张步骤卡里的思考 / 工具 / 结论三块（下一步再开新卡）
 $script:stepBox = $null
+$script:stepNode = $null
 
-# 过程元素往哪挂：有当前步骤就挂这一步里，本轮有卡就挂卡里，没有（正文、系统行、历史外的事件）就挂聊天区
-function Get-ProcPanel {
-  if ($script:stepBox) { return $script:stepBox }
+# 过程元素往哪挂：
+#   有当前步骤卡 → 按 kind 挂这一步的「思考区 / 工具区 / 结论区」（三段顺序固定，
+#     不管事件是「先出正文再调工具」还是反过来，展开看到的永远是 思考 → 工具 → 结论）；
+#   本轮有卡 → 挂轮的过程区；都没有（历史外的事件、系统行）→ 挂聊天区。
+function Get-ProcPanel([string]$kind = '') {
+  if ($script:stepNode) {
+    if ($kind -eq 'reason') { return $script:stepNode.ThinkHost }
+    if ($kind -eq 'tool') { return $script:stepNode.ToolHost }
+    if ($kind -eq 'text') { return $script:stepNode.TextHost }
+    return $script:stepNode.Body
+  }
   if ($script:turnProc -and -not $script:turnProc.Done) { return $script:turnProc.Body }
   return $script:renderHost
 }
@@ -1297,17 +1285,23 @@ function New-ThinkIcon([string]$color = '#A8B0BE') {
 # 刷新状态行：阶段词 + 计时；结束了就把绿点熄掉、词换成「已完成」
 function Update-TurnProc($t) {
   if (-not $t) { return }
-  $verb = $(if ($t.Done) { '已完成' } else { $script:thinkVerb })
+  $verb = $(if ($t.Done -or (-not $t.Live)) { '已完成' } else { $script:thinkVerb })
   if (-not $verb) { $verb = '思考中' }
+  # 历史里读回来的轮次（Live=$false）已经定局：进度词只报「已完成」，不再显示阶段词。
+  # 不这么改的话，一张历史回放的轮卡在收到第一个 assistant/message 之前那几十毫秒里，
+  # 状态行还是 New-TurnProc 建的「思考中…」，切到旧会话会闪一下「思考中」。
+  $historical = (-not $t.Live)
   # 跑着的阶段词句尾点一下；「执行 fs.read」这种不再加点
-  $tail = $(if ($t.Done) { '' } elseif ($verb -eq '思考中' -or $verb -eq '回答中' -or $verb -eq '验证中') { '…' } else { '' })
+  $tail = $(if ($t.Done -or $historical) { '' } elseif ($verb -eq '思考中' -or $verb -eq '回答中' -or $verb -eq '验证中') { '…' } else { '' })
   $t.Verb.Text = $verb + $tail
-  $t.Verb.Foreground = $(if ($t.Done) { Brush '#6B7280' } else { Brush '#C7CBD2' })
-  $secs = $(if ($t.Done) { [double]$t.Ms / 1000.0 } else { ((Get-Date) - $t.T0).TotalSeconds })
+  if ($historical) { $t.Verb.Foreground = (Brush '#6B7280') }
+  else { $t.Verb.Foreground = $(if ($t.Done) { Brush '#6B7280' } else { Brush '#C7CBD2' }) }
+  $secs = $(if ($t.Done -or $historical) { [double]$t.Ms / 1000.0 } else { ((Get-Date) - $t.T0).TotalSeconds })
   # 历史回放没有墙钟：这一轮走了多久按事件时间戳之差算
   if ($t.At0 -gt 0 -and $t.AtLast -ge $t.At0) { $secs = ([double]$t.AtLast - $t.At0) / 1000.0 }
   $t.Clock.Text = (Format-Clock $secs)
-  if ($t.Done) {
+  # 历史轮：耗时与呼吸灯都按定局处理（数据齐了就是事件时间戳之差）
+  if ($t.Done -or $historical) {
     # 呼吸灯停不下来就是还在跑：结束这一轮时熄掉
     $t.Dot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
     $t.Dot.Opacity = 1
@@ -1336,6 +1330,9 @@ function New-TurnProc {
   $box = New-Object System.Windows.Controls.StackPanel
   $box.Margin = '0,2,0,9'
   $box.HorizontalAlignment = 'Stretch'
+  $script:stepNode = $null
+  $script:reasonNode = $null
+  $script:toolGroup = $null
 
   # 轮头：一整块可点。上面一行是状态（● 思考中… 1:30），
   # 下面一行是这一轮的工具汇总（▾ 14 次工具调用 · 共 8.3s · 6 步   read×6 · shell×3）；
@@ -1419,6 +1416,13 @@ function New-TurnProc {
     Dot = $dot; Verb = $verb; Clock = $clock
     Thought = $null; LastStep = $null
     Open = $true; Done = $false; Tools = 0; Steps = 0; Replay = $false
+    StepNodes = (New-Object System.Collections.ArrayList)
+    # Closed：这一轮是否已经收过尾（收尾动作只跑一次；不复用 Done，
+    # 因为回放的步骤卡建出来就带 Done，用 Done 当早退条件会把收尾整段跳过）
+    Closed = $false
+    # Live：这张轮卡是不是「正在跑的这一轮」的。历史回放里读回来的轮次一律 Live=$false，
+    # 状态行直接定格「已完成」，不显示任何进行中的阶段词（任务已经结束了）。
+    Live = $true
     ToolMs = 0.0; Failed = 0; Counts = @{}; Order = (New-Object System.Collections.ArrayList)
     T0 = (Get-Date); Ms = 0; At0 = 0; AtLast = 0
   }
@@ -1442,6 +1446,18 @@ function Toggle-TurnProc($t) {
   if (-not $t) { return }
   $t.Open = -not $t.Open
   if ($t.Body) { $t.Body.Visibility = $(if ($t.Open) { 'Visible' } else { 'Collapsed' }) }
+  # 展开这一轮时，里面的步骤卡一律保持「一行一张」的收起态：
+  # 一轮展开先看到的是「第 1 步… 第 2 步…」的目录，想看哪一步再点哪一步，
+  # 不然一轮十几步会把每一段的思考链和工具行全铺开，翻半天也看不到别的步。
+  if ($t.Open) {
+    foreach ($node in @($t.StepNodes)) {
+      if (-not $node) { continue }
+      if (-not $node.Open) { continue }
+      $node.Open = $false
+      if ($node.Body) { $node.Body.Visibility = 'Collapsed' }
+      Update-StepHead $node
+    }
+  }
   Update-TurnProc $t
 }
 
@@ -1455,34 +1471,291 @@ function Set-TurnProcCollapsed($t) {
   Update-TurnProc $t
 }
 
-# 开新的一步：上一段思考先定格，然后在这一块里依次长「思考 → 工具 → 结论」。
-# 整轮共用一张思考条 / 一张工具聚合卡，会让「哪段思考配哪几次调用」糊成一片。
+# 轮卡标成「历史轮」：状态行只报「已完成」（Update-TurnProc 看 Live），过程区从建成起收起。
+# 注意这里不能顺手置 Done——Done 的含义是「这张卡已经收尾、不能再往里画」，
+# 而回放要接着往同一张卡里填思考 / 工具 / 正文；置了 Done 的话下一次 Get-TurnProc
+# 会另建一张轮卡，一轮就会裂成好几张。
+function Set-TurnHistorical($t) {
+  if (-not $t) { return }
+  $t.Live = $false
+  $t.Replay = $true
+  Set-TurnProcCollapsed $t
+  Update-TurnProc $t
+}
+
+# 开新的一步：一张可折叠的步骤卡。
+#   卡头     ▸ 第 3 步 · 结论摘要……        2 次调用 · 思考 4s   ← 收起时就一行
+#   卡身     [这段思考] → [这几次调用] → [这一步给出的结论]
+# 一步一张，展开一步只看到这一步的思考过程和工具调用，不会跟别的步混在一起。
+# 整轮共用一张思考条 / 一张工具聚合卡会让「哪段思考配哪几次调用」糊成一片。
 function New-StepBlock {
   $tp = Get-TurnProc
   if ($script:reasonNode -and -not $script:reasonNode.Done) { Complete-Reasoning }
-  $box = New-Object System.Windows.Controls.StackPanel
-  $box.Margin = '0,0,0,2'
-  $box.HorizontalAlignment = 'Stretch'
-  # 这一步的容器：思考 / 工具 / 结论都落进来，最后一段结论在轮尾被搬进 Final 区
-  $tp.Body.Children.Add($box) | Out-Null
-  $script:stepBox = $box
-  $tp.LastStep = $box
+  # 这一轮是从历史里读回来的（Live=$false）：这一步早就做完了，
+  # 卡头不该是「正在做…」，等正文到了再用 Set-StepConclusion 填真实结论
+  $finished = (-not $tp.Live)
+  # 上一步没拿到结论（只有思考 / 工具、没有正文）就把这一步并进去，不另起一张卡：
+  # 目录里不该出现「第 4 步（这一步没有结论）」这种占位行，它的内容归到下一张
+  # 有结论的卡里一起看。全部步骤都没结论时就会并成一张，这比一串空卡好读。
+  # 判据只看有没有结论（Snip），不看 Done——历史回放的卡一建出来就 Done，
+  # 拿 Done 当判据会导致回放里一次也合并不上。
+  $prev = $script:stepNode
+  if ($prev -and [string]::IsNullOrWhiteSpace($prev.Snip) -and $prev.Card.Parent -eq $tp.Body) {
+    # 并进去：这张卡重新变成「可以继续画」的状态，新一段思考从自己的条目开始
+    $prev.Done = $false
+    $script:reasonNode = $null
+    $script:toolGroup = $null
+    Update-StepHead $prev
+    return $prev
+  }
+
+  $card = New-Object System.Windows.Controls.Border
+  $card.Background = (Brush '#0B0D11')
+  $card.BorderBrush = (Brush '#0DFFFFFF')
+  $card.BorderThickness = '1'
+  $card.CornerRadius = '8'
+  $card.Padding = '0'
+  $card.Margin = '0,0,0,5'
+  $card.HorizontalAlignment = 'Stretch'
+  $card.Tag = 'step'
+  $tp.Body.Children.Add($card) | Out-Null
+
+  $sp = New-Object System.Windows.Controls.StackPanel
+  $sp.Tag = 'stepstack'
+
+  # 卡头：一整块可点。左边步骤号，中间这一条的结论摘要（没有结论时先说「正在做…」），
+  # 右边这一步的调用次数和思考耗时。
+  $head = New-Object System.Windows.Controls.Button
+  $head.Background = [System.Windows.Media.Brushes]::Transparent
+  $head.BorderThickness = '0'
+  $head.Padding = '9,5'
+  $head.Cursor = 'Hand'
+  $head.HorizontalContentAlignment = 'Stretch'
+  $head.Template = (New-FlatTemplate)
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($head, 'StepHead')
+  $head.ToolTip = '点一下展开 / 收起这一段的思考过程和工具调用'
+
+  $dp = New-Object System.Windows.Controls.DockPanel
+  # 右边：这一步调了几次、想了多久（都很轻，最后才亮）
+  $meta = New-Text '' 10 '#5B626D' 'Normal' 'Cascadia Mono, Consolas' 0
+  $meta.VerticalAlignment = 'Center'
+  [System.Windows.Controls.DockPanel]::SetDock($meta, 'Right')
+  $dp.Children.Add($meta) | Out-Null
+
+  $no = New-Text '' 10.5 '#6B7280' 'SemiBold' 'Cascadia Mono, Consolas' 0
+  $no.VerticalAlignment = 'Center'
+  $no.Margin = '0,0,7,0'
+  [System.Windows.Controls.DockPanel]::SetDock($no, 'Left')
+  $dp.Children.Add($no) | Out-Null
+
+  $title = New-Text $(if ($finished) { '▸  已完成' } else { '▸  正在做…' }) 11.5 $(if ($finished) { '#9BA3B4' } else { '#C7CBD2' }) 'SemiBold' 'Segoe UI' 0
+  $title.VerticalAlignment = 'Center'
+  $title.TextTrimming = 'CharacterEllipsis'
+  $title.TextWrapping = 'NoWrap'
+  $dp.Children.Add($title) | Out-Null
+  $head.Content = $dp
+  $sp.Children.Add($head) | Out-Null
+
+  # 卡身：这一步的思考 / 工具 / 结论都落在这里，收起时整块不占地方
+  $body = New-Object System.Windows.Controls.StackPanel
+  $body.Margin = '9,0,9,7'
+  $sp.Children.Add($body) | Out-Null
+
+  $card.Child = $sp
+
+  # 卡身里的三段固定区域：思考在上、工具居中、结论在下。
+  # 这样展开一张卡永远是「怎么想的 → 做了什么 → 得到什么」，跟事件到达顺序无关。
+  $thinkHost = New-Object System.Windows.Controls.StackPanel
+  $body.Children.Add($thinkHost) | Out-Null
+  $toolHost = New-Object System.Windows.Controls.StackPanel
+  $body.Children.Add($toolHost) | Out-Null
+  $textHost = New-Object System.Windows.Controls.StackPanel
+  $body.Children.Add($textHost) | Out-Null
+
+  $node = New-Object PSObject -Property @{
+    Card = $card; Head = $head; Body = $body; Title = $title; No = $no; Meta = $meta
+    ThinkHost = $thinkHost; ToolHost = $toolHost; TextHost = $textHost
+    # 历史里的步骤卡一建出来就是 Done：不会再显示「正在做…」
+    Open = $true; Done = $finished
+    Tools = 0; ReasonSecs = 0.0; Snip = ''
+  }
+  $head.Tag = $node
+  $head.Add_Click({ param($s, $e) Toggle-StepBlock $s.Tag })
+
+  $script:stepBox = $body
+  $script:stepNode = $node
+  # 卡上挂回自己的节点：回放时要按卡片父级从 Body 里收集步卡（Border 是 .NET 对象，直接 $card.NodeRef = ... 会报「找不到属性」，得走 Add-Member）
+  $card | Add-Member -NotePropertyName NodeRef -NotePropertyValue $node -Force
+  # 记进这一轮的名册：展开轮卡时要按这份名册把各步收起来
+  if ($tp.StepNodes -and -not $tp.StepNodes.Contains($node)) { $tp.StepNodes.Add($node) | Out-Null }
+  $tp.LastStep = $node
+  $tp.Steps = [int]$tp.Steps + 1
+  $node.No.Text = '第 ' + $tp.Steps + ' 步'
+  Update-StepHead $node
+  # 历史里的这一步早就做完了：卡身默认收起，轮卡展开后看到的是「第 1 步… 第 2 步…」
+  # 这样的一行一条目录，想看哪一步的思考和工具再点哪一步。
+  if ($finished) {
+    $node.Open = $false
+    $body.Visibility = 'Collapsed'
+  }
   # 思考和工具组都按步新建：下一段思考、下一次调用落进新块
   $script:toolGroup = $null
   $script:reasonNode = $null
   $tp.Thought = $null
   # 轮头那行「N 步」按实际开了几块算：host 的 step 编号含收尾步，跟块数对不上
-  $tp.Steps = [int]$tp.Steps + 1
   Update-TurnProc $tp
-  return $box
+  return $node
+}
+
+# 刷新步骤卡头：箭头 + 结论摘要（没结论时按阶段说在做什么）+ 这一步的规模。
+# 摘要取「这一步的结论」第一行；还在跑的时候取最新那段思考的开头。
+function Update-StepHead($n) {
+  if (-not $n) { return }
+  $arrow = $(if ($n.Open) { '▾' } else { '▸' })
+  $snip = [string]$n.Snip
+  if (-not $snip) {
+    if ($n.Done) { $snip = '（这一步没有结论）' }
+    else { $snip = '正在做…' }
+  }
+  $max = Get-RowChars 330 6.6
+  if ($snip.Length -gt $max) { $snip = $snip.Substring(0, $max) + '…' }
+  $n.Title.Text = "$arrow  $snip"
+  $n.Title.Foreground = $(if ($n.Done) { Brush '#9BA3B4' } else { Brush '#C7CBD2' })
+  $parts = @()
+  if ([int]$n.Tools -gt 0) { $parts += ("$($n.Tools) 次调用") }
+  if ([double]$n.ReasonSecs -gt 0.05) { $parts += ('思考 ' + (Format-ReasonSecs $n.ReasonSecs)) }
+  $n.Meta.Text = ($parts -join ' · ')
+}
+
+# 这一步的结论出来了：卡头换成它的第一句正文（收起态看这一句就够了）
+# 标题行（## 结论 之类）本身不说明信息，去掉标记后太短就往下找一句完整的
+function Set-StepConclusion($n, [string]$text) {
+  if (-not $n) { return }
+  $pick = $null
+  foreach ($raw in (([string]$text) -split "`r?`n")) {
+    if (-not $raw.Trim()) { continue }
+    # 去掉标题/列表/引用标记和行内代码反引号，留下能读的字
+    $line = ($raw -replace '^\s*[#>\-*\+\d\.\s]+', '').Replace('`', '').Trim()
+    if (-not $line) { continue }
+    # 代码块围栏行直接跳过
+    if ($raw.Trim() -match '^(```|~~~)') { continue }
+    if ($line.Length -ge 8) { $pick = $line; break }
+    if (-not $pick) { $pick = $line }
+  }
+  if (-not $pick) { return }
+  $n.Snip = $pick
+  $n.Done = $true
+  Update-StepHead $n
+}
+
+# 把「没有结论」的步骤并进它后面第一张有结论的卡里（整轮画完后扫一遍）。
+# 判据看「卡里有没有正文」（Tag='assistant' 的正文块），不看 Snip：
+# 回放里 Snip 可能还没回填，真正能说明这步有没有结论的是它的正文。
+# 没有后继卡的（末尾那几张）就保留——它们至少还挂着工具行。
+function Merge-EmptySteps($t) {
+  if (-not $t) { return }
+  # 只处理还挂在这一轮里的步骤卡（已经被并掉的要从名册里认出来跳过）
+  $nodes = @()
+  foreach ($n in @($t.StepNodes)) {
+    if ($n -and $n.Card -and $n.Card.Parent -eq $t.Body) { $nodes += $n }
+  }
+  # 名册可能挂在先前那个轮卡对象上（回放中轮卡会被替换），那就按卡片父级从 Body 直接收集
+  if ($nodes.Count -lt 2 -and $t.Body) {
+    $nodes = @()
+    foreach ($c in @($t.Body.Children)) {
+      if ($c.Tag -eq 'step' -and $c.NodeRef) { $nodes += $c.NodeRef }
+    }
+  }
+  if ($nodes.Count -lt 2) { return }
+
+  $dropped = @()
+  for ($i = $nodes.Count - 2; $i -ge 0; $i--) {
+    $node = $nodes[$i]
+    if (Test-StepHasText $node) { continue }
+    $host = $null
+    for ($j = $i + 1; $j -lt $nodes.Count; $j++) {
+      if ($dropped -contains $nodes[$j]) { continue }
+      if (Test-StepHasText $nodes[$j]) { $host = $nodes[$j]; break }
+    }
+    if (-not $host) { continue }
+    Move-StepContent $node $host
+    $t.Body.Children.Remove($node.Card) | Out-Null
+    $dropped += $node
+  }
+  foreach ($node in $dropped) {
+    [void]$t.StepNodes.Remove($node)
+  }
+
+  # 并完之后重排卡头编号，别留下「第 3 步、第 5 步」这种断号
+  $no = 0
+  foreach ($node in @($t.StepNodes)) {
+    if (-not $node -or $node.Card.Parent -ne $t.Body) { continue }
+    $no++
+    if ($node.No) { $node.No.Text = "第 $no 步" }
+  }
+}
+
+# 这一步有没有结论：正文里得有真正的文字。
+# 只看 TextHost.Children.Count 不行——正文容器往往是空的也先建好了，
+# 那样每张卡都会被判成「有结论」，合并一次也不会触发。
+function Test-StepHasText($node) {
+  if (-not $node) { return $false }
+  if ($node.Snip -and ([string]$node.Snip).Trim()) { return $true }
+  if (-not $node.TextHost) { return $false }
+  foreach ($k in @($node.TextHost.Children)) {
+    $txt = ''
+    if ($k -is [System.Windows.Controls.TextBlock]) { $txt = $k.Text }
+    elseif ($k.Text) { $txt = $k.Text }
+    if (-not $txt -and $k.Inlines -and $k.Inlines.Count -gt 0) {
+      foreach ($il in $k.Inlines) { if ($il.Text) { $txt += $il.Text } }
+    }
+    if ($txt -and $txt.Trim()) { return $true }
+  }
+  return $false
+}
+
+# 把一张步骤卡的思考区 / 工具区整体搬到另一张卡上（结论区不搬）
+function Move-StepContent($from, $to) {
+  if (-not $from -or -not $to) { return }
+  foreach ($pair in @(
+      @($from.ThinkHost, $to.ThinkHost),
+      @($from.ToolHost, $to.ToolHost))) {
+    $src = $pair[0]; $dst = $pair[1]
+    if (-not $src -or -not $dst) { continue }
+    foreach ($k in @($src.Children)) {
+      $src.Children.Remove($k) | Out-Null
+      $dst.Children.Insert(0, $k) | Out-Null
+    }
+  }
+  # 原来的结论区（空的正文层）整块丢掉：留着就是一个孤零零的空白行，
+  # 界面上看起来像有个 ×/空框挂在卡中间
+  if ($from.TextHost) { $from.TextHost.Children.Clear() }
+  $to.Tools += $from.Tools
+  # 思考时间也带上，卡头「思考 Xs」才不是白丢
+  $to.ReasonSecs += $from.ReasonSecs
+  Update-StepHead $to
+}
+
+# 点步骤卡头：展开 / 收起这一步的思考与工具
+function Toggle-StepBlock($n) {
+  if (-not $n) { return }
+  $n.Open = -not $n.Open
+  $n.Body.Visibility = $(if ($n.Open) { 'Visible' } else { 'Collapsed' })
+  Update-StepHead $n
 }
 
 # 一轮收尾：算出总耗时，状态行定格「已完成 1:30」，绿点熄掉，
-# 并把最后一步的结论搬进 Final 区（折叠轮头收的是「过程」，最后结论要一直看得见）。
+# 并把最后一步整组（思考 + 工具 + 结论）搬到 Final 区——折叠轮头收的是前面的过程，
+# 最后一步的结论要一直看得见，而且它跟自己那几步的思考、调用仍然是一组。
 # 历史回放（Replay）额外做一件事：整轮过程默认收起，打开旧会话先看到结论。
 function Close-TurnProc {
   $t = $script:turnProc
-  if (-not $t -or $t.Done) { return }
+  if (-not $t) { return }
+  # 注意：这里不能因为 $t.Done 就早退。历史回放的每一步卡建出来就标了 Done
+  # （那表示「这一步已经画完，可以往里填最后一次正文」），轮卡自己在回放时也被
+  # Set-TurnHistorical 打过 Replay 标记；早退会让下面的合卡、搬结论整段都不执行。
+  if ($t.Closed) { return }
+  $t.Closed = $true
   $t.Done = $true
   # 历史回放没有墙钟可用（拉起来才几十毫秒），按事件时间戳之差算这一轮的真实耗时
   if ($t.Ms -le 0 -and $t.At0 -gt 0 -and $t.AtLast -ge $t.At0) { $t.Ms = [int]($t.AtLast - $t.At0) }
@@ -1490,30 +1763,39 @@ function Close-TurnProc {
   # 这一轮的思考条和工具卡都留在原地（点开还能看），下一轮重新建
   if ($t.Thought -and -not $t.Thought.Done) { Complete-Reasoning }
   # 最后一段结论从过程区搬到 Final：中间各步的结论留在过程里，跟着轮头一起收。
-  # 从后往前找第一个带结论的步骤块（历史回放里最后一「步」可能只有工具、没有正文）
+  # 从后往前找第一张带结论的步骤卡（历史回放里最后一「步」可能只有工具、没有正文），
+  # 搬的是整张卡——它的思考区和工具区跟着走，展开仍能看到「怎么想到这个结论的」。
   if ($t.Body -and $t.Final) {
-    # 兜底：极端情况下正文直接挂在过程区上（没有步骤块），先把它挑出来
+    # 兜底：正文直接挂在过程区上（没有步骤卡），先把它挑出来
     foreach ($k in @($t.Body.Children)) {
       if ($k.Tag -eq 'assistant') {
         $t.Body.Children.Remove($k) | Out-Null
         $t.Final.Children.Add($k) | Out-Null
       }
     }
-    $steps = @($t.Body.Children)
-    for ($i = $steps.Count - 1; $i -ge 0; $i--) {
-      $sb = $steps[$i]
-      if (-not $sb.Children) { continue }
-      $moved = $false
-      foreach ($k in @($sb.Children)) {
-        if ($k.Tag -eq 'assistant') {
-          $sb.Children.Remove($k) | Out-Null
-          $t.Final.Children.Add($k) | Out-Null
-          $moved = $true
+    $cards = @($t.Body.Children)
+    for ($i = $cards.Count - 1; $i -ge 0; $i--) {
+      $card = $cards[$i]
+      if (-not $card.Children) { continue }
+      $hasText = $false
+      foreach ($layer in @($card.Children)) {
+        if (-not $layer.Children) { continue }
+        foreach ($k in @($layer.Children)) {
+          if ($k.Tag -eq 'assistant') { $hasText = $true }
         }
       }
-      if ($moved) { break }
+      if ($hasText) {
+        $t.Body.Children.Remove($card) | Out-Null
+        $t.Final.Children.Add($card) | Out-Null
+        break
+      }
     }
   }
+  # 收尾补救：把「没有结论」的步骤并进它后面第一张有结论的卡。
+  # 逐条事件合并（New-StepBlock 里那次）挡不住全部情况——历史回放里一条 assistant/message
+  # 可能是空的，卡建出来时就已经 Done、正文又是空的，等下一段正文到达时早就另起了新卡。
+  # 所以在整轮画完之后按顺序再扫一遍：卡里没正文的，把内容整体搬到下一张有正文的卡上。
+  Merge-EmptySteps $t
   # 历史回放（切到旧会话也是这条路）：这一轮的过程默认整块收起，
   # 只留轮头两行和最后的结论——打开旧会话先看到结论，不用先翻一屏思考链和工具卡；
   # 想看过程点轮头就放回来（Body 里的思考条 / 工具卡本身仍是各自的收起态）。
@@ -1523,6 +1805,7 @@ function Close-TurnProc {
   }
   $script:reasonNode = $null
   $script:toolGroup = $null
+  $script:stepNode = $null
   Update-TurnProc $t
   $script:turnProc = $null
   $script:stepBox = $null
@@ -1553,7 +1836,13 @@ function Update-ToolGroup($g) {
   # 还在跑的那件由右边的红字和底部胶囊报，这串数字才不会每 100ms 自己往上跳
   $done = $g.Count - $g.Running
   $total = $(if ($done -gt 0) { ' · 共 ' + (Format-ToolSecs $g.TotalMs) } else { '' })
-  $g.Head.Text = "$arrow  $($g.Count) 次工具调用$total"
+  # 一步里只调了一次工具时，不套「1 次工具调用 · 共 0ms」这层壳：合计没有信息量，
+  # 直接把工具名当标题（展开后就是它的参数），省掉一层没有内容的聚合卡。
+  if ($g.Count -eq 1 -and $g.Order.Count -eq 1) {
+    $g.Head.Text = "$arrow  $($g.Order[0])"
+  } else {
+    $g.Head.Text = "$arrow  $($g.Count) 次工具调用$total"
+  }
   # 右侧：有调用在跑就先亮红字「运行中... · 」，后面才是各工具计数
   if ($g.Running -gt 0) {
     $g.Run.Text = '运行中... · '
@@ -1618,7 +1907,7 @@ function New-ToolGroup {
   $sp.Children.Add($items) | Out-Null
 
   $outer.Child = $sp
-  (Get-ProcPanel).Children.Add($outer) | Out-Null
+  (Get-ProcPanel 'tool').Children.Add($outer) | Out-Null
 
   $g = New-Object PSObject -Property @{
     Head = $title; Sum = $sum; Run = $run; Items = $items; Border = $outer
@@ -1656,6 +1945,7 @@ function Reset-ToolGroup {
   Close-ToolGroup
   $script:toolGroup = $null
   $script:stepBox = $null
+  $script:stepNode = $null
 }
 
 # ---------------------------------------------------------------- 底部实时状态胶囊
@@ -1703,15 +1993,16 @@ function Update-BottomPill {
 
 function Add-ToolLine([string]$name, [string]$summary, [string]$argsText = '') {
   $g = Get-ToolGroup
-  # 一组管一整轮：中间插进来的思考块会把组挤到上面，这里把它挪回末尾，
-  # 于是多步调用始终显示成「思考 1 / 2 / 3 … + 一块工具汇总」，不会一步一块往下平铺
-  $panel = $g.Border.Parent
-  if ($panel -and $panel.Children.IndexOf($g.Border) -ne ($panel.Children.Count - 1)) {
-    $panel.Children.Remove($g.Border) | Out-Null
-    $panel.Children.Add($g.Border) | Out-Null
-  }
+  # 同一步里的调用都落进这张步骤卡的工具区；块本身的位置不再靠挪动，
+  # 区域容器已经固定成「思考 → 工具 → 结论」的顺序
   $st = Add-ToolRow $name $summary $argsText $g.Items
   $g.Count++
+  # 步骤卡头：这一步调了几次
+  $sn = $script:stepNode
+  if ($sn) {
+    $sn.Tools = [int]$sn.Tools + 1
+    Update-StepHead $sn
+  }
   # 轮头汇总：这一轮一共调了几次、各调了几次（耗时等结果回来后补）
   $tp = $script:turnProc
   if ($tp -and -not $tp.Done) {
@@ -1783,20 +2074,12 @@ function Format-ReasonSecs([double]$secs) {
   return (Format-Elapsed $secs)
 }
 
-# 这条思考的完整文本：实时是边流边写进 TextBlock 的；
-# 历史回放先挂在 Pending 上（不写 TextBlock，见 Render-ReplayEvent），点开时才落进去
+# 这条思考的完整文本（实时和回放都直接在 TextBlock 里，没有挂起态）
+# 超长思考的 Body 里只放了前一段，复制/日志要用 FullText 才不丢字
 function Get-ReasonFullText($n) {
   if (-not $n) { return '' }
-  $t = [string]$n.Body.Text
-  if (-not $t -and $n.Pending) { return [string]$n.Pending }
-  return $t
-}
-
-# 把挂起的正文真正写进 TextBlock（回放里第一次展开时才调）：之后摘要/复制都走 Body.Text
-function Set-ReasoningText($n) {
-  if (-not $n -or -not $n.Pending) { return }
-  $n.Body.Text = [string]$n.Pending
-  $n.Pending = $null
+  if ($n.PSObject.Properties['FullText'] -and $n.FullText) { return [string]$n.FullText }
+  return [string]$n.Body.Text
 }
 
 # 这一段思考的纯文本（整轮只有一张条，只取当前这一段）
@@ -1830,6 +2113,10 @@ function Update-ReasoningHeader($n) {
   $n.Sum.Text = $s
   $n.Sum.Visibility = $(if ($n.Open) { 'Collapsed' } else { 'Visible' })
   $n.Body.Visibility = $(if ($n.Open) { 'Visible' } else { 'Collapsed' })
+  # 「继续展开全文」那一行跟着正文一起收放：收起态只留标题和摘要
+  if ($n.PSObject.Properties['ChainHost'] -and $n.ChainHost) {
+    $n.ChainHost.Visibility = $(if ($n.Open) { 'Visible' } else { 'Collapsed' })
+  }
 }
 
 # 读秒时每 0.25s 都要刷一次头部：只动时间那一格，
@@ -1840,11 +2127,57 @@ function Update-ReasoningTime($n) {
   $n.Secs = ((Get-Date) - $n.T0).TotalSeconds
 }
 
+# 思考条正文很长时（历史回放里几万字也常见）：收起时反正不占地方，所以从一开始就整段写好，
+# 点「展开」当场看到全文，不会再有一次「内容才一段段长出来」的加载动作。
+# 只有长到雷达不动的（两万字以上）才分两截，先在正文里放前一段 + 一行「展开全文」。
+$script:reasonLongChars = 20000
+function Add-ReasonChainMore($n) {
+  $b = New-Object System.Windows.Controls.Button
+  $b.Content = '… 继续展开全文'
+  $b.HorizontalAlignment = 'Left'
+  $b.Height = 26
+  $b.Padding = '12,0'
+  $b.Margin = '0,4,0,0'
+  $b.FontSize = 11
+  $b.Cursor = 'Hand'
+  $b.Focusable = $false
+  $b.Background = (Brush '#12141A')
+  $b.Foreground = (Brush '#9BA3B4')
+  $b.BorderBrush = (Brush '#1FFFFFFF')
+  $b.BorderThickness = '1'
+  $b.Template = (New-FlatTemplate)
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($b, 'ReasonMore')
+  # PS 5.1 里闭包拿不到局部变量，靠 Tag 把要写的东西递过去
+  $b.Tag = $n
+  $b.Add_Click({
+    param($s, $e)
+    $node = $s.Tag
+    $s.Visibility = 'Collapsed'
+    $node.Body.Text = [string]$node.FullText
+    $node.RestShown = $true
+  })
+  $n.ChainHost.Children.Add($b) | Out-Null
+}
+
+function Set-ReasoningFull($n, [string]$text, [switch]$Append) {
+  if (-not $n) { return }
+  $full = $text
+  # 同一轮里第二段、第三段思考接着往后写（段间空一行），不是覆盖前面那段
+  if ($Append -and $n.FullText) { $full = [string]$n.FullText + "`r`n`r`n" + $text }
+  $n.FullText = $full
+  if ($full.Length -gt $script:reasonLongChars) {
+    $n.Body.Text = $full.Substring(0, $script:reasonLongChars)
+    $n.RestShown = $false
+    if ($n.ChainHost.Children.Count -eq 0) { Add-ReasonChainMore $n }
+  } else {
+    $n.Body.Text = $full
+    $n.RestShown = $true
+  }
+}
+
 function Toggle-Reasoning($n) {
   if (-not $n) { return }
   $n.Open = -not $n.Open
-  # 展开：回放里挂起的正文到这里才写进 TextBlock（一开始就不渲染，省掉一屏思考的长文本排版）
-  if ($n.Open) { Set-ReasoningText $n }
   Update-ReasoningHeader $n
 }
 
@@ -1854,14 +2187,14 @@ function Add-ReasoningBlock {
   $tp = Get-TurnProc
   if ($tp.Thought) {
     $n = $tp.Thought
-    # 上一段还是挂起态（回放里没渲染）就先落下去：接着写要按 Body.Text 的长度算段起点
-    Set-ReasoningText $n
     $n.Done = $false
     $n.Open = $false
     $n.T0 = (Get-Date)
     $n.Secs = 0
     if ($n.Body.Text) { $n.Body.Text = $n.Body.Text + "`r`n`r`n" }
-    $n.SegStart = $n.Body.Text.Length
+    # 段起点按整段全文长度算（超长思考的 Body 只放了前一段，用它的长度会把段起点算偏）；
+    # 实时流没维护 FullText，那时 Body.Text 就是全文，直接用它的长度
+    $n.SegStart = $(if ($n.FullText) { ([string]$n.FullText).Length + 4 } else { $n.Body.Text.Length })
     if ($n.Caret) { $n.Caret.Visibility = 'Visible' }
     $script:reasonNode = $n
     Update-ReasoningHeader $n
@@ -1920,7 +2253,11 @@ function Add-ReasoningBlock {
   $body.LineHeight = 19
   $body.LineStackingStrategy = 'BlockLineHeight'
   $body.Margin = '0,5,0,0'
+  # 正文太长时「继续展开全文」按钮挂在这个容器末尾（写在正文下面一行）
+  $chainHost = New-Object System.Windows.Controls.StackPanel
+  $chainHost.Margin = '0,0,0,0'
   $stack.Children.Add($body) | Out-Null
+  $stack.Children.Add($chainHost) | Out-Null
 
   # 流式时正文末尾那个一闪一闪的小光标（Kite 的思考就是边想边流出来的样子）
   $caret = New-Object System.Windows.Controls.Border
@@ -1943,15 +2280,19 @@ function Add-ReasoningBlock {
   $outer.Child = $stack
   $box = @{ text = '' }
   Set-CopyMenu $outer $box
-  (Get-ProcPanel).Children.Add($outer) | Out-Null
+  (Get-ProcPanel 'reason').Children.Add($outer) | Out-Null
 
   # 默认收起：标题一行「思考」+ 一行摘要，点开才铺全文
   $node = New-Object PSObject -Property @{
     Head = $head; Title = $title; Time = $time; Sum = $sum; Body = $body; Caret = $caret
+    ChainHost = $chainHost
     Border = $outer; Box = $box
+    # FullText / RestShown：打开历史时整段思考已经写进 Body（超过 reasonLongChars 才先放一段）
     T0 = (Get-Date); Open = $false; Done = $false; Secs = 0; SegStart = 0
-    # 回放时正文先挂这儿，展开（或"复制整段对话"）时才写进 Body
-    Pending = $null
+    FullText = ''; RestShown = $true
+    # 这段思考属于哪张步骤卡：收尾时按 Owner 累加耗时，不按「当前」步骤——
+    # 思考常常在下一步的 step 事件之后才被 onText/onToolStart 关掉，按当前算会串到隔壁
+    Owner = $script:stepNode
   }
   # 节点挂在标题自己的 Tag 上：PS 5.1 下这个事件里的 GetNewClosure 拿不到 $node，点了会抛异常
   $head.Tag = $node
@@ -2023,11 +2364,29 @@ function Complete-Reasoning {
   # 历史回放里已经给过耗时（$ev.ms）就别用「刚刚过去 0 秒」盖掉它
   if ($n.Secs -lt 0.1) { $n.Secs = ((Get-Date) - $n.T0).TotalSeconds }
   $n.Open = $false
-  # 复制菜单 / 复制日志要拿到完整正文：回放里正文可能还挂在 Pending 上（没渲染）
+  # 正文补全：实时流没维护 FullText（Body.Text 一直在累积，它就是全文）；
+  # 回放里超长思考只把前一段写进了 Body，那种情况 FullText 比 Body 长，不能被覆盖掉
+  if ($n.PSObject.Properties['FullText'] -and ([string]$n.FullText).Length -lt ([string]$n.Body.Text).Length) {
+    $n.FullText = [string]$n.Body.Text
+  }
+  # 复制菜单 / 复制日志要拿到完整正文
   $full = Get-ReasonFullText $n
   $n.Box.text = $full
   Append-CopyLog ('[思考] ' + $full)
   Update-ReasoningHeader $n
+  # 步骤卡头：把这一段的思考时长累进去（一步里可能想两回），还没结论时摘要先取思考开头
+  $sn = $n.Owner
+  if ($sn) {
+    $sn.ReasonSecs = [double]$sn.ReasonSecs + [double]$n.Secs
+    if (-not $sn.Snip) {
+      $one = (($full -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -First 1)
+      if ($null -ne $one) {
+        $one = ($one -replace '^\s*[#>\-*]+\s*', '').Trim()
+        if ($one) { $sn.Snip = $one }
+      }
+    }
+    Update-StepHead $sn
+  }
   # 只解绑"当前"，节点本身还在界面上（点标题仍能展开），toggle 用的是节点 Tag 上的那一份
   $script:reasonNode = $null
 }
@@ -2315,12 +2674,6 @@ function New-TableCard($rows, [int]$headerRows) {
 
   $outer.Child = $grid
   return $outer
-}
-
-# 超长文本先截一段看，剩下的用一行提示带过（思考过程回放用）
-function Clip-LongText([string]$t, [int]$max) {
-  if ($t.Length -le $max) { return $t }
-  return $t.Substring(0, $max) + "`n…（已折叠 $($t.Length - $max) 字）"
 }
 
 # 历史回放时，单条超长正文先画前面一段，剩下的点一下再画
@@ -3000,7 +3353,17 @@ function Render-ReplayEvent($ev) {
   # 回放的卡没有墙钟耗时：拿事件自带的时间戳记下这一轮的头尾
   $at = [double]$ev.at
   $cur = $script:turnProc
-  if ($cur -and -not $cur.Done -and $at -gt 0) { $cur.AtLast = $at }
+  if ($cur -and -not $cur.Done -and $at -gt 0) {
+    # 时间戳也要喂给已经定局的历史轮：它的耗时和轮头时钟都按首尾事件算
+    $cur.AtLast = $at
+    if ($cur.At0 -le 0) { $cur.At0 = $at }
+    Update-TurnProc $cur
+  }
+  # 回放里的一轮 = turn/start 之后、turn/end 之前的那一段，已经从库里读回来了，
+  # 所以它当场就是「已完成」：历史轮的轮卡和步骤卡都只报已完成 / 最终结论，
+  # 不再出现「思考中…」「正在做…」这种进行中的说法。
+  # 真的还在跑的那一轮由回放收尾处补的活卡（Live=$true）负责显示，两者不会混。
+  # 提问那一条不建卡：轮卡得排在你的消息下面，不能抢在它之前。
   if ($ev.kind -eq 'user/message') {
     # 一轮从用户消息开始：上一轮的过程卡和工具块在这里收掉，回放也是一轮一张
     Close-TurnProc
@@ -3009,21 +3372,20 @@ function Render-ReplayEvent($ev) {
     $script:replayHasUser = $true
   }
   elseif ($ev.kind -eq 'assistant/message') {
-    # 历史里没有 step/start 事件：每条 assistant/message 就是一步的产出，在这里开新块
-    # 整轮都打上回放标记：Close-TurnProc 据此把过程默认收起（只有思考/正文、没有工具的轮次也算）
-    $tp = Get-TurnProc
-    $tp.Replay = $true
-    # 从建成起就收起：过程区不参与排版，也不会「先展开一屏再收起来」
-    Set-TurnProcCollapsed $tp
+    # 历史里没有 step/start 事件：每条 assistant/message 就是一步的产出，在这里开一张新的步骤卡。
+    # 轮卡在这一刻才建（排在提问下面），建出来先按「历史轮」标一遍再往里画，
+    # 这样轮头从第一帧起就是「已完成」，不会先闪一下「思考中…」。
+    Set-TurnHistorical (Get-TurnProc)
     New-StepBlock | Out-Null
-    # 历史里的思考过程也要能看，默认收起成一行摘要；超长的先只放前一段
+    # 历史里的思考过程也要能看，默认收起成一行摘要。
+    # 正文在这里就整段写进 TextBlock（不再挂起到「点开那一刻」才写）：
+    # 打开旧会话是一次性的，之后点展开永远立刻看到全文，没有内容往外长的加载过程。
     if ($ev.reasoning) {
       $tp = $script:turnProc
       if ($tp.At0 -le 0) { $tp.At0 = $at }
       $rn = Add-ReasoningBlock
-      # 正文先挂着不渲染（Pending）：收起时只要一行摘要，点开这一条时才写进 TextBlock。
-      # 几十段思考一次性铺满整棵树，切会话那一下会明显卡一下，而且马上又要收起来。
-      $rn.Pending = (Clip-LongText ([string]$ev.reasoning) $script:reasonFoldChars)
+      # Add-ReasoningBlock 复用整轮的同一张思考条：同轮后续几段按追加写，段前那行空行由它自己加
+      Set-ReasoningFull $rn ([string]$ev.reasoning) -Append
       $rn.Secs = [math]::Round(([double]$ev.ms) / 1000.0, 1)
       Complete-Reasoning
     }
@@ -3038,14 +3400,15 @@ function Render-ReplayEvent($ev) {
       } else {
         Render-Markdown $script:assistantBody $txt
       }
+      # 卡头摘要取这条消息的第一行（回放里收起态就看这一行）
+      Set-StepConclusion $script:stepNode $txt
       $script:currentAssistant = $null
     }
   }
   elseif ($ev.kind -eq 'tool/call') {
-    Get-TurnProc | Out-Null
+    # 有的轮次只有工具、没有正文：轮卡也要在这里才建（同样先标成历史轮）
+    Set-TurnHistorical (Get-TurnProc)
     $tp = $script:turnProc
-    $tp.Replay = $true
-    Set-TurnProcCollapsed $tp
     if ($tp.At0 -le 0) { $tp.At0 = $at }
     # 历史里只存了入参和结果：摘要取自关键字段，展开区放完整参数
     $sum = ''
@@ -3767,6 +4130,14 @@ function Continue-ReplayRender {
   Close-ToolGroup
   $script:currentAssistant = $null
   $script:replayRenderJob = $null
+  # 历史画完了：如果这个会话此刻真的还有一轮在跑，末尾补一张活卡（呼吸灯 + 阶段词 + 计时）。
+  # 历史里的轮次都已经定格「已完成」，进行中的状态只由这张活卡来报，两者不会混在一起。
+  # 这一轮的事件可能先于历史到达（那时 $script:turnProc 已经是活卡），那就不再补第二张。
+  if ($script:busy -and (-not $script:turnProc -or -not $script:turnProc.Live)) {
+    New-TurnProc | Out-Null
+    Set-Busy $true
+    $Scroller.ScrollToEnd()
+  }
   if ($job.mode -eq 'before') {
     $script:historyBefore = [int]$job.from
   } else {
@@ -3881,6 +4252,8 @@ function Clear-Transcript {
   $script:toolRows = @{}
   $script:toolGroup = $null
   $script:turnProc = $null
+  $script:stepBox = $null
+  $script:stepNode = $null
   $script:assistantBox = $null
   $script:copyLog.Clear() | Out-Null
   $script:copyBoxOf = @{}
@@ -4934,7 +5307,7 @@ function Handle-Event([string]$line) {
     }
     'step' {
       $tp = Get-TurnProc
-      # 每一步开一块：思考、工具、结论按步拢在一起
+      # 每一步开一张卡：这一步的思考、工具调用、结论都拢在这一张里，卡头能整块收放
       New-StepBlock | Out-Null
       Update-TurnProc $tp
     }
@@ -4960,13 +5333,19 @@ function Handle-Event([string]$line) {
     }
     'assistant-end' {
       Complete-Reasoning
+      Get-TurnProc | Out-Null
+      # host 只在每步开始时发 step：一步里先调工具再出结论时，结论要落回这一步的卡里，
+      # 不能因为「上一步的 assistant-end」就新开一张卡，所以这里只沿用当前步骤卡
+      if (-not $script:stepNode) { New-StepBlock | Out-Null }
       if ($e.text -and ([string]$e.text).Trim()) {
         # 真的出了一段正文才断开工具组；只有工具调用、没有文字的一步保持同一块继续累加
         Close-ToolGroup
         if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
         Render-Markdown $script:assistantBody ([string]$e.text)
+        # 这一步的结论：卡头换成它的第一行（收起态一眼看结论）
+        Set-StepConclusion $script:stepNode ([string]$e.text)
       } elseif ($script:currentAssistant -and $script:assistantBody) {
-        # 只有工具调用、没有文字：把这个空块删掉（正文现在挂在当前步骤里，父级不一定是聊天区）
+        # 只有工具调用、没有文字：把这个空块删掉（正文现在挂在当前步骤卡里，父级是结论区）
         $container = $script:assistantBody.Parent
         if ($container -and $container.Parent) { $container.Parent.Children.Remove($container) | Out-Null }
       }

@@ -25,7 +25,35 @@ export const MODES = ['read-only', 'guarded', 'full'] as const
 export const PERF_MODES = ['off', 'basic', 'full'] as const
 export type PerfMode = (typeof PERF_MODES)[number]
 
+/**
+ * 一个供应商（OpenAI 兼容的一家服务）：端点 + Key + 默认模型。
+ *
+ * 为什么要一份列表：同一个人手上常常有好几个端点（公司网关、本地 Ollama、
+ * 官方 API），来回改一个 baseURL 就得重填 Key，还容易把上一个 Key 弄丢。
+ * 列表里每项自带 Key，切换只是换「当前用哪个」，互不覆盖。
+ * 名字是给人认的（界面上点它），只作标识不当主键——允许重名，靠 id 区分。
+ */
+export interface Provider {
+  /** 稳定标识：界面选中项靠它，改名字也不会丢选中 */
+  id: string
+  /** 显示名（空＝用端点兜底显示） */
+  name: string
+  baseURL: string
+  apiKey: string
+  model: string
+}
+
 export interface Settings {
+  /** 供应商列表；旧版本只有一个 baseURL/apiKey，读到时会在 providersOf 里折成一项 */
+  providers?: Provider[]
+  /** 当前用哪个供应商（存 id）；找不到就回落到列表第一项 */
+  activeProvider?: string
+  /**
+   * 以下三个是「当前生效值」的快照，保留是为了两件事：
+   * 1) 兼容只认识 baseURL/apiKey/model 的旧版本与手写 config.json；
+   * 2) 环境变量/命令行覆盖时，界面仍要知道原本存的是什么。
+   * 由 saveSettings 在写入时同步成当前供应商的值，不要让它们跟列表不一致。
+   */
   baseURL?: string
   apiKey?: string
   model?: string
@@ -91,6 +119,16 @@ function coerce(raw: unknown): Settings {
     const v = obj[k]
     if (typeof v === 'string' && v.trim()) out[k] = v.trim()
   }
+  if (Array.isArray(obj.providers)) {
+    const list: Provider[] = []
+    for (const raw of obj.providers) {
+      const p = coerceProvider(raw)
+      // 同 id 重复（手改出来的）只留第一个，否则界面上点哪一行都不确定
+      if (p && !list.some((x) => x.id === p.id)) list.push(p)
+    }
+    if (list.length) out.providers = list
+  }
+  if (typeof obj.activeProvider === 'string' && obj.activeProvider.trim()) out.activeProvider = obj.activeProvider.trim()
   if (typeof obj.vision === 'boolean') out.vision = obj.vision
   if (typeof obj.perf === 'string' && (PERF_MODES as readonly string[]).includes(obj.perf)) {
     out.perf = obj.perf as PerfMode
@@ -109,6 +147,79 @@ function coerce(raw: unknown): Settings {
 
 /** 手改过的 JSON 常常带 BOM，剥掉再解析 */
 const stripBom = (s: string): string => s.replace(/^\uFEFF/, '')
+
+/** 单条供应商的净化：缺端点的直接丢掉（用不了还不如没有） */
+function coerceProvider(raw: unknown): Provider | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const obj = raw as Record<string, unknown>
+  const str = (k: string): string => (typeof obj[k] === 'string' ? (obj[k] as string).trim() : '')
+  const baseURL = str('baseURL')
+  if (!baseURL) return undefined
+  const id = str('id') || `p-${Math.random().toString(36).slice(2, 10)}`
+  const p: Provider = { id, name: str('name'), baseURL, apiKey: str('apiKey'), model: str('model') }
+  return p
+}
+
+/**
+ * 把设置折成「一份供应商列表 + 当前选中项」。
+ *
+ * 旧版 config.json 只有顶层 baseURL/apiKey/model，这里就把它当成唯一的一家供应商：
+ * 用户不需要为了升级重填一遍 Key，切到列表形态也不会丢配置。
+ * 顶层那三个字段是「当前生效值」的快照，读的时候反过来补进当前这家供应商——
+ * 手改成 `{providers:[{...}], baseURL:"..."}` 这种混搭也能自洽。
+ */
+export function providersOf(s: Settings): { list: Provider[]; active: string } {
+  const list: Provider[] = (s.providers ?? []).map((p) => ({ ...p }))
+  if (!list.length) {
+    if (!s.baseURL) return { list: [], active: '' }
+    list.push({ id: 'p-default', name: '', baseURL: s.baseURL, apiKey: s.apiKey ?? '', model: s.model ?? '' })
+    return { list, active: list[0]!.id }
+  }
+  const active = list.some((p) => p.id === s.activeProvider) ? s.activeProvider! : list[0]!.id
+  // 顶层快照（baseURL/apiKey/model）只回填给「端点对得上的那一家」：
+  // 单独的 /model、改 Key 这类只写顶层字段的调用，据此落到它该落的那家身上。
+  // 反过来，切 activeProvider 时顶层快照属于旧的那家，绝不能拿去覆盖新选中的这家。
+  const snap = s.baseURL ? list.find((p) => p.baseURL === s.baseURL) : undefined
+  if (snap) {
+    if (s.apiKey) snap.apiKey = s.apiKey
+    if (s.model) snap.model = s.model
+  }
+  return { list, active }
+}
+
+/** 当前生效的供应商；一个都没配时返回 undefined（调用方自己兜默认端点） */
+export function activeProviderOf(s: Settings): Provider | undefined {
+  const { list, active } = providersOf(s)
+  return list.find((p) => p.id === active) ?? list[0]
+}
+
+/** 界面上的显示名：没起名字就用端点 */
+export function providerLabel(p: Provider): string {
+  return p.name || p.baseURL
+}
+
+/**
+ * 保存前的清洗：去空白、丢掉没端点的项、补 id、去重。
+ * 放在这里而不是界面里，是因为手写 config.json 也有可能踩到这些，读取路径要同样干净。
+ */
+export function normalizeProviders(list: Provider[]): Provider[] {
+  const out: Provider[] = []
+  for (const raw of list) {
+    const baseURL = raw.baseURL?.trim() ?? ''
+    if (!baseURL) continue
+    const id = raw.id?.trim() || `p-${Math.random().toString(36).slice(2, 10)}`
+    if (out.some((p) => p.id === id)) continue
+    const p: Provider = {
+      id,
+      name: raw.name?.trim() ?? '',
+      baseURL,
+      apiKey: raw.apiKey?.trim() ?? '',
+      model: raw.model?.trim() ?? '',
+    }
+    out.push(p)
+  }
+  return out
+}
 
 export async function loadSettings(dataDir: string): Promise<Settings> {
   try {
@@ -130,6 +241,9 @@ export function loadSettingsSync(dataDir: string): Settings {
 /** 合并写入：只覆盖传进来的字段，空字符串视为"不动那个字段"（界面上留空＝保持原值） */
 export async function saveSettings(dataDir: string, patch: Settings): Promise<Settings> {
   const merged: Settings = { ...(await loadSettings(dataDir)) }
+  // 供应商列表是"整份替换"的语义：界面里删掉一家就得真删掉，
+  // 逐项合并做不到「删除」，也会让 id 复用时的覆盖关系变得说不清。
+  if (patch.providers !== undefined) merged.providers = normalizeProviders(patch.providers)
   if (patch.baseURL?.trim()) merged.baseURL = patch.baseURL.trim()
   if (patch.apiKey?.trim()) merged.apiKey = patch.apiKey.trim()
   if (patch.model?.trim()) merged.model = patch.model.trim()
@@ -151,6 +265,30 @@ export async function saveSettings(dataDir: string, patch: Settings): Promise<Se
   for (const k of ['firstByteSecs', 'idleSecs', 'requestSecs'] as const) {
     const v = patch[k]
     if (typeof v === 'number' && Number.isFinite(v)) merged[k] = v
+  }
+  // 当前供应商：只接列表里存在的 id（界面传错了不至于让下次启动没供应商可用）
+  if (patch.activeProvider !== undefined) {
+    const { list } = providersOf(merged)
+    const want = patch.activeProvider.trim()
+    if (want && list.some((p) => p.id === want)) merged.activeProvider = want
+    else if (!want) delete merged.activeProvider
+  }
+  // 收口：顶层快照（baseURL/apiKey/model）与当前供应商必须一致。
+  // 旧版本、手写 config.json 和 CLI 只认这三个字段，列表改了却不更新它们，
+  // 就会出现「界面显示 A、实际请求打 B」的鬼故事；反过来 /model 这种单字段
+  // 改动也会经 providersOf 落回当前供应商身上。
+  {
+    const { list, active } = providersOf(merged)
+    if (list.length) {
+      const cur = list.find((p) => p.id === active) ?? list[0]!
+      merged.providers = list
+      merged.activeProvider = cur.id
+      merged.baseURL = cur.baseURL
+      if (cur.apiKey) merged.apiKey = cur.apiKey
+      else delete merged.apiKey
+      if (cur.model) merged.model = cur.model
+      else delete merged.model
+    }
   }
   await mkdir(dataDir, { recursive: true })
   await writeFile(settingsPath(dataDir), `${JSON.stringify(merged, null, 2)}\n`, 'utf8')

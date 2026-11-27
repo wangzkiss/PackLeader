@@ -23,8 +23,17 @@ import { Agent, type Renderer } from './core/loop.ts'
 import { Policy } from './core/policy.ts'
 import { Session } from './core/session.ts'
 import { ingestFiles } from './core/attach.ts'
-import { PERF_MODES, llmTimeoutsOf, loadSettings, maskKey, saveSettings, visionFrom } from './core/settings.ts'
-import type { PerfMode } from './core/settings.ts'
+import {
+  PERF_MODES,
+  llmTimeoutsOf,
+  loadSettings,
+  maskKey,
+  normalizeProviders,
+  providersOf,
+  saveSettings,
+  visionFrom,
+} from './core/settings.ts'
+import type { PerfMode, Provider } from './core/settings.ts'
 import { PerfLog } from './core/perf.ts'
 import { registerSecret } from './core/redact.ts'
 import type { AskRequest } from './core/tools.ts'
@@ -222,10 +231,21 @@ async function main(): Promise<void> {
   perf.point('start', { mode: perfMode, pid: process.pid, node: process.version })
   // 没有 key 也要开窗口：第一次用的人是先在界面上填端点/Key 的。
   // 真正拦在 runTask 里（见下），而不是启动时直接死掉。
+  //
+  // 供应商列表：命令行/环境变量没给 Key 时（＝没显式配置过）就用列表里「当前选中」的那家。
+  // 一家都没配（老版本只有顶层 baseURL/apiKey）时 providersOf 会把它折成唯一一家，行为不变。
+  const { list: savedProviders, active: savedActive } = providersOf(saved)
+  const curProvider = savedProviders.find((p) => p.id === savedActive)
   if (!opts.apiKey) {
-    if (saved.apiKey) opts.apiKey = saved.apiKey
-    if (saved.baseURL) opts.baseURL = saved.baseURL
-    if (saved.model) opts.model = saved.model
+    if (curProvider) {
+      opts.apiKey = curProvider.apiKey
+      if (curProvider.baseURL) opts.baseURL = curProvider.baseURL
+      if (curProvider.model) opts.model = curProvider.model
+    } else {
+      if (saved.apiKey) opts.apiKey = saved.apiKey
+      if (saved.baseURL) opts.baseURL = saved.baseURL
+      if (saved.model) opts.model = saved.model
+    }
     if (saved.verify && !opts.noVerify) opts.verify = saved.verify
   }
   // 看图：命令行/环境变量没显式指定就听 config.json 的，那里也没有就按默认（开）。
@@ -517,6 +537,42 @@ async function main(): Promise<void> {
     return open
   }
 
+  /**
+   * 供应商列表的运行时视图：界面读的是它，切供应商时同步更新。
+   * 启动值来自 config.json（老配置会被 providersOf 折成唯一一家）。
+   */
+  let providerList: Provider[] = savedProviders
+  let activeId = savedActive
+
+  /**
+   * 把一家供应商设为「当前生效」：客户端 cfg 与 opts 一起改。
+   *
+   * 为什么不是给每轮传参：llm 是共享对象，中途切换要立刻影响下一轮；
+   * 而正在跑的那一轮已经发出的请求不受影响（这符合直觉：改设置不该动已在飞的回答）。
+   */
+  const applyProvider = (p: Provider | undefined): void => {
+    // 列表被清空时保留原来那套（老配置的顶层字段仍可用），不要把人打到没端点的状态
+    if (!p) return
+    activeId = p.id
+    opts.baseURL = p.baseURL
+    opts.apiKey = p.apiKey
+    opts.model = p.model
+    llm.cfg.baseURL = p.baseURL
+    llm.cfg.apiKey = p.apiKey
+    llm.cfg.model = p.model
+    registerSecret(p.apiKey)
+  }
+
+  /** 给界面看的供应商：Key 只出门牌号，不让整个 key 走 IPC 落到前端内存里 */
+  const publicProvider = (p: Provider): Record<string, unknown> => ({
+    id: p.id,
+    name: p.name,
+    baseURL: p.baseURL,
+    model: p.model,
+    apiKeyMasked: maskKey(p.apiKey),
+    hasKey: Boolean(p.apiKey),
+  })
+
   const state = (): Record<string, unknown> => ({
     type: 'ready',
     session: session.id,
@@ -530,6 +586,9 @@ async function main(): Promise<void> {
     maxSteps: opts.maxSteps,
     verify: opts.verify,
     vision: opts.vision,
+    // 供应商列表：界面上的下拉/列表按它画；Key 只给门牌号
+    providers: providerList.map(publicProvider),
+    activeProvider: activeId,
     historyCount: session.events.length,
     questions: questionPositions(),
     // 工具调用日志目录：界面上「设置」里直接显示出来，方便按日志改
@@ -770,8 +829,11 @@ async function main(): Promise<void> {
         break
       }
       case 'list-models': {
-        const baseURL = String(cmd.baseURL ?? '').trim() || opts.baseURL
-        const apiKey = String(cmd.apiKey ?? '').trim() || opts.apiKey
+        // providerId 给了就按「那一家」的端点/Key 拉（设置面板里可能正在看别家，还没保存）
+        const wantProvider = String(cmd.providerId ?? '').trim()
+        const fromList = wantProvider ? providerList.find((p) => p.id === wantProvider) : undefined
+        const baseURL = String(cmd.baseURL ?? '').trim() || fromList?.baseURL || opts.baseURL
+        const apiKey = String(cmd.apiKey ?? '').trim() || fromList?.apiKey || opts.apiKey
         if (!apiKey) {
           send({ type: 'error', message: '先填 API Key，再拉取模型列表', needsSetup: true })
           break
@@ -867,19 +929,9 @@ async function main(): Promise<void> {
         // 设置文件可能在进程运行期间被手动编辑。打开设置时重新读取磁盘，
         // 同步更新当前客户端和 agent，让修改无需重启或再点一次保存就生效。
         const saved = await loadSettings(opts.dataDir)
-        if (saved.baseURL) {
-          opts.baseURL = saved.baseURL
-          llm.cfg.baseURL = saved.baseURL
-        }
-        if (saved.apiKey) {
-          opts.apiKey = saved.apiKey
-          llm.cfg.apiKey = saved.apiKey
-          registerSecret(saved.apiKey)
-        }
-        if (saved.model) {
-          opts.model = saved.model
-          llm.cfg.model = saved.model
-        }
+        const { list: providers, active } = providersOf(saved)
+        providerList = providers
+        applyProvider(providers.find((p) => p.id === active))
         opts.verify = saved.verify ?? ''
         opts.vision = visionFrom(saved)
         // 超时：文件里删掉了就回到内置默认，不能让上一次调大的值一直粘着
@@ -888,6 +940,8 @@ async function main(): Promise<void> {
         llm.cfg.idleMs = opts.llmTimeouts.idleMs ?? LLM_DEFAULT_TIMEOUTS.idleMs
         llm.cfg.timeoutMs = opts.llmTimeouts.timeoutMs ?? LLM_DEFAULT_TIMEOUTS.timeoutMs
         agent = await buildAgent()
+        // 列表里每家的 Key 都登记：切来切去时旧 key 仍可能出现在历史文本里
+        for (const p of providers) registerSecret(p.apiKey)
         send({
           type: 'config-loaded',
           baseURL: opts.baseURL,
@@ -897,6 +951,8 @@ async function main(): Promise<void> {
           verify: opts.verify,
           vision: opts.vision,
           logsDir: audit.logsDir,
+          providers: providers.map(publicProvider),
+          activeProvider: active,
           // 把客户端当前实际生效的毫秒超时折成秒报回去：界面/测试据此确认 config.json 里的值已经落地
           firstByteSecs: Math.round((llm.cfg.firstByteMs ?? LLM_DEFAULT_TIMEOUTS.firstByteMs) / 1000),
           idleSecs: Math.round((llm.cfg.idleMs ?? LLM_DEFAULT_TIMEOUTS.idleMs) / 1000),
@@ -905,42 +961,67 @@ async function main(): Promise<void> {
         break
       }
       case 'config': {
-        // 界面上填的端点 / Key：立刻生效（不用重启），并落盘给下次启动用
-        const baseURL = String(cmd.baseURL ?? '').trim()
-        const apiKey = String(cmd.apiKey ?? '').trim()
-        const model = String(cmd.model ?? '').trim()
+        // 界面上填的端点 / Key：立刻生效（不用重启），并落盘给下次启动用。
+        //
+        // 供应商列表（providers）是「整份」提交的：界面里增删改完点保存一次发过来。
+        // 列表里每项带自己的 Key，所以每条都要登记脱敏；只有「当前」那条会真正生效。
+        const hasProviders = Array.isArray(cmd.providers)
+        const formUrl = String(cmd.baseURL ?? '').trim()
+        const formKey = String(cmd.apiKey ?? '').trim()
+        const formModel = String(cmd.model ?? '').trim()
+        const wantId = String(cmd.activeProvider ?? '').trim()
         // verify 允许被"清空成自动识别"，所以单独判断有没有传这个字段
         const hasVerify = Object.prototype.hasOwnProperty.call(cmd, 'verify')
         const verify = String(cmd.verify ?? '').trim()
         const hasVision = Object.prototype.hasOwnProperty.call(cmd, 'vision')
-        if (baseURL) {
-          opts.baseURL = baseURL
-          llm.cfg.baseURL = baseURL
+
+        // 界面传来的列表先清洗（去空白、丢空端点、补 id）
+        let incoming: Provider[] = hasProviders ? normalizeProviders(cmd.providers as Provider[]) : providerList
+        let picked = incoming.find((p) => p.id === wantId) ?? incoming[0]
+        // 表单里同时带着当前这家的三个字段（用户可能只改了其中一个）：
+        // 以表单值为准回写到被选中的那家，保存后列表和表单不会互相打脸。
+        if (picked && hasProviders) {
+          if (formUrl) picked.baseURL = formUrl
+          if (formKey) picked.apiKey = formKey
+          if (formModel) picked.model = formModel
         }
-        if (apiKey) {
-          opts.apiKey = apiKey
-          llm.cfg.apiKey = apiKey
-        }
-        if (model) {
-          opts.model = model
-          llm.cfg.model = model
-        }
-        if (!opts.apiKey) {
-          send({ type: 'error', message: 'API Key 不能为空' })
+        // 列表里一家都没有、表单也没填端点：退回「单端点」老写法，别把人卡在保存不了上
+        if (!picked && !formUrl) {
+          send({ type: 'error', message: '至少配一个供应商：端点地址不能为空' })
           break
         }
+        if (!picked) {
+          picked = { id: `p-${Date.now().toString(36)}`, name: '', baseURL: formUrl, apiKey: formKey, model: formModel }
+          incoming = [picked]
+        }
+        if (!picked.apiKey) {
+          // Key 留空＝保持原值；新填的那家留空才是真缺
+          const prev = providerList.find((p) => p.id === picked!.id)
+          if (prev?.apiKey) picked.apiKey = prev.apiKey
+        }
+        if (!picked.apiKey) {
+          send({ type: 'error', message: `供应商「${picked.name || picked.baseURL}」还没填 API Key` })
+          break
+        }
+        if (!incoming.some((p) => p.id === picked!.id)) incoming.unshift(picked)
+        providerList = incoming
+        // 立刻生效：下一轮请求就走这家
+        applyProvider(picked)
+        for (const p of incoming) registerSecret(p.apiKey)
         if (hasVerify) opts.verify = verify
         if (hasVision) opts.vision = Boolean(cmd.vision)
         try {
           await saveSettings(opts.dataDir, {
-            baseURL: opts.baseURL,
-            apiKey: opts.apiKey,
-            model: llm.cfg.model,
+            providers: incoming,
+            activeProvider: picked.id,
+            // 顶层快照（baseURL/apiKey/model）与当前供应商保持一致：
+            // 旧版本和手写配置文件只认这三个字段
+            baseURL: picked.baseURL,
+            apiKey: picked.apiKey,
+            model: picked.model,
             verify: hasVerify ? verify : undefined,
             vision: hasVision ? Boolean(cmd.vision) : undefined,
           })
-          // 换了 key 也要登记，否则新 key 不会被脱敏
-          registerSecret(opts.apiKey)
           // 验证命令变了要重建 agent，否则还用着旧的
           agent = await buildAgent()
           send({
@@ -952,6 +1033,8 @@ async function main(): Promise<void> {
             vision: opts.vision,
             saved: true,
             logsDir: audit.logsDir,
+            providers: providerList.map(publicProvider),
+            activeProvider: activeId,
           })
         } catch (e) {
           send({ type: 'error', message: `配置已生效，但没写进磁盘：${(e as Error).message}` })

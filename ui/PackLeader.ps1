@@ -563,7 +563,28 @@ $xaml = @'
           <TextBlock Text="填 OpenAI 兼容的端点地址和 Key，保存后立刻生效，并写进数据目录的 config.json。"
                      Foreground="#7C838E" FontSize="11" Margin="0,5,0,16" TextWrapping="Wrap"/>
 
-          <TextBlock Text="端点地址" Foreground="#ADB2B8" FontSize="11" Margin="0,0,0,5"/>
+          <!-- 供应商列表：公司网关 / 本地 Ollama / 官方 API 各存一套端点和 Key，点一行就切过去。
+               下面那三个输入框永远在编辑「选中的这一行」。 -->
+          <DockPanel Margin="0,0,0,6">
+            <Button x:Name="CfgProviderDel" DockPanel.Dock="Right" Content="删除" Height="24" Padding="10,0"
+                    Cursor="Hand" FontSize="11" Margin="8,0,0,0" Background="Transparent" Foreground="#F87171"
+                    BorderBrush="#66F87171" BorderThickness="1"/>
+            <Button x:Name="CfgProviderAdd" DockPanel.Dock="Right" Content="＋ 新增" Height="24" Padding="10,0"
+                    Cursor="Hand" FontSize="11" Margin="8,0,0,0" Background="Transparent" Foreground="#8AB4FF"
+                    BorderBrush="#4D8AB4FF" BorderThickness="1"/>
+            <TextBlock Text="供应商" Foreground="#ADB2B8" FontSize="11" VerticalAlignment="Center"/>
+          </DockPanel>
+          <Border Background="#0F1115" BorderBrush="#1FFFFFFF" BorderThickness="1" CornerRadius="6" Padding="4">
+            <StackPanel x:Name="CfgProviderList"/>
+          </Border>
+          <TextBlock Text="点一行＝选中它编辑；行上的「当前」＝正在使用的那家（保存后立刻生效）。"
+                     Foreground="#5B626D" FontSize="10.5" Margin="0,5,0,0" TextWrapping="Wrap"/>
+
+          <TextBlock Text="名称（可选）" Foreground="#ADB2B8" FontSize="11" Margin="0,13,0,5"/>
+          <TextBox x:Name="CfgName" Height="30" Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF"
+                   BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center" FontSize="11.5"/>
+
+          <TextBlock Text="端点地址" Foreground="#ADB2B8" FontSize="11" Margin="0,13,0,5"/>
           <TextBox x:Name="CfgUrl" Height="30" Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF"
                    BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center" FontSize="11.5"
                    FontFamily="Cascadia Mono, Consolas"/>
@@ -917,6 +938,10 @@ $CfgFetch = $window.FindName('CfgFetch')
 $CfgVision = $window.FindName('CfgVision')
 $CfgLogsDir = $window.FindName('CfgLogsDir')
 $CfgOpenLogs = $window.FindName('CfgOpenLogs')
+$CfgName = $window.FindName('CfgName')
+$CfgProviderList = $window.FindName('CfgProviderList')
+$CfgProviderAdd = $window.FindName('CfgProviderAdd')
+$CfgProviderDel = $window.FindName('CfgProviderDel')
 $ModelChips = $window.FindName('ModelChips')
 $ModelHint = $window.FindName('ModelHint')
 $AttachBtn = $window.FindName('AttachBtn')
@@ -4893,6 +4918,9 @@ $script:history = New-Object System.Collections.ArrayList
 $script:historyIdx = 0
 $script:cfgBaseURL = ''
 $script:cfgKeyMasked = ''
+# 供应商列表（host 的 ready / config / config-loaded 事件带来）
+$script:cfgProviders = @()
+$script:cfgActiveProvider = ''
 $script:verifyCmd = ''
 # 看图默认开（和 src/core/settings.ts 的 DEFAULT_VISION 一致）；host 的 ready 事件会带来真实值
 $script:visionOn = $true
@@ -5553,22 +5581,157 @@ $window.Add_Drop({
 
 
 # ---------------------------------------------------------------- 设置面板
-function Sync-SettingsForm {
-  $CfgUrl.Text = $(if ($script:cfgBaseURL) { $script:cfgBaseURL } else { '' })
+# 供应商列表的界面态：$script:providers 是「表单里的整份列表」，$script:activeProvider 是当前生效那家。
+# 布局上刻意让三个输入框只编辑「选中行」，列表本身是唯一的真相：
+# 每次改完输入框（切行 / 保存）都把输入框回写进列表，绝不会出现「框里是 A、列表里是 B」。
+$script:providers = @()
+$script:activeProvider = ''
+$script:editingProvider = ''
+$script:provSelBrush = Brush '#1E2836'
+$script:provCurBrush = Brush '#1B2230'
+
+function New-ProviderId {
+  return ('p-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+}
+
+# 把表单里正在编辑的那一行的三个输入框回写进列表（输入框留空＝不动该项，与 host 的语义一致）
+function Apply-FormToProvider {
+  if (-not $script:editingProvider) { return }
+  foreach ($p in $script:providers) {
+    if ($p.id -ne $script:editingProvider) { continue }
+    $p.name = $CfgName.Text.Trim()
+    $url = $CfgUrl.Text.Trim()
+    if ($url) { $p.baseURL = $url }
+    $key = $CfgKey.Text.Trim()
+    if ($key) { $p.apiKey = $key; $p.hasKey = $true; $p.newKey = $key }
+    $p.model = $CfgModel.Text.Trim()
+    return
+  }
+}
+
+function Get-Provider($id) {
+  foreach ($p in $script:providers) { if ($p.id -eq $id) { return $p } }
+  return $null
+}
+
+# 选中某一行：先把当前编辑内容存回去，再换成这一行的值
+function Select-Provider([string]$id) {
+  Apply-FormToProvider
+  $p = Get-Provider $id
+  if (-not $p) { return }
+  $script:editingProvider = $p.id
+  $CfgName.Text = [string]$p.name
+  $CfgUrl.Text = [string]$p.baseURL
   $CfgKey.Text = ''
-  $CfgModel.Text = $script:modelName
+  $CfgModel.Text = [string]$p.model
+  if ($p.hasKey) {
+    $CfgKeyHint.Text = "已设置（$($p.apiKeyMasked)）；留空表示保持不变。"
+  } else {
+    $CfgKeyHint.Text = '这一家还没填 Key，填一个才能用它对话。'
+  }
+  Draw-ProviderList
+}
+
+# 列表重绘：未保存的改动实时体现在列表上（名字/端点/当前标记），不用先点保存
+function Draw-ProviderList {
+  $CfgProviderList.Children.Clear()
+  if (@($script:providers).Count -eq 0) {
+    $empty = New-Object System.Windows.Controls.TextBlock
+    $empty.Text = '还没有供应商，点「＋ 新增」加一个。'
+    $empty.Foreground = (Brush '#5B626D')
+    $empty.FontSize = 10.5
+    $empty.Margin = '8,7'
+    $CfgProviderList.Children.Add($empty) | Out-Null
+    return
+  }
+  foreach ($p in $script:providers) {
+    $isCur = ($p.id -eq $script:activeProvider)
+    $isEdit = ($p.id -eq $script:editingProvider)
+    $row = New-Object System.Windows.Controls.Button
+    $row.Padding = '8,6'
+    $row.HorizontalContentAlignment = 'Left'
+    $row.Cursor = 'Hand'
+    $row.BorderThickness = '0'
+    $row.Margin = '0,1'
+    $row.Template = (New-FlatTemplate)
+    $row.Background = $(if ($isEdit) { $script:provSelBrush } elseif ($isCur) { $script:provCurBrush } else { [System.Windows.Media.Brushes]::Transparent })
+    $row.Tag = $p.id
+    $grid = New-Object System.Windows.Controls.DockPanel
+    # 右侧状态：当前那家标蓝点，其余显示一个「设为当前」的小字按钮
+    if ($isCur) {
+      $cur = New-Object System.Windows.Controls.TextBlock
+      $cur.Text = '● 当前'
+      $cur.Foreground = (Brush '#4ADE80')
+      $cur.FontSize = 10.5
+      $cur.VerticalAlignment = 'Center'
+      $cur.Margin = '8,0,4,0'
+      [System.Windows.Controls.DockPanel]::SetDock($cur, 'Right')
+      $grid.Children.Add($cur) | Out-Null
+    }
+    $name = New-Object System.Windows.Controls.TextBlock
+    $name.Text = $(if ($p.name) { [string]$p.name } else { [string]$p.baseURL })
+    $name.Foreground = (Brush '#E5E7EB')
+    $name.FontSize = 11.5
+    $name.TextTrimming = 'CharacterEllipsis'
+    $sub = New-Object System.Windows.Controls.TextBlock
+    $sub.Text = ([string]$p.baseURL + '  ·  ' + $(if ($p.model) { [string]$p.model } else { '未填模型' }))
+    $sub.Foreground = (Brush '#6B7280')
+    $sub.FontSize = 10
+    $sub.Margin = '0,2,0,0'
+    $sub.TextTrimming = 'CharacterEllipsis'
+    # 两行竖排：名字在上、端点·模型在下；Container 拖到右侧标「● 当前」
+    $stack = New-Object System.Windows.Controls.StackPanel
+    $stack.Children.Add($name) | Out-Null
+    $stack.Children.Add($sub) | Out-Null
+    $grid.Children.Add($stack) | Out-Null
+    $row.Content = $grid
+    $row.Add_Click({
+      param($s, $e)
+      $id = [string]$s.Tag
+      if ($e.ClickCount -ge 2) {
+        # 双击＝把这一家设为当前（改完 Key 后的常用动作，少点一次）
+        Apply-FormToProvider
+        $script:activeProvider = $id
+        Draw-ProviderList
+        return
+      }
+      Select-Provider $id
+    })
+    $CfgProviderList.Children.Add($row) | Out-Null
+  }
+}
+
+function Sync-SettingsForm {
+  $script:providers = @($script:cfgProviders)
+  $script:activeProvider = $script:cfgActiveProvider
+  # 选中的行：原来选的那家还在就保持，否则回落到当前生效那家、再否则第一家
+  $keep = Get-Provider $script:editingProvider
+  if (-not $keep) { $keep = Get-Provider $script:activeProvider }
+  $script:editingProvider = ''
+  if ($keep) {
+    $script:editingProvider = $keep.id
+    $CfgName.Text = [string]$keep.name
+    $CfgUrl.Text = [string]$keep.baseURL
+    $CfgKey.Text = ''
+    $CfgModel.Text = [string]$keep.model
+    if ($keep.hasKey) { $CfgKeyHint.Text = "已设置（$($keep.apiKeyMasked)）；留空表示保持不变。" }
+    else { $CfgKeyHint.Text = '这一家还没填 Key，填一个才能用它对话。' }
+  } else {
+    $CfgName.Text = ''
+    $CfgUrl.Text = $(if ($script:cfgBaseURL) { $script:cfgBaseURL } else { '' })
+    $CfgKey.Text = ''
+    $CfgModel.Text = $script:modelName
+    if ($script:hasKey) { $CfgKeyHint.Text = "已设置（$($script:cfgKeyMasked)）；留空表示保持不变。" }
+    else { $CfgKeyHint.Text = '还没有设置 Key，填一个才能开始对话。' }
+  }
   $CfgVerify.Text = $script:verifyCmd
   $CfgLogsDir.Text = $script:logsDir
   $CfgVision.IsChecked = [bool]$script:visionOn
   $ModelChips.Children.Clear()
   $ModelChips.Visibility = 'Collapsed'
   $ModelHint.Text = '点「拉取」从端点列出可用模型。'
-  if ($script:hasKey) {
-    $CfgKeyHint.Text = "已设置（$($script:cfgKeyMasked)）；留空表示保持不变。"
-  } else {
-    $CfgKeyHint.Text = '还没有设置 Key，填一个才能开始对话。'
-  }
   $CfgError.Text = ''
+  Draw-ProviderList
 }
 
 function Open-Settings {
@@ -5586,16 +5749,39 @@ function Close-Settings {
   $InputBox.Focus() | Out-Null
 }
 
+# 整份提交：列表 + 当前项 + 表单里正在编辑的那行（可能刚改还没回写）
 function Save-Settings {
-  $url = $CfgUrl.Text.Trim()
-  $key = $CfgKey.Text.Trim()
-  $model = $CfgModel.Text.Trim()
-  if (-not $url) { $CfgError.Text = '端点地址不能为空（例：http://127.0.0.1:19790/v1）'; return }
-  if (-not $url.StartsWith('http')) { $CfgError.Text = '端点地址要以 http:// 或 https:// 开头'; return }
-  if (-not $key -and -not $script:hasKey) { $CfgError.Text = 'API Key 不能为空'; return }
+  Apply-FormToProvider
+  if (@($script:providers).Count -eq 0) {
+    $CfgError.Text = '至少配一个供应商：点「＋ 新增」填上端点地址和 Key。'
+    return
+  }
+  $edit = Get-Provider $script:editingProvider
+  if (-not $edit) { $edit = Get-Provider $script:activeProvider }
+  if ($edit) { $script:activeProvider = $edit.id }
+  foreach ($p in $script:providers) {
+    if (-not $p.baseURL) { $CfgError.Text = '每家供应商都要填端点地址（例：http://127.0.0.1:19790/v1）'; return }
+    if (-not ([string]$p.baseURL).StartsWith('http')) { $CfgError.Text = "「$($p.name)」的端点地址要以 http:// 或 https:// 开头"; return }
+    if (-not $p.hasKey) { $CfgError.Text = "「$($p.name)」还没填 API Key"; return }
+  }
   $CfgError.Text = ''
-  $payload = @{ cmd = 'config'; baseURL = $url; model = $model; verify = $CfgVerify.Text.Trim(); vision = [bool]$CfgVision.IsChecked }
-  if ($key) { $payload.apiKey = $key }
+  # Key 只发新填的明文；没改过的那家不带 apiKey，host 会用列表里存的
+  $list = @()
+  foreach ($p in $script:providers) {
+    $item = @{ id = [string]$p.id; name = [string]$p.name; baseURL = [string]$p.baseURL; model = [string]$p.model }
+    if ($p.newKey) { $item.apiKey = [string]$p.newKey }
+    $list += $item
+  }
+  $cur = Get-Provider $script:activeProvider
+  $payload = @{
+    cmd = 'config'
+    providers = $list
+    activeProvider = [string]$script:activeProvider
+    baseURL = [string]$cur.baseURL
+    model = [string]$cur.model
+    verify = $CfgVerify.Text.Trim()
+    vision = [bool]$CfgVision.IsChecked
+  }
   Send-Host $payload
 }
 
@@ -5926,6 +6112,7 @@ function Handle-Event-Core([string]$line) {
       $script:modelName = [string]$e.model
       $script:cfgBaseURL = [string]$e.baseURL
       $script:cfgKeyMasked = [string]$e.apiKeyMasked
+      if ($null -ne $e.providers) { $script:cfgProviders = @($e.providers); $script:cfgActiveProvider = [string]$e.activeProvider }
       $script:verifyCmd = [string]$e.verify
       $script:visionOn = [bool]$e.vision
       $script:logsDir = [string]$e.logsDir
@@ -6173,6 +6360,7 @@ function Handle-Event-Core([string]$line) {
       if ($e.logsDir) { $script:logsDir = [string]$e.logsDir }
       $script:modelName = [string]$e.model
       $script:hasKey = [bool]$e.hasKey
+      if ($null -ne $e.providers) { $script:cfgProviders = @($e.providers); $script:cfgActiveProvider = [string]$e.activeProvider }
       Update-ModelPill ([string]$e.model)
       if ($SettingsOverlay.Visibility -eq 'Visible') {
         Sync-SettingsForm
@@ -6281,6 +6469,31 @@ $StopBtn.Add_Click({
 
 # 设置面板
 $SettingsBtn.Add_Click({ Perf-Action 'open-settings'; Open-Settings })
+
+# 供应商：新增一行空白（端点留空，保存时会拦住并提示），删掉当前选中的那一家
+$CfgProviderAdd.Add_Click({
+  Apply-FormToProvider
+  $p = [pscustomobject]@{
+    id = (New-ProviderId); name = ''; baseURL = ''; model = ''
+    hasKey = $false; apiKeyMasked = ''; apiKey = ''; newKey = ''
+  }
+  $script:providers = @($script:providers) + $p
+  # 新增的这家直接选中（以及设为当前）：用户点「新增」的意图就是要用它
+  $script:activeProvider = $p.id
+  Select-Provider $p.id
+  $CfgName.Focus() | Out-Null
+})
+$CfgProviderDel.Add_Click({
+  $del = Get-Provider $script:editingProvider
+  if (-not $del) { $CfgError.Text = '先在列表里点选要删的那一家'; return }
+  if (@($script:providers).Count -le 1) { $CfgError.Text = '至少留一个供应商'; return }
+  $rest = @()
+  foreach ($p in $script:providers) { if ($p.id -ne $del.id) { $rest += $p } }
+  $script:providers = $rest
+  if ($script:activeProvider -eq $del.id) { $script:activeProvider = $rest[0].id }
+  $script:editingProvider = ''
+  Select-Provider $script:activeProvider
+})
 
 # 打开日志目录：资源管理器直接定位过去，方便复杂任务卡住时按日志复盘
 $CfgOpenLogs.Add_Click({

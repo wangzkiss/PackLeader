@@ -27,7 +27,7 @@ import { Checkpoints } from './core/checkpoint.ts'
 import { Agent } from './core/loop.ts'
 import { Policy } from './core/policy.ts'
 import { Session } from './core/session.ts'
-import { llmTimeoutsOf, loadSettingsSync } from './core/settings.ts'
+import { llmTimeoutsOf, loadSettingsSync, providersOf } from './core/settings.ts'
 import { PERF_MODES } from './core/settings.ts'
 import type { PerfMode } from './core/settings.ts'
 import { PerfLog, newRunId, perfDir } from './core/perf.ts'
@@ -110,6 +110,13 @@ function resolveConfig(flags: Record<string, string | boolean>): Config {
   // 优先级：命令行 > 环境变量 > <data>/config.json > 内置默认。
   // 界面里填的端点/Key 也写这个文件，所以装完之后不设任何环境变量也能用。
   const saved = loadSettingsSync(dataDir)
+  // 供应商列表：界面里配了多家时，命令行/环境变量没指定就用「当前选中的那家」。
+  // 列表是空的话 cur 为 undefined，后面自然回落到旧字段与内置默认端点。
+  const { list: savedProviders, active: savedActive } = providersOf(saved)
+  const cur = savedProviders.find((p) => p.id === savedActive)
+  const providerKey = cur?.apiKey ?? saved.apiKey
+  const providerUrl = cur?.baseURL ?? saved.baseURL
+  const providerModel = cur?.model || saved.model
   // 权限档：命令行 > 环境变量 > config.json（界面上切过的档）> guarded
   const mode = (str(flags, 'mode') ?? process.env.PL_MODE ?? saved.mode ?? 'guarded') as Mode
   if (!['read-only', 'guarded', 'full'].includes(mode)) throw new Error(`--mode 只能是 read-only / guarded / full，收到 ${mode}`)
@@ -123,15 +130,15 @@ function resolveConfig(flags: Record<string, string | boolean>): Config {
       process.env.PL_API_KEY ??
       process.env.DEEPSEEK_API_KEY ??
       process.env.OPENAI_API_KEY ??
-      saved.apiKey ??
+      providerKey ??
       '',
     baseURL:
       str(flags, 'base-url') ??
       process.env.PL_BASE_URL ??
       process.env.DEEPSEEK_BASE_URL ??
-      saved.baseURL ??
+      providerUrl ??
       'https://api.deepseek.com/v1',
-    model: str(flags, 'model') ?? process.env.PL_MODEL ?? saved.model ?? 'deepseek-chat',
+    model: str(flags, 'model') ?? process.env.PL_MODEL ?? providerModel ?? 'deepseek-chat',
     approval,
     maxSteps: num(flags, 'max-steps') ?? 100,
     // 空串 = 自动识别（detectVerifier）

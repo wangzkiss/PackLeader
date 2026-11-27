@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { Session } from '../src/core/session.ts'
-import { DEFAULT_VISION, llmTimeoutsOf, loadSettings, loadSettingsSync, maskKey, saveSettings, settingsPath, TIMEOUT_RANGES, visionFrom } from '../src/core/settings.ts'
+import { DEFAULT_VISION, activeProviderOf, llmTimeoutsOf, loadSettings, loadSettingsSync, maskKey, providersOf, saveSettings, settingsPath, TIMEOUT_RANGES, visionFrom } from '../src/core/settings.ts'
 
 const tmp = (): Promise<string> => mkdtemp(join(tmpdir(), 'pl-settings-'))
 
@@ -20,7 +20,14 @@ const exists = async (p: string): Promise<boolean> => {
 test('settings: 写入后能读回，落盘是 JSON 而不是别的格式', async () => {
   const dir = await tmp()
   const saved = await saveSettings(dir, { baseURL: 'http://127.0.0.1:19790/v1', apiKey: 'sk-test-1234', model: 'deepseek-flash' })
-  assert.deepEqual(saved, { baseURL: 'http://127.0.0.1:19790/v1', apiKey: 'sk-test-1234', model: 'deepseek-flash' })
+  // 保存时会顺手把单端点折成一家供应商（providers 里一项，activeProvider 指向它），
+  // 这样 config.json 从第一次保存起就是自描述的新形态，老字段依然同步着当前生效值。
+  assert.equal(saved.baseURL, 'http://127.0.0.1:19790/v1')
+  assert.equal(saved.apiKey, 'sk-test-1234')
+  assert.equal(saved.model, 'deepseek-flash')
+  assert.equal(saved.providers?.length, 1)
+  assert.equal(saved.providers?.[0]?.baseURL, 'http://127.0.0.1:19790/v1')
+  assert.equal(saved.activeProvider, saved.providers?.[0]?.id)
 
   const back = await loadSettings(dir)
   assert.equal(back.apiKey, 'sk-test-1234')
@@ -99,6 +106,74 @@ test('settings: 手写成 "vision": false 也能读出来（别被 coerce 丢掉
   const s = await loadSettings(dir)
   assert.equal(s.vision, false)
   assert.equal(visionFrom(s), false)
+})
+
+test('settings: 多个供应商各存各的 Key，切换只换当前项不动别人的', async () => {
+  const dir = await tmp()
+  await saveSettings(dir, {
+    providers: [
+      { id: 'a', name: '公司网关', baseURL: 'https://gw.example/v1', apiKey: 'sk-aaa', model: 'gpt-4o' },
+      { id: 'b', name: '本地', baseURL: 'http://127.0.0.1:11434/v1', apiKey: 'sk-bbb', model: 'qwen' },
+    ],
+    activeProvider: 'b',
+    vision: true,
+  })
+  let s = await loadSettings(dir)
+  assert.equal(s.providers?.length, 2)
+  assert.equal(s.activeProvider, 'b')
+  // 顶层快照跟着当前项走：旧版本/手写配置只认这三个字段
+  assert.equal(s.baseURL, 'http://127.0.0.1:11434/v1')
+  assert.equal(s.apiKey, 'sk-bbb')
+  assert.equal(s.model, 'qwen')
+
+  // 切回第一家：两家的 Key 都还在，没有被覆盖
+  await saveSettings(dir, { activeProvider: 'a' })
+  s = await loadSettings(dir)
+  assert.equal(s.activeProvider, 'a')
+  assert.equal(s.apiKey, 'sk-aaa')
+  assert.equal(s.providers?.find((p) => p.id === 'b')?.apiKey, 'sk-bbb')
+
+  // 删掉一家：整份替换语义，文件里就真没了
+  await saveSettings(dir, { providers: [s.providers!.find((p) => p.id === 'b')!] })
+  s = await loadSettings(dir)
+  assert.equal(s.providers?.length, 1)
+  assert.equal(s.providers?.[0]?.id, 'b')
+  assert.equal(s.activeProvider, 'b', '当前项被删了要回落到列表里存在的那个')
+})
+
+test('settings: 旧版单端点配置会被折成一家供应商（升级不用重填 Key）', async () => {
+  const dir = await tmp()
+  await writeFile(
+    settingsPath(dir),
+    JSON.stringify({ baseURL: 'http://old/v1', apiKey: 'sk-old', model: 'm-old' }),
+    'utf8',
+  )
+  const s = await loadSettings(dir)
+  const { list, active } = providersOf(s)
+  assert.equal(list.length, 1)
+  assert.equal(active, list[0]!.id)
+  assert.equal(list[0]!.baseURL, 'http://old/v1')
+  assert.equal(list[0]!.apiKey, 'sk-old')
+  assert.deepEqual(activeProviderOf(s), list[0])
+
+  // 一家都没配：没有当前供应商，调用方自己兜默认端点
+  const empty = await tmp()
+  assert.equal(activeProviderOf(await loadSettings(empty)), undefined)
+})
+
+test('settings: 供应商列表里有坏项（没端点/重复 id）时不带病保存', async () => {
+  const dir = await tmp()
+  const saved = await saveSettings(dir, {
+    providers: [
+      { id: 'x', name: '好的', baseURL: ' http://ok/v1 ', apiKey: ' sk-x ' },
+      { id: 'x', name: '重复 id', baseURL: 'http://dup/v1', apiKey: 'sk-dup' },
+      { id: 'y', name: '', baseURL: '   ', apiKey: 'sk-none' },
+    ] as never,
+    activeProvider: 'x',
+  })
+  assert.equal(saved.providers?.length, 1, '空端点的项丢掉，重复 id 只留第一个')
+  assert.equal(saved.providers?.[0]?.baseURL, 'http://ok/v1')
+  assert.equal(saved.providers?.[0]?.apiKey, 'sk-x')
 })
 
 test('settings: maskKey 只露头尾', () => {

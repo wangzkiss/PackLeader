@@ -1282,6 +1282,27 @@ function New-ThinkIcon([string]$color = '#A8B0BE') {
   return $c
 }
 
+# 收起状态下「正在处理」的实时提示：优先正在吐的那句思考的尾巴，其次当前阶段词
+# （思考中 / 执行 fs.read / 回答中）。步骤卡头的摘要和轮头右边都用它——
+# 只要还在跑就一直变，一眼看得出没卡住。
+function Get-LiveHintText {
+  $rn = $script:pumpTarget
+  if (-not $rn) { $rn = $script:reasonNode }
+  if ($rn -and $rn.Body) {
+    $q = [string]$rn.Body.Text
+    if ($q) {
+      $q = ($q -replace '\s+', ' ').Trim()
+      if ($q.Length -gt 0) {
+        if ($q.Length -gt 42) { $q = '…' + $q.Substring($q.Length - 40) }
+        return $q
+      }
+    }
+  }
+  $verb = [string]$script:thinkVerb
+  if ($verb) { return $verb }
+  return '正在处理…'
+}
+
 # 刷新状态行：阶段词 + 计时；结束了就把绿点熄掉、词换成「已完成」
 function Update-TurnProc($t) {
   if (-not $t) { return }
@@ -1324,6 +1345,14 @@ function Update-TurnProc($t) {
   if ($s.Length -gt $maxChars) { $s = $s.Substring(0, $maxChars) + '…' }
   $t.SumRight.Text = $s
   $t.SumRight.Foreground = $(if ([int]$t.Failed -gt 0) { Brush '#F87171' } else { Brush '#6B7280' })
+  # 第一行右边：还在跑就在这里不停刷「最新在干什么」（思考尾巴 / 当前工具名）。
+  # 收起态下这一行就是全部动静，收尾后藏起来。
+  $hint = ''
+  if (-not ($t.Done -or $historical)) { $hint = Get-LiveHintText }
+  if ($t.LiveHint) {
+    $t.LiveHint.Text = $hint
+    $t.LiveHint.Visibility = $(if ($hint) { 'Visible' } else { 'Collapsed' })
+  }
 }
 
 function New-TurnProc {
@@ -1351,6 +1380,8 @@ function New-TurnProc {
   # 状态行：● 思考中… 1:30
   $row = New-Object System.Windows.Controls.DockPanel
   $row.Margin = '2,0,2,0'
+  # 关掉 LastChildFill：右边那行实时提示要按 Dock 贴右，别被撑满整行
+  $row.LastChildFill = $false
 
   $left = New-Object System.Windows.Controls.StackPanel
   $left.Orientation = 'Horizontal'
@@ -1378,6 +1409,18 @@ function New-TurnProc {
   $clock.Margin = '9,0,0,0'
   $left.Children.Add($clock) | Out-Null
   $row.Children.Add($left) | Out-Null
+
+  # 第一行右边：收起态下唯一在动的东西——最新一句思考 / 正在跑的工具，跑完就收起来
+  $live = New-Text '' 10.5 '#7C8595' 'Normal' 'Cascadia Mono, Consolas' 0
+  $live.VerticalAlignment = 'Center'
+  $live.TextTrimming = 'CharacterEllipsis'
+  $live.TextWrapping = 'NoWrap'
+  $live.MaxWidth = 460
+  $live.Margin = '12,0,2,0'
+  $live.Visibility = 'Collapsed'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($live, 'TurnLive')
+  [System.Windows.Controls.DockPanel]::SetDock($live, 'Right')
+  $row.Children.Add($live) | Out-Null
   $hs.Children.Add($row) | Out-Null
 
   # 汇总行：左边「N 次工具调用 · 共 X · M 步」，右边各工具计数
@@ -1413,7 +1456,7 @@ function New-TurnProc {
 
   $node = New-Object PSObject -Property @{
     Box = $box; Body = $body; Final = $final; Head = $head; SumLeft = $sumLeft; SumRight = $sumRight
-    Dot = $dot; Verb = $verb; Clock = $clock
+    Dot = $dot; Verb = $verb; Clock = $clock; LiveHint = $live
     Thought = $null; LastStep = $null
     Open = $true; Done = $false; Tools = 0; Steps = 0; Replay = $false
     StepNodes = (New-Object System.Collections.ArrayList)
@@ -1552,6 +1595,7 @@ function New-StepBlock {
   $title.VerticalAlignment = 'Center'
   $title.TextTrimming = 'CharacterEllipsis'
   $title.TextWrapping = 'NoWrap'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($title, 'StepTitle')
   $dp.Children.Add($title) | Out-Null
   $head.Content = $dp
   $sp.Children.Add($head) | Out-Null
@@ -1596,12 +1640,11 @@ function New-StepBlock {
   $tp.Steps = [int]$tp.Steps + 1
   $node.No.Text = '第 ' + $tp.Steps + ' 步'
   Update-StepHead $node
-  # 历史里的这一步早就做完了：卡身默认收起，轮卡展开后看到的是「第 1 步… 第 2 步…」
-  # 这样的一行一条目录，想看哪一步的思考和工具再点哪一步。
-  if ($finished) {
-    $node.Open = $false
-    $body.Visibility = 'Collapsed'
-  }
+  # 步骤卡一律默认收起，只留卡头一行：还在跑的时候这一行会不停刷最新思考 / 工具（见
+  # Step-ReasonTyping），看得出在处理；想看过程自己点开。历史回放同理，轮卡展开先看到
+  # 「第 1 步… 第 2 步…」这样一行一条的目录。
+  $node.Open = $false
+  $body.Visibility = 'Collapsed'
   # 思考和工具组都按步新建：下一段思考、下一次调用落进新块
   $script:toolGroup = $null
   $script:reasonNode = $null
@@ -1619,7 +1662,8 @@ function Update-StepHead($n) {
   $snip = [string]$n.Snip
   if (-not $snip) {
     if ($n.Done) { $snip = '（这一步没有结论）' }
-    else { $snip = '正在做…' }
+    # 还在跑：这行一直刷「最新在干什么」（思考尾巴 / 当前工具），收起态靠它看动静
+    else { $snip = (Get-LiveHintText) }
   }
   $max = Get-RowChars 330 6.6
   if ($snip.Length -gt $max) { $snip = $snip.Substring(0, $max) + '…' }
@@ -1779,22 +1823,27 @@ function Close-TurnProc {
         $t.Final.Children.Add($k) | Out-Null
       }
     }
+    # 最后一段结论：从后往前找第一张带正文的步骤卡，把它的正文块搬到 Final，
+    # 卡片本身（思考 + 调用）留在过程区。
+    # 早先写的是「把整张卡搬过去」，可正文在卡身第三层（TextHost）里，只往下扫两层
+    # 一次也扫不到——这条搬运其实从来没生效过，结论就一直跟着步骤卡被折起来，
+    # 得点开最后一步才看得见。
+    # 就算扫到了也不该搬整张卡：卡头能折叠，点轮头展开时还会把各步卡收成一行。
     $cards = @($t.Body.Children)
     for ($i = $cards.Count - 1; $i -ge 0; $i--) {
       $card = $cards[$i]
-      if (-not $card.Children) { continue }
-      $hasText = $false
-      foreach ($layer in @($card.Children)) {
-        if (-not $layer.Children) { continue }
-        foreach ($k in @($layer.Children)) {
-          if ($k.Tag -eq 'assistant') { $hasText = $true }
+      if (-not $card.PSObject.Properties['NodeRef']) { continue }
+      $sn = $card.NodeRef
+      if (-not $sn -or -not $sn.TextHost) { continue }
+      $moved = $false
+      foreach ($k in @($sn.TextHost.Children)) {
+        if ($k.Tag -eq 'assistant') {
+          $sn.TextHost.Children.Remove($k) | Out-Null
+          $t.Final.Children.Add($k) | Out-Null
+          $moved = $true
         }
       }
-      if ($hasText) {
-        $t.Body.Children.Remove($card) | Out-Null
-        $t.Final.Children.Add($card) | Out-Null
-        break
-      }
+      if ($moved) { break }
     }
   }
   # 收尾补救：把「没有结论」的步骤并进它后面第一张有结论的卡。
@@ -1842,8 +1891,33 @@ function Update-ToolGroup($g) {
   # 还在跑的那件由右边的红字和底部胶囊报，这串数字才不会每 100ms 自己往上跳
   $done = $g.Count - $g.Running
   $total = $(if ($done -gt 0) { ' · 共 ' + (Format-ToolSecs $g.TotalMs) } else { '' })
-  # 一步里只调了一次工具时，不套「1 次工具调用 · 共 0ms」这层壳：合计没有信息量，
-  # 直接把工具名当标题（展开后就是它的参数），省掉一层没有内容的聚合卡。
+  # 一整组只有一次调用时不套这层壳：卡头会写「read」、里面再一行 read，等于同一件事写两遍。
+  # 把壳去掉、行直接露出来（行本身可点，展开就是这次调用的入参和结果），
+  # 轮廓 / 背景 / 边距一起收，看起来就是普通的一行工具调用。
+  $wasSingle = [bool]$g.Single
+  $g.Single = ($g.Count -le 1)
+  if ($g.Single) {
+    # 整行组头都收起来（连右侧计数一起）：这一行现在只留下面那条工具行本身
+    if ($g.HeadBtn) { $g.HeadBtn.Visibility = 'Collapsed' }
+    $g.Head.Visibility = 'Collapsed'
+    $g.Items.Visibility = 'Visible'
+    $g.Items.Margin = '0'
+    $g.Border.Background = [System.Windows.Media.Brushes]::Transparent
+    $g.Border.BorderThickness = '0'
+    $g.Border.Padding = '0'
+    $g.Border.Margin = '0'
+  } else {
+    # 同一步里又来了第二件工具：壳重新出现，并且直接展开（否则新行会被折起来看不见）
+    if ($wasSingle) { $g.Open = $true }
+    # 壳重新出现：整行组头和标题都放回来
+    if ($g.HeadBtn) { $g.HeadBtn.Visibility = 'Visible' }
+    $g.Head.Visibility = 'Visible'
+    $g.Items.Visibility = $(if ($g.Open) { 'Visible' } else { 'Collapsed' })
+    $g.Items.Margin = '8,0,8,7'
+    $g.Border.Background = (Brush '#0E1116')
+    $g.Border.BorderThickness = '1'
+    $g.Border.Margin = '0,0,0,6'
+  }
   if ($g.Count -eq 1 -and $g.Order.Count -eq 1) {
     $g.Head.Text = "$arrow  $($g.Order[0])"
   } else {
@@ -1867,7 +1941,7 @@ function Update-ToolGroup($g) {
   $g.Sum.Foreground = $(if ($g.Failed -gt 0) { Brush '#F87171' } else { Brush '#6B7280' })
 }
 
-function New-ToolGroup {
+function New-ToolGroupAt([object]$where = $null) {
   $outer = New-Object System.Windows.Controls.Border
   $outer.Background = (Brush '#0E1116')
   $outer.BorderBrush = (Brush '#0FFFFFFF')
@@ -1913,17 +1987,25 @@ function New-ToolGroup {
   $sp.Children.Add($items) | Out-Null
 
   $outer.Child = $sp
-  (Get-ProcPanel 'tool').Children.Add($outer) | Out-Null
+  $box = $(if ($where) { $where } else { (Get-ProcPanel 'tool') })
+  $box.Children.Add($outer) | Out-Null
 
   $g = New-Object PSObject -Property @{
-    Head = $title; Sum = $sum; Run = $run; Items = $items; Border = $outer
+    # Head 是组头左边那串标题文字，HeadBtn 是整行按钮——单工具时得把整行收掉：
+    # 只藏标题的话，按钮自己的内边距和右边的「read ×1」还会占出一条空白行
+    Head = $title; HeadBtn = $head; Sum = $sum; Run = $run; Items = $items; Border = $outer
     Count = 0; Counts = @{}; Order = (New-Object System.Collections.ArrayList)
-    Running = 0; Failed = 0; Open = $false; TotalMs = 0
+    Running = 0; Failed = 0; Open = $false; TotalMs = 0; Single = $false
   }
   # 同样拿 Tag 传节点：事件里直接引用 $g 会拿到 null
   $head.Tag = $g
   $head.Add_Click({ param($s, $e) Toggle-ToolGroup $s.Tag })
   return $g
+}
+
+# 兼容旧调用：不给落点就是整轮那张（过程区 tools 段）
+function New-ToolGroup {
+  return (New-ToolGroupAt $null)
 }
 
 function Toggle-ToolGroup($g) {
@@ -2066,6 +2148,8 @@ function Set-ToolLineDone([string]$id, [string]$text, [bool]$ok, [int]$ms = 0, [
 # Kite 那样的样式：收起时就是一行「⋯ 思考了4s  <开头一句>            ▸」，
 # 点一下展开看全文。流式时展开，出正文 / 调工具后自动收起。
 $script:reasonNode = $null
+# 逐字泵的目标节点：与 reasonNode 分开，布局逻辑置空 reasonNode 时泵照旧往原节点吐字
+$script:pumpTarget = $null
 # 思考流式的待吐队列：模型一次给一大段（或一帧里攒了好几条 delta）时先存这里，按帧追上去
 $script:reasonQueue = New-Object System.Text.StringBuilder
 $script:reasonTypingTimer = $null
@@ -2197,12 +2281,16 @@ function Add-ReasoningBlock {
     $n.Open = $false
     $n.T0 = (Get-Date)
     $n.Secs = 0
+    $n.PendingEnd = $false
     if ($n.Body.Text) { $n.Body.Text = $n.Body.Text + "`r`n`r`n" }
     # 段起点按整段全文长度算（超长思考的 Body 只放了前一段，用它的长度会把段起点算偏）；
     # 实时流没维护 FullText，那时 Body.Text 就是全文，直接用它的长度
     $n.SegStart = $(if ($n.FullText) { ([string]$n.FullText).Length + 4 } else { $n.Body.Text.Length })
     if ($n.Caret) { $n.Caret.Visibility = 'Visible' }
     $script:reasonNode = $n
+    # 泵自己的目标：布局逻辑（New-StepBlock / Close-TurnProc）会随时把 reasonNode 置空，
+    # 泵不能跟着丢目标，否则队列里还没吐完的字会被 Step-ReasonTyping 清掉
+    $script:pumpTarget = $n
     Update-ReasoningHeader $n
     return $n
   }
@@ -2294,7 +2382,8 @@ function Add-ReasoningBlock {
     ChainHost = $chainHost
     Border = $outer; Box = $box
     # FullText / RestShown：打开历史时整段思考已经写进 Body（超过 reasonLongChars 才先放一段）
-    T0 = (Get-Date); Open = $false; Done = $false; Secs = 0; SegStart = 0
+    # PendingEnd：「这段思考已经结束，但队列里的字还没吐完」——泵吐空了才真正定格
+    T0 = (Get-Date); Open = $false; Done = $false; Secs = 0; SegStart = 0; PendingEnd = $false
     FullText = ''; RestShown = $true
     # 这段思考属于哪张步骤卡：收尾时按 Owner 累加耗时，不按「当前」步骤——
     # 思考常常在下一步的 step 事件之后才被 onText/onToolStart 关掉，按当前算会串到隔壁
@@ -2305,6 +2394,7 @@ function Add-ReasoningBlock {
   $head.Add_Click({ param($s, $e) Toggle-Reasoning $s.Tag })
   $tp.Thought = $node
   $script:reasonNode = $node
+  $script:pumpTarget = $node
   Update-ReasoningHeader $node
   return $node
 }
@@ -2323,7 +2413,7 @@ function Start-ReasonTyping {
 }
 
 function Step-ReasonTyping {
-  $rn = $script:reasonNode
+  $rn = $script:pumpTarget
   $timer = $script:reasonTypingTimer
   if (-not $rn -or $rn.Done) {
     if ($timer) { $timer.Stop() }
@@ -2333,19 +2423,41 @@ function Step-ReasonTyping {
   $pending = $script:reasonQueue.Length
   if ($pending -le 0) {
     if ($timer) { $timer.Stop() }
+    # 字吐干净了：如果后面还有事件压着（说明这段思考确实完了），先定格再放它们上屏
+    $waiting = ($script:deferredLines -and $script:deferredLines.Count -gt 0 -and -not $script:deferReplay)
+    if (($rn.PendingEnd -or $waiting) -and -not $rn.Done) { Finish-Reasoning $rn }
+    if ($waiting) { Resume-DeferredEvents }
     return
   }
-  $take = 1
-  if ($pending -gt 800) { $take = 200 }
-  elseif ($pending -gt 300) { $take = 60 }
-  elseif ($pending -gt 80) { $take = 20 }
-  elseif ($pending -gt 20) { $take = 5 }
+  # 实时思考默认收着（只留一行会动的摘要），正文看不见，所以按「收起」配速：快速滚过去。
+  # 用户手动展开看的时候才放慢，一个字一个字看得清。
+  # 上游（19790 代理）会把整段 SSE 缓冲完一次性下发，不能按积压量暴涨到一帧几百字。
+  # 只有真看得见才算「展开」：父级步骤卡收起时子元素自身的 Visibility 仍是 Visible，
+  # 光看 Body.Visibility 会把收起态误当成展开、按慢速吐字
+  $shown = ($rn.Body -and $rn.Body.Visibility -eq 'Visible' -and $rn.Owner -and $rn.Owner.Open)
+  if ($shown) {
+    $take = 1
+    if ($pending -gt 600) { $take = 4 }
+    elseif ($pending -gt 240) { $take = 3 }
+    elseif ($pending -gt 60) { $take = 2 }
+  } else {
+    # 收起态正文没人看，只有卡头 / 轮头那两行尾巴在动：往快里吐，别把后面的工具事件压太久
+    $take = 4
+    if ($pending -gt 4000) { $take = 60 }
+    elseif ($pending -gt 1200) { $take = 30 }
+    elseif ($pending -gt 400) { $take = 12 }
+  }
   if ($take -gt $pending) { $take = $pending }
   $rn.Body.Text = $rn.Body.Text + $script:reasonQueue.ToString(0, $take)
   $script:reasonQueue.Remove(0, $take) | Out-Null
   $script:reasonTypingTick++
-  # 收起态右侧那行摘要跟着流式刷新（每 6 帧一次，别每帧重排）
-  if (($script:reasonTypingTick % 6) -eq 0) { Update-ReasoningHeader $rn }
+  # 收起态真正给人看的就这两行：步骤卡头的摘要、轮头右边的实时提示——跟着吐字一起刷
+  # （每 4 帧一次，别每帧重排）
+  if (($script:reasonTypingTick % 4) -eq 0) {
+    Update-ReasoningHeader $rn
+    if ($rn.Owner) { Update-StepHead $rn.Owner }
+    if ($script:turnProc -and -not $script:turnProc.Done) { Update-TurnProc $script:turnProc }
+  }
   # 停在底部才跟着滚（用户往上翻旧内容时别硬拉回来），也别每帧都触发一次排版
   if (($script:reasonTypingTick % 3) -eq 0) {
     if (($Scroller.VerticalOffset + $Scroller.ViewportHeight) -ge ($Scroller.ExtentHeight - 120)) { $Scroller.ScrollToEnd() }
@@ -2364,6 +2476,24 @@ function Flush-ReasonTyping($rn) {
 
 function Complete-Reasoning {
   $n = $script:reasonNode
+  if (-not $n -or $n.Done) { return }
+  # 队列里还有没吐完的字就一律交给 16ms 的泵吐完再定格（收起态也一样：卡头那行尾巴
+  # 正是靠它一点点长出来的）。已经标过 PendingEnd 也不能在这里收——assistant-end /
+  # tool-start / turn-end 会连着各调一次，早先「标过就 Finish」等于第二次调用就把剩下的字
+  # 一次性倒出来，看着还是整段。
+  if ($script:reasonQueue.Length -gt 0) {
+    if (-not $n.PendingEnd) {
+      $n | Add-Member -NotePropertyName PendingEnd -NotePropertyValue $true -Force
+      $n.Secs = ((Get-Date) - $n.T0).TotalSeconds
+    }
+    return
+  }
+  Finish-Reasoning $n
+}
+
+# 真正定格一段思考：计时、收起、把正文落到 FullText / 复制日志、步骤卡头累计。
+# 队列里还有没吐完的字时，Complete-Reasoning 会把它推迟到泵吐空再调。
+function Finish-Reasoning($n) {
   if (-not $n -or $n.Done) { return }
   Flush-ReasonTyping $n
   $n.Done = $true
@@ -2395,6 +2525,27 @@ function Complete-Reasoning {
   }
   # 只解绑"当前"，节点本身还在界面上（点标题仍能展开），toggle 用的是节点 Tag 上的那一份
   $script:reasonNode = $null
+  $script:pumpTarget = $null
+}
+
+# 后面还有东西要上屏（工具行 / 下一步 / 正文）：思考必须先吐完再走。
+# 否则队列还在慢慢吐、工具那一行已经「✓ 完成」，时序一看就是假的。
+function Settle-Reasoning {
+  $t = $script:pumpTarget
+  if (-not $t) { $t = $script:reasonNode }
+  if ($t -and -not $t.Done) { Finish-Reasoning $t }
+}
+
+# 思考吐完了，把之前压住的事件按原顺序放出来（回放期间不再二次压，避免死循环）
+function Resume-DeferredEvents {
+  if ($script:deferReplay) { return }
+  if (-not $script:deferredLines -or $script:deferredLines.Count -eq 0) { return }
+  $batch = @($script:deferredLines)
+  $script:deferredLines.Clear()
+  $script:deferReplay = $true
+  try {
+    foreach ($ln in $batch) { if ($ln -and $ln.Trim()) { Handle-Event $ln } }
+  } finally { $script:deferReplay = $false }
 }
 
 function Add-VerifyRow([string]$label, [int]$round) {
@@ -5215,6 +5366,14 @@ function Start-Turn([string]$text) {
 # ---------------------------------------------------------------- 事件处理
 function Handle-Event([string]$line) {
   try { $e = $line | ConvertFrom-Json } catch { return }
+  # 思考还在往外吐字时，后面的「工具开始 / 工具完成 / 下一步 / 结论」先压着别画：
+  # 否则界面上会出现「思考还在流、工具那一行已经 ✓ 完成」，时序一看就是假的。
+  # 等泵把这段思考吐完（Step-ReasonTyping 里），再按原顺序放出来。
+  if (-not $script:deferReplay -and $script:reasonQueue.Length -gt 0 -and $script:pumpTarget -and -not $script:pumpTarget.Done -and (@('step', 'text', 'assistant-end', 'tool-start', 'tool-end', 'turn-end') -contains [string]$e.type)) {
+    if (-not $script:deferredLines) { $script:deferredLines = New-Object System.Collections.ArrayList }
+    $script:deferredLines.Add($line) | Out-Null
+    return
+  }
   # 事件都带 session：正在跑的那一轮可能属于别的会话（切走了它还在跑）。
   # 那些事件不能画进当前聊天区（会串），但「它跑完了」要提示一下，别让人一直以为还在跑。
   $evSession = [string]$e.session
@@ -5312,33 +5471,52 @@ function Handle-Event([string]$line) {
       $Scroller.ScrollToEnd()
     }
     'step' {
+      Settle-Reasoning
       $tp = Get-TurnProc
       # 每一步开一张卡：这一步的思考、工具调用、结论都拢在这一张里，卡头能整块收放
       New-StepBlock | Out-Null
       Update-TurnProc $tp
     }
     'reasoning' {
-      Get-TurnProc | Out-Null
-      # 思考不再断开工具组：整轮共用一块，块的位置由 Add-ToolLine 挪回末尾
-      if (-not $script:reasonNode) { Add-ReasoningBlock | Out-Null }
-      Set-ThinkVerb '思考中'
-      $rn = $script:reasonNode
-      if ($rn.Caret) { $rn.Caret.Visibility = 'Visible' }
+      # 每个 delta 只做「入队 + 启泵」：一秒里要来几十上百条，早先每来一条都刷一遍
+      # 状态行（Update-ThinkRow）和轮卡，几十毫秒的 tick 里几百次属性写入，16ms 的
+      # 逐字泵根本抢不到渲染帧——要到最后 Complete-Reasoning 一次性 flush，
+      # 看着就是「啪」地出一整段。费事的动作只在「这一段思考刚开头」做一次。
+      # 上一段还在慢慢吐字、新的一段就来了：先把上一段定格（剩余字一次补上），
+      # 否则两段思考会挤在同一个队列里，字会串到新一段的正文上
+      if ($script:reasonNode -and $script:reasonNode.PendingEnd -and -not $script:reasonNode.Done) {
+        Finish-Reasoning $script:reasonNode
+      }
+      if (-not $script:reasonNode) {
+        Get-TurnProc | Out-Null
+        # 思考不再断开工具组：整轮共用一块，块的位置由 Add-ToolLine 挪回末尾
+        $rn = Add-ReasoningBlock
+        Set-ThinkVerb '思考中'
+        # 实时思考保持收起（只留一行会滚动的摘要）：摊开会把上面几条推走，
+        # 用户要的是「收缩着快速滚过去」，想看全文自己点开
+        if ($rn) { Update-ReasoningHeader $rn }
+      }
       # 不直接把 delta 塞进文本框（那样一帧里几条一叠就是“啪”地出一大段），
       # 先入队，由 16ms 的逐字泵按帧吐出来，看着才是流式的
       $script:reasonQueue.Append([string]$e.delta) | Out-Null
       Start-ReasonTyping
     }
     'text' {
-      Close-ToolGroup
-      Complete-Reasoning
-      Set-ThinkVerb '回答中'
-      if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
+      # 同一件事：正文流也是一秒几十条 delta，开段的动作（收工具组、收思考、
+      # 新建正文块）只做一次，不然每条 delta 都把开段那套重跑一遍
+      if (-not $script:currentAssistant) {
+        Close-ToolGroup
+        Settle-Reasoning
+        $script:currentAssistant = Add-AssistantMessage
+      }
+      # 状态行只在这一段里已经不是「回答中」时才换词（比方说中间插了一次工具），
+      # 换完就不再每条 delta 重刷
+      if ($script:thinkVerb -ne '回答中') { Set-ThinkVerb '回答中' }
       $script:pendingText.Append([string]$e.delta) | Out-Null
       if ($script:assistantBox) { $script:assistantBox.text = $script:pendingText.ToString() }
     }
     'assistant-end' {
-      Complete-Reasoning
+      Settle-Reasoning
       Get-TurnProc | Out-Null
       # host 只在每步开始时发 step：一步里先调工具再出结论时，结论要落回这一步的卡里，
       # 不能因为「上一步的 assistant-end」就新开一张卡，所以这里只沿用当前步骤卡
@@ -5363,8 +5541,8 @@ function Handle-Event([string]$line) {
       $script:currentAssistant = $null
     }
     'tool-start' {
+      Settle-Reasoning
       Get-TurnProc | Out-Null
-      Complete-Reasoning
       Set-ThinkVerb ('执行 ' + [string]$e.name)
       $script:currentAssistant = $null
       # 入参先存着：点开这一行才看得到（太长截一段，完整的在会话日志里）
@@ -5380,6 +5558,7 @@ function Handle-Event([string]$line) {
       $Scroller.ScrollToEnd()
     }
     'tool-end' {
+      Settle-Reasoning
       Set-ThinkVerb '思考中'
       # 结果开头一段随事件过来，点开这一行就能看（完整内容在会话日志里）
       $preview = [string]$e.preview

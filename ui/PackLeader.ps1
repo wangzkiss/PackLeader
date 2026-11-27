@@ -41,15 +41,223 @@ try { $OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 # 必须在创建任何窗口之前调用；窗口建好后再设就不生效了。
 $script:appUserModelId = 'PackLeader.Desktop'
 try {
-  if (-not ('PL.ShellNative' -as [type])) {
-    Add-Type -Namespace PL -Name ShellNative -MemberDefinition @'
-[DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern int SetCurrentProcessExplicitAppUserModelID(string id);
+  # 两处 P/Invoke 合成一次编译：Add-Type 每次都要现调一次 csc（实测约 70ms），
+  # 启动路径上少等一次。类型名不变，下面 [PL.ShellNative] / [PL.IconNative] 照旧能用。
+  if (-not ('PL.IconNative' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+namespace PL {
+  public static class ShellNative {
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern int SetCurrentProcessExplicitAppUserModelID(string id);
+  }
+  public static class IconNative {
+    [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr hIcon);
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+    [DllImport("user32.dll", EntryPoint = "SetClassLongPtr")] public static extern IntPtr SetClassLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hAfter, int x, int y, int cx, int cy, uint flags);
+  }
+
+  /// <summary>
+  /// 性能日志写入器：后台线程每 500ms 批量 append 一次。
+  /// 绝不在 UI 线程上同步写盘——那等于为了记日志反过来把界面卡住。
+  /// 队列封顶 5000 条，超了丢最旧的（宁可少记几条，也不能让内存一直涨）。
+  /// </summary>
+  public sealed class PerfWriter {
+    readonly Queue<string> q = new Queue<string>();
+    readonly object gate = new object();
+    readonly string path;
+    readonly Thread th;
+    volatile bool stopped;
+    public long Dropped;
+
+    public PerfWriter(string p) {
+      path = p;
+      th = new Thread(Loop);
+      th.IsBackground = true;
+      th.Start();
+    }
+
+    public void Write(string line) {
+      lock (gate) { if (q.Count >= 5000) { q.Dequeue(); Dropped++; } q.Enqueue(line); }
+    }
+
+    public void Flush() { Drain(); }
+
+    public void Stop() { stopped = true; Drain(); }
+
+    void Loop() {
+      while (!stopped) { Thread.Sleep(500); Drain(); }
+    }
+
+    void Drain() {
+      string[] batch;
+      lock (gate) { if (q.Count == 0) return; batch = q.ToArray(); q.Clear(); }
+      try {
+        using (FileStream fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+        using (StreamWriter sw = new StreamWriter(fs, new UTF8Encoding(false))) {
+          foreach (string s in batch) sw.WriteLine(s);
+        }
+      } catch { }
+    }
+  }
+}
 '@
   }
   $script:aumidHr = [PL.ShellNative]::SetCurrentProcessExplicitAppUserModelID($script:appUserModelId)
 } catch {
   # 设不上就退回旧行为（任务栏会显示 PowerShell 的图标），但不能因此打断启动
   $script:aumidHr = -1
+}
+
+# ---------------------------------------------------------------- 性能日志
+# 一次启动一个 run：启动器生成 run / t0 经环境变量传下来，三层（启动器 / 界面 / host）
+# 的日志靠这两个值对齐成一条时间轴。开关在 config.json 的 perf 字段（off / basic / full）。
+# 这一块自带容错：任何一步失败都只降级成「不记」，绝不挡着窗口起来。
+$script:perfMode = if ($env:PL_PERF) { [string]$env:PL_PERF } else { 'basic' }
+if (@('off', 'basic', 'full') -notcontains $script:perfMode) { $script:perfMode = 'basic' }
+$script:perfRun = [string]$env:PL_PERF_RUN
+$script:perfT0 = 0L
+if ($env:PL_PERF_T0) { [void][long]::TryParse([string]$env:PL_PERF_T0, [ref]$script:perfT0) }
+if ($script:perfT0 -le 0) { $script:perfT0 = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+$script:perf = $null
+$script:perfFile = ''
+$script:perfMark = [System.Diagnostics.Stopwatch]::StartNew()
+
+function Perf-JStr([string]$s) {
+  if ($null -eq $s) { return '""' }
+  return '"' + ($s -replace '\\', '\\\\' -replace '"', '\"' -replace "`r", '\r' -replace "`n", '\n') + '"'
+}
+
+# Perf <type> <name> [-dur <ms>] [-meta @{...}]  —— type 一般是 span / point
+function Perf([string]$type, [string]$name, $dur = $null, $meta = $null) {
+  if (-not $script:perf) { return }
+  try {
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $sb = New-Object System.Text.StringBuilder 192
+    [void]$sb.Append('{"v":1,"src":"ui","run":').Append((Perf-JStr $script:perfRun))
+    [void]$sb.Append(',"ts":').Append($now).Append(',"mono":').Append($now - $script:perfT0)
+    [void]$sb.Append(',"type":').Append((Perf-JStr $type)).Append(',"name":').Append((Perf-JStr $name))
+    if ($null -ne $dur) { [void]$sb.Append(',"dur_ms":').Append([long][Math]::Round([double]$dur)) }
+    if ($meta) {
+      foreach ($k in $meta.Keys) {
+        $v = $meta[$k]
+        [void]$sb.Append(',').Append((Perf-JStr ([string]$k))).Append(':')
+        if ($v -is [bool]) { [void]$sb.Append($(if ($v) { 'true' } else { 'false' })) }
+        elseif ($v -is [int] -or $v -is [long]) { [void]$sb.Append([string]$v) }
+        elseif ($v -is [double] -or $v -is [single] -or $v -is [decimal]) {
+          [void]$sb.Append(([double]$v).ToString('0.###', [System.Globalization.CultureInfo]::InvariantCulture))
+        } else { [void]$sb.Append((Perf-JStr ([string]$v))) }
+      }
+    }
+    [void]$sb.Append('}')
+    $script:perf.Write($sb.ToString())
+  } catch { }
+}
+
+# ---------------------------------------------------------------- 性能监测：帧率 / 心跳 / 卡顿
+# 界面「卡一下」有三种不同的原因，得分开记：
+#   心跳断档（stall）= 主线程被一段脚本占住了；
+#   帧率掉（fps）= 画得慢，但主线程是活的；
+#   队列变长（queue）= host 吐得快、界面消化不掉。
+$script:perfWatchOn = $false
+$script:perfFrames = 0
+$script:perfSec = 0L
+$script:perfFpsN = 0
+$script:perfFpsMin = 0
+$script:perfHeartLast = 0L
+$script:perfStalls = 0
+$script:perfEvtCount = 0
+$script:perfTurnT0 = $null
+# basic 档也一定要记的事件类型：一轮的开头结尾、工具调用、报错——一条就够定位一轮
+$script:perfKeyTypes = @('turn-start', 'turn-end', 'tool-start', 'tool-end', 'ready', 'error', 'question', 'approval')
+
+function Perf-Action([string]$name, $meta = $null) {
+  # 交互动作：按钮按下那一刻一条，和后面的 event / span 一对，就知道「点了多久才有反应」
+  if (-not $script:perf -or $script:perfMode -eq 'off') { return }
+  Perf 'action' $name $null $meta
+}
+
+function Perf-Stall([double]$gapMs) {
+  # 主线程断档：把当时在干什么一并记下，事后才知道是哪一段占住了
+  $script:perfStalls = ([int]$script:perfStalls) + 1
+  $meta = @{ busy = $false; q = 0; reason = 0; mode = [string]$script:perfMode }
+  try { $meta.busy = [bool]$script:busy } catch { }
+  try { if ($script:pumpOut) { $meta.q = [int]$script:pumpOut.Count } } catch { }
+  try { if ($script:reasonQueue) { $meta.reason = [int]$script:reasonQueue.Count } } catch { }
+  Perf 'stall' 'ui' $gapMs $meta
+}
+
+function Start-PerfWatch {
+  if (-not $script:perf -or $script:perfMode -eq 'off' -or $script:perfWatchOn) { return }
+  $script:perfWatchOn = $true
+  $script:perfHeartLast = [System.Diagnostics.Stopwatch]::GetTimestamp()
+  # 帧回调每帧都跑，所以它自己必须极轻：只加一个计数。重一点就先把帧率拉下来了
+  try {
+    [System.Windows.Media.CompositionTarget]::add_Rendering(
+      [System.EventHandler]{ param($s, $e) $script:perfFrames = ([int]$script:perfFrames) + 1 })
+  } catch { }
+}
+
+function Step-PerfWatch {
+  # 每个 tick（50ms）走一次：量心跳断档，顺带按秒统计帧率
+  if (-not $script:perfWatchOn) { return }
+  try {
+    $now = [System.Diagnostics.Stopwatch]::GetTimestamp()
+    $freq = [double][System.Diagnostics.Stopwatch]::Frequency
+    if ($script:perfHeartLast -gt 0) {
+      $gapMs = ($now - [long]$script:perfHeartLast) * 1000.0 / $freq
+      # tick 是 50ms 一跳；越过 200ms 说明主线程真被占住了（4 倍余量，避开误报）
+      if ($gapMs -ge 200) { Perf-Stall $gapMs }
+    }
+    $script:perfHeartLast = $now
+
+    $sec = [long][Math]::Floor($now / $freq)
+    if ($sec -ne $script:perfSec) {
+      $fps = [int]$script:perfFrames
+      if ($script:perfSec -gt 0) {
+        # 窗口不可见 / 最小化时帧率当然很低，那不是卡顿，不参与统计
+        $vis = $false
+        try { $vis = ($script:window.IsVisible -and $script:window.WindowState -ne 'Minimized') } catch { }
+        if ($vis) {
+          if ($fps -lt $script:perfFpsMin -or $script:perfFpsMin -le 0) { $script:perfFpsMin = $fps }
+          $script:perfFpsN = ([int]$script:perfFpsN) + 1
+          if ($script:perfMode -eq 'full') {
+            Perf 'fps' 'ui' $null @{ fps = $fps; stalls = [int]$script:perfStalls; n = 1 }
+          } elseif (($script:perfFpsN % 10) -eq 0) {
+            # basic 档每 10 秒一条：这一段里最低的那一秒 + 累计卡顿次数
+            Perf 'fps' 'ui' $null @{ fps = [int]$script:perfFpsMin; n = 10; stalls = [int]$script:perfStalls }
+            $script:perfFpsMin = 0
+          }
+        }
+      }
+      $script:perfSec = $sec
+      $script:perfFrames = 0
+    }
+  } catch { }
+}
+
+if ($script:perfMode -ne 'off') {
+  try {
+    $perfBase = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { $env:TEMP }
+    $perfDir = Join-Path (Join-Path $perfBase 'PackLeader') 'perf'
+    New-Item -ItemType Directory -Force -Path $perfDir | Out-Null
+    $script:perfFile = Join-Path $perfDir ('ui-' + (Get-Date -Format 'yyyyMMdd') + '.jsonl')
+    $script:perf = New-Object -TypeName PL.PerfWriter -ArgumentList $script:perfFile
+    # 脚本首行时 PowerShell 进程已经跑了多久：进程创建 → 跑起第一条脚本。这段在这之前没有任何埋点，
+    # 慢的时候 pl perf 只能显示「到窗口 4.47s」而各段加起来才 400ms
+    $psElapsed = 0L
+    try {
+      $psStartMs = ([DateTimeOffset]([Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime())).ToUnixTimeMilliseconds()
+      $psElapsed = [long]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $psStartMs)
+    } catch { $psElapsed = 0L }
+    Perf 'start' 'ui' $null @{ pid = $PID; mode = $script:perfMode; ps = $PSVersionTable.PSVersion.ToString(); ps_ms = [long]$psElapsed }
+  } catch { $script:perf = $null }
 }
 
 $script:guiLog = Join-Path $env:TEMP 'packleader-ui.log'
@@ -59,7 +267,7 @@ $script:boot = {
   try { [System.IO.File]::AppendAllText($script:guiLog, ("{0:HH:mm:ss.fff} {1}`r`n" -f (Get-Date), $m), (New-Object System.Text.UTF8Encoding $false)) } catch { }
 }
 [System.IO.File]::WriteAllText($script:guiLog, "", (New-Object System.Text.UTF8Encoding $false))
-& $script:boot "boot ps=$($PSVersionTable.PSVersion) aumid=$($script:appUserModelId) hr=$($script:aumidHr)"
+& $script:boot ("boot ps=$($PSVersionTable.PSVersion) aumid=$($script:appUserModelId) hr=$($script:aumidHr) psStart=$([Diagnostics.Process]::GetCurrentProcess().StartTime.ToString('HH:mm:ss.fff'))")
 function Log([string]$m) { & $script:boot $m }
 trap { if ($script:boot) { & $script:boot ("异常: " + ($_ | Out-String)) } else { try { [System.IO.File]::AppendAllText((Join-Path $env:TEMP 'packleader-ui.log'), ("early: " + ($_ | Out-String)), (New-Object System.Text.UTF8Encoding $false)) } catch { } }; throw }
 
@@ -75,7 +283,11 @@ $root = $env:PL_GUI_ROOT
 if (-not $root) { $root = Split-Path -Parent $here }
 $hostTs = Join-Path $root 'src\host.ts'
 
+Log '载 WPF 程序集'
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml, System.Windows.Forms
+Log '程序集就绪'
+Perf 'span' 'wpf-assemblies' $script:perfMark.ElapsedMilliseconds
+$script:perfMark.Restart()
 
 # ---------------------------------------------------------------- 界面
 $xaml = @'
@@ -505,6 +717,8 @@ $xaml = @'
 
 $window = [Windows.Markup.XamlReader]::Parse($xaml)
 Log 'XAML 解析成功'
+Perf 'span' 'xaml-parse' $script:perfMark.ElapsedMilliseconds
+$script:perfMark.Restart()
 # 图标：默认是 powershell.exe 的白蓝图标，换成左栏那个 P 徽标。
 # 坑：WPF 的 Window.Icon 只吃「一张图」，系统需要 16/20/24/32px 时自己去缩这张图，
 # 缩出来的 16px 就是一个白团——任务栏上看到的就是那团白。
@@ -512,14 +726,7 @@ Log 'XAML 解析成功'
 # 再用 WM_SETICON 把小图标（标题栏/任务栏）和大图标（Alt+Tab）分别交给窗口。
 $script:iconHandles = @()
 try {
-  Add-Type -Namespace PL -Name IconNative -MemberDefinition @'
-[DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
-[DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr hIcon);
-[DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
-[DllImport("user32.dll", EntryPoint = "SetClassLongPtr")] public static extern IntPtr SetClassLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
-[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hAfter, int x, int y, int cx, int cy, uint flags);
-'@
-
+  # PL.IconNative 已在上面和 ShellNative 一次编译好，这里不再调 csc
   # 画一张 $Size×$Size 的 P 徽标（和 scripts/make-icon.ps1 同一套比例）
   function New-LogoBitmap([int]$Size) {
     $visual = New-Object System.Windows.Media.DrawingVisual
@@ -4530,6 +4737,18 @@ if ($Demo) {
   }
 }
 
+# ---------- host 启动（挪到窗口显示之后，见 Add_Loaded） ----------
+# 实测这一段要 ~300ms（node 冷启动 + LinePump 现编译）。放在 ShowDialog 之前，
+# 就是「双击后先干等 0.3 秒」。窗口先出来，host 在 Loaded 里补上；这期间发的消息先排队。
+$script:proc = $null
+$script:pumpOut = $null
+$script:pumpErr = $null
+$script:hostQueue = New-Object System.Collections.ArrayList
+$script:hostStarted = $false
+function Start-Host {
+  # 演示模式：只回放脚本，永不起 host（原来这段 spawn 被 if (-not $Demo) 包着）
+  if ($Demo) { $script:hostQueue.Clear(); return }
+  $script:hostT0 = [System.Diagnostics.Stopwatch]::StartNew()
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $node = (Get-Command node -ErrorAction SilentlyContinue).Source
 if (-not $node) { $node = 'node.exe' }
@@ -4542,6 +4761,12 @@ $psi.RedirectStandardError = $true
 $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
 $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
 $psi.WorkingDirectory = $root
+# 性能日志：同一个 run 继续往下传，host 写自己那份，按 mono 能拼成一条时间轴
+if ($script:perfMode -ne 'off') {
+  $psi.EnvironmentVariables['PL_PERF'] = [string]$script:perfMode
+  if ($script:perfRun) { $psi.EnvironmentVariables['PL_PERF_RUN'] = [string]$script:perfRun }
+  if ($script:perfT0 -gt 0) { $psi.EnvironmentVariables['PL_PERF_T0'] = [string]$script:perfT0 }
+}
 $hostArgs = @('--disable-warning=ExperimentalWarning', $hostTs, '--cwd', $Cwd, '--mode', $Mode, '--data-dir', $DataDir,
               '--base-url', $BaseUrl, '--model', $Model)
 if ($ApiKey) { $hostArgs += @('--api-key', $ApiKey) }
@@ -4551,11 +4776,11 @@ $psi.Arguments = ($hostArgs | ForEach-Object {
   if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
 }) -join ' '
 
-$proc = $null
-if (-not $Demo) {
-  $proc = [System.Diagnostics.Process]::Start($psi)
-  Log "host 已启动 pid=$($proc.Id)"
-}
+if ($script:hostStarted) { return }
+$script:hostStarted = $true
+$script:proc = [System.Diagnostics.Process]::Start($psi)
+Log "host 已启动 pid=$($script:proc.Id)"
+Perf 'span' 'host-spawn' $script:hostT0.ElapsedMilliseconds @{ pid = $script:proc.Id }
 
 # 深色标题栏：WPF 自己的 chrome 是白色的，只能调 DWM
 Add-Type -Namespace PL -Name Dwm -MemberDefinition @'
@@ -4608,29 +4833,40 @@ public class LinePump
     }
 
     public bool Finished { get { lock (gate) { return done && q.Count == 0; } } }
+
+    /// <summary>还排着没取走的行数——界面卡时它会变长，是「渲染跟不上」的直接证据</summary>
+    public int Count { get { lock (gate) { return q.Count; } } }
 }
 '@ -Language CSharp
 
-$pumpOut = $null
-$pumpErr = $null
-if ($proc) {
-  $pumpOut = New-Object LinePump -ArgumentList $proc.StandardOutput
-  $pumpOut.Start()
-  $pumpErr = New-Object LinePump -ArgumentList $proc.StandardError
-  $pumpErr.Start()
-  Log '输出泵已启动'
+  if ($script:proc) {
+    $script:pumpOut = New-Object LinePump -ArgumentList $script:proc.StandardOutput
+    $script:pumpOut.Start()
+    $script:pumpErr = New-Object LinePump -ArgumentList $script:proc.StandardError
+    $script:pumpErr.Start()
+    Log '输出泵已启动'
+    Perf 'span' 'host-pump' $script:hostT0.ElapsedMilliseconds
+  }
+  # 窗口先出来后用户手快发的消息，host 一起来就补发（不然会静默丢掉）
+  if ($script:hostQueue.Count -gt 0) {
+    $pending = @($script:hostQueue)
+    $script:hostQueue.Clear()
+    foreach ($o in $pending) { Send-Host $o }
+  }
 }
 
 function Send-Host($obj) {
-  if (-not $proc) { return }
+  # host 未就绪（窗口先显示、它在 Loaded 里才起）：先排队，起来后补发，不能静默丢
+  if ($Demo) { return }
+  if (-not $script:proc) { [void]$script:hostQueue.Add($obj); return }
   try {
     $line = ($obj | ConvertTo-Json -Compress -Depth 6)
     # 必须走 BaseStream 自己写 UTF-8 字节：.NET Framework 4.8 的 StandardInput 是
     # 按 Console.InputEncoding（中文系统是 GBK）编码的，中文提示词写到子进程就变乱码了。
     # 4.8 也没有 StandardInputEncoding 这个属性（.NET Core 才有）。
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($line + "`n")
-    $proc.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
-    $proc.StandardInput.BaseStream.Flush()
+    $script:proc.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+    $script:proc.StandardInput.BaseStream.Flush()
   } catch {
     Log ("写入 host 失败: " + ($_ | Out-String))
   }
@@ -5580,6 +5816,11 @@ function Set-Busy([bool]$on) {
 function Start-Turn([string]$text) {
   $files = @($script:attachFiles)
   if (-not $text.Trim() -and $files.Count -eq 0) { return }
+  # 端到端计时的起点：按下发送（或回车）那一刻，到第一段看得见的输出为止
+  if ($script:perf) {
+    $script:perfTurnT0 = [System.Diagnostics.Stopwatch]::StartNew()
+    Perf 'action' 'send' @{ chars = $text.Length; files = $files.Count }
+  }
   # 输入历史：连续重复的不重复记，指针归到末尾
   $trimmed = $text.Trim()
   if ($trimmed -and ($script:history.Count -eq 0 -or [string]$script:history[$script:history.Count - 1] -ne $trimmed)) {
@@ -5615,6 +5856,31 @@ function Start-Turn([string]$text) {
 
 # ---------------------------------------------------------------- 事件处理
 function Handle-Event([string]$line) {
+  # 计时包壳：只量「这一条事件画了多久」，行为一点不改（原实现整体挪到 Handle-Event-Core）
+  if (-not $script:perf) { Handle-Event-Core $line; return }
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  try {
+    Handle-Event-Core $line
+  } finally {
+    $sw.Stop()
+    try {
+      $ms = $sw.Elapsed.TotalMilliseconds
+      $t = 'other'
+      if ($line -match '"type"\s*:\s*"([A-Za-z-]+)"') { $t = $matches[1] }
+      $script:perfEvtCount = ([int]$script:perfEvtCount) + 1
+      if ($ms -ge 8 -or $script:perfMode -eq 'full' -or ($script:perfKeyTypes -contains $t)) {
+        Perf 'event' $t $ms @{ size = $line.Length }
+      }
+      # 端到端：从按下发送到第一段看得见的输出（思考 / 正文 / 工具行）
+      if ($script:perfTurnT0 -and (@('reasoning', 'text', 'tool-start') -contains $t)) {
+        Perf 'span' 'e2e-first-output' $script:perfTurnT0.Elapsed.TotalMilliseconds @{ first = $t }
+        $script:perfTurnT0 = $null
+      }
+    } catch { }
+  }
+}
+
+function Handle-Event-Core([string]$line) {
   try { $e = $line | ConvertFrom-Json } catch { return }
   # 思考还在往外吐字时，后面的「工具开始 / 工具完成 / 下一步 / 结论」先压着别画：
   # 否则界面上会出现「思考还在流、工具那一行已经 ✓ 完成」，时序一看就是假的。
@@ -5994,6 +6260,7 @@ function Handle-Event([string]$line) {
 $SendBtn.Add_Click({ Start-Turn $InputBox.Text })
 $StopBtn.Add_Click({
   if (-not $script:busy) { return }
+  Perf-Action 'stop'
   # 点过一次就灰掉：连点只会多几行「已中断当前轮」，不会更快
   $StopBtn.IsEnabled = $false
   $StopBtn.Content = '正在中断…'
@@ -6013,7 +6280,7 @@ $StopBtn.Add_Click({
 })
 
 # 设置面板
-$SettingsBtn.Add_Click({ Open-Settings })
+$SettingsBtn.Add_Click({ Perf-Action 'open-settings'; Open-Settings })
 
 # 打开日志目录：资源管理器直接定位过去，方便复杂任务卡住时按日志复盘
 $CfgOpenLogs.Add_Click({
@@ -6101,6 +6368,7 @@ $window.Add_PreviewKeyDown({
 })
 
 $NewChatBtn.Add_Click({
+  Perf-Action 'new-chat'
   Send-Host @{ cmd = 'new-session' }
   Clear-Transcript
   Add-EmptyState
@@ -6110,11 +6378,13 @@ $NewChatBtn.Add_Click({
 # 权限胶囊：点一下向上弹出三档菜单
 $ModePill.Add_Click({
   param($s, $e)
+  Perf-Action 'mode-pill'
   if ($script:modePopup -and $script:modePopup.IsOpen) { $script:modePopup.IsOpen = $false; $script:modePopup = $null }
   else { Show-ModeMenu }
 })
 
 $PickFolderBtn.Add_Click({
+  Perf-Action 'pick-folder'
   $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
   $dlg.Description = '选择工作目录'
   $dlg.SelectedPath = $(if ($script:cwdPath) { $script:cwdPath } else { $env:USERPROFILE })
@@ -6131,6 +6401,8 @@ $script:tickCount = 0
 $timer.Add_Tick({
   try {
     if (-not $script:tickSeen) { $script:tickSeen = $true; Log 'Tick 首次触发' }
+    # 主线程心跳：量这一次心跳和上一次隔了多久，断档了就记一笔
+    Step-PerfWatch
     # 启动器（PackLeader.exe）没了就自己退出：覆盖安装时它会被安装器关掉，
     # 不跟着退就会留下孤儿窗口，看起来像"装了两个"。
     $script:tickCount++
@@ -6152,6 +6424,13 @@ $timer.Add_Tick({
         if ($null -eq $l) { break }
         if ($l.Trim()) { Log ("stderr: " + $l) }
       }
+    }
+    # 输出泵队列：剩得越多说明界面越消化不掉（host 吐得快或渲染被占住）
+    if ($pumpOut) {
+      $qd = 0
+      try { $qd = $pumpOut.Count } catch { }
+      if ($qd -ge 5 -and $script:perfMode -eq 'full') { Perf 'queue' 'out' $qd }
+      elseif ($qd -ge 20) { Perf 'queue' 'out' $qd @{ mode = [string]$script:perfMode } }
     }
     # 演示模式：每 200ms 喂一条，顺序和真跑一轮一样；开演前先把空态清掉
     if ($script:demoLines.Count -gt 0 -and $script:demoIdx -lt $script:demoLines.Count) {
@@ -6369,6 +6648,10 @@ function Restore-SideWidth {
 
 $window.Add_Loaded({
   Log '窗口 Loaded'
+  Perf 'span' 'first-frame' $script:perfShowT0.ElapsedMilliseconds
+  $script:perfMark.Restart()
+  # host 放到窗口画完之后再起：省掉首帧前那 ~300ms，界面先出来
+  Start-Host
   # 深色标题栏：WPF 默认给的是白色系统 chrome，和深色底不搭。
   # DWMWA_USE_IMMERSIVE_DARK_MODE = 20（Win10 2004+），更早的版本用 19。
   try {
@@ -6384,6 +6667,9 @@ $window.Add_Loaded({
   Restore-SideWidth
   # 列表建好、布局落定后再量一次：标题宽度决定左栏能拉到多宽
   try { $window.Dispatcher.Invoke([action]{ Update-SideFit }, [System.Windows.Threading.DispatcherPriority]::Background) } catch { }
+  # 性能监测从这里开始：帧率 / 心跳 / 卡顿（窗口已可见，之前的不算数）
+  Start-PerfWatch
+  Perf 'point' 'ui-ready'
   $timer.Start()
   $InputBox.Focus() | Out-Null
   # 自测入口：设置 PL_GUI_TASK 会自动发第一条任务（也方便截图验证）
@@ -6408,6 +6694,7 @@ $window.Add_SizeChanged({
 
 $window.Add_Closing({
   Log '窗口 Closing'
+  Perf 'point' 'closing' @{ stalls = [int]$script:perfStalls; events = [int]$script:perfEvtCount }
   try { Save-SideWidth } catch { }
 
   $timer.Stop()
@@ -6416,6 +6703,11 @@ $window.Add_Closing({
   try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
 })
 
+Perf 'point' 'show-dialog'
+$script:perfShowT0 = [System.Diagnostics.Stopwatch]::StartNew()
 Log '准备 ShowDialog'
 $window.ShowDialog() | Out-Null
 Log '窗口已关闭'
+# 退出汇总：一辈子一条，pl perf 报表直接读它最省事
+Perf 'summary' 'exit' @{ uptime_ms = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $script:perfT0); dropped = $(if ($script:perf) { $script:perf.Dropped } else { 0 }) }
+if ($script:perf) { try { $script:perf.Stop() } catch { } }

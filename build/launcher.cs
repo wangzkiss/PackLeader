@@ -4,8 +4,11 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using System.Windows.Forms;
 
 static class Program
@@ -26,7 +29,12 @@ static class Program
             pass.Add(a);
         }
 
+        PerfInit();
+        if (!cli) ShowSplash();
+        PerfWrite("span", "splash", PerfClock.Elapsed.TotalMilliseconds, null);
+        double mark = PerfClock.Elapsed.TotalMilliseconds;
         string node = FindNode(appDir);
+        PerfWrite("span", "find-node", PerfClock.Elapsed.TotalMilliseconds - mark, null);
         if (node == null)
         {
             string msg = "找不到 Node.js（需要 " + MinVersion + " 或更新版本）。\r\n\r\n"
@@ -34,6 +42,7 @@ static class Program
                 + "所以安装包只有几百 KB，而不是把 150 MB 的运行时打包进来。\r\n\r\n"
                 + "装好 Node 后重新双击即可：https://nodejs.org/";
             if (cli) { Console.Error.WriteLine(msg); return 2; }
+            CloseSplash();
             MessageBox.Show(msg, "PackLeader", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return 2;
         }
@@ -43,16 +52,20 @@ static class Program
         {
             string msg = "安装不完整：找不到\r\n" + entry + "\r\n\r\n请重新运行安装包。";
             if (cli) { Console.Error.WriteLine(msg); return 3; }
+            CloseSplash();
             MessageBox.Show(msg, "PackLeader", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 3;
         }
 
+        mark = PerfClock.Elapsed.TotalMilliseconds;
         string version = NodeVersion(node);
+        PerfWrite("span", "node-version", PerfClock.Elapsed.TotalMilliseconds - mark, "\"version\":" + PerfStr(version));
         if (version != null && !VersionOk(version))
         {
             string msg = "Node 版本太低：找到 " + version + "，PackLeader 需要 " + MinVersion + " 或更新版本。\r\n\r\n"
                 + "（Node 22.18 起才原生支持直接运行 TypeScript，装新版即可：https://nodejs.org/）";
             if (cli) { Console.Error.WriteLine(msg); return 4; }
+            CloseSplash();
             MessageBox.Show(msg, "PackLeader", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return 4;
         }
@@ -95,16 +108,183 @@ static class Program
         string log = Path.Combine(Path.GetTempPath(), "packleader-launcher.log");
         try { if (File.Exists(log) && new FileInfo(log).Length > 2 * 1024 * 1024) File.Delete(log); } catch { }
 
+        // 主窗口一露头就把启动提示撤掉（最多等 30 秒，防止永远挂着）
+        WatchForWindow();
+        mark = PerfClock.Elapsed.TotalMilliseconds;
         using (Process p = Process.Start(psi))
         {
+            PerfWrite("span", "node-launch", PerfClock.Elapsed.TotalMilliseconds - mark, "\"node\":" + PerfStr(node));
             p.OutputDataReceived += delegate(object s, DataReceivedEventArgs e) { Append(log, e.Data); };
             p.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e) { Append(log, e.Data); };
             p.BeginOutputReadLine();
             p.BeginErrorReadLine();
             p.WaitForExit();
             p.WaitForExit();
+            PerfWrite("span", "launcher-total", PerfClock.Elapsed.TotalMilliseconds, null);
             return p.ExitCode;
         }
+    }
+
+    // ---------------- 启动提示（splash） ----------------
+    // 双击之后到窗口出现要 0.6~1.5 秒（冷机、杀软扫描时更久），中间什么也不显示，
+    // 用户感受就是「卡住了」。这里立刻弹一个极小的无边框条，主窗口露头即撤。
+    static Form splash;
+    static readonly object splashGate = new object();
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+
+    static void ShowSplash()
+    {
+        try
+        {
+            Thread t = new Thread(delegate()
+            {
+                try
+                {
+                    lock (splashGate) { splash = new SplashForm(); }
+                    Application.Run(splash);
+                }
+                catch { }
+            });
+            t.IsBackground = true;
+            t.SetApartmentState(ApartmentState.STA);
+            t.Start();
+        }
+        catch { }
+    }
+
+    static void WatchForWindow()
+    {
+        try
+        {
+            Thread t = new Thread(delegate()
+            {
+                try
+                {
+                    Stopwatch sw = Stopwatch.StartNew();
+                    bool found = false;
+                    while (sw.ElapsedMilliseconds < 30000)
+                    {
+                        if (FindWindow(null, "PackLeader") != IntPtr.Zero) { found = true; break; }
+                        Thread.Sleep(30);
+                    }
+                    // 这是「双击到看得见窗口」最准的一个数（比界面里的 Loaded 打点更贴近用户感知）
+                    PerfWrite("point", "main-window-found", PerfClock.Elapsed.TotalMilliseconds, found ? null : "\"timeout\":true");
+                    // 让主窗口先画完一帧再撤，不然两个窗口会闪一下
+                    Thread.Sleep(150);
+                }
+                catch { }
+                CloseSplash();
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+        catch { }
+    }
+
+    static void CloseSplash()
+    {
+        try
+        {
+            Form f;
+            lock (splashGate) { f = splash; }
+            if (f != null && f.IsHandleCreated) f.BeginInvoke(new Action(f.Close));
+        }
+        catch { }
+    }
+
+    sealed class SplashForm : Form
+    {
+        // 不抢焦点：用户双击后可能还在别的窗口里打字
+        protected override bool ShowWithoutActivation { get { return true; } }
+
+        public SplashForm()
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.CenterScreen;
+            ClientSize = new Size(300, 62);
+            BackColor = Color.FromArgb(15, 17, 21);
+            ShowInTaskbar = false;
+            TopMost = true;
+            DoubleBuffered = true;
+            Label l = new Label();
+            l.Text = "PackLeader 正在启动…";
+            l.ForeColor = Color.FromArgb(249, 250, 251);
+            l.Dock = DockStyle.Fill;
+            l.TextAlign = ContentAlignment.MiddleCenter;
+            l.Font = new Font("Microsoft YaHei UI", 10.5f);
+            Controls.Add(l);
+            Paint += delegate(object s, PaintEventArgs e)
+            {
+                using (Pen p = new Pen(Color.FromArgb(70, 43, 92, 255)))
+                {
+                    e.Graphics.DrawRectangle(p, 0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
+                }
+            };
+        }
+    }
+
+    // ---------------- 性能日志 ----------------
+    // 启动链每一段记一条（exe → splash → node → PS → 主窗口），落
+    // %LOCALAPPDATA%\PackLeader\perf\launcher-YYYYMMDD.jsonl。只写几行，同步写无所谓；
+    // node 与界面进程各自写自己的文件，分析时按 ts / mono 合并。
+    static readonly Stopwatch PerfClock = Stopwatch.StartNew();
+    static string perfFile;
+    static string perfRun = "";
+    static long perfT0;
+
+    static void PerfInit()
+    {
+        try
+        {
+            string mode = Environment.GetEnvironmentVariable("PL_PERF");
+            if (string.Equals(mode, "off", StringComparison.OrdinalIgnoreCase)) return;
+            perfRun = Environment.GetEnvironmentVariable("PL_PERF_RUN");
+            if (string.IsNullOrEmpty(perfRun))
+            {
+                perfRun = "r-" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString("x") + "-" + Guid.NewGuid().ToString("N").Substring(0, 4);
+            }
+            long t0;
+            if (!long.TryParse(Environment.GetEnvironmentVariable("PL_PERF_T0"), out t0) || t0 <= 0)
+            {
+                t0 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            }
+            perfT0 = t0;
+            // 往下传：node（cli.ts）→ 界面 / host 进程都靠这两个值拼同一条时间轴
+            Environment.SetEnvironmentVariable("PL_PERF_RUN", perfRun);
+            Environment.SetEnvironmentVariable("PL_PERF_T0", perfT0.ToString());
+            string dir = Path.Combine(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PackLeader"), "perf");
+            Directory.CreateDirectory(dir);
+            perfFile = Path.Combine(dir, "launcher-" + DateTime.Now.ToString("yyyyMMdd") + ".jsonl");
+            PerfWrite("start", "exe", null, "\"pid\":" + Process.GetCurrentProcess().Id + ",\"os\":" + PerfStr(Environment.OSVersion.VersionString));
+        }
+        catch { }
+    }
+
+    static void PerfWrite(string type, string name, double? durMs, string extra)
+    {
+        if (perfFile == null) return;
+        try
+        {
+            StringBuilder sb = new StringBuilder(192);
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            sb.Append("{\"v\":1,\"src\":\"launcher\",\"run\":").Append(PerfStr(perfRun));
+            sb.Append(",\"ts\":").Append(now).Append(",\"mono\":").Append(now - perfT0);
+            sb.Append(",\"type\":").Append(PerfStr(type)).Append(",\"name\":").Append(PerfStr(name));
+            if (durMs.HasValue) sb.Append(",\"dur_ms\":").Append((long)Math.Round(durMs.Value));
+            if (!string.IsNullOrEmpty(extra)) sb.Append(',').Append(extra);
+            sb.Append('}');
+            // 不带 BOM：带 BOM 的话首行不是 '{'，分析时会当成坏行跳过
+            File.AppendAllText(perfFile, sb.ToString() + "\r\n", new UTF8Encoding(false));
+        }
+        catch { }
+    }
+
+    static string PerfStr(string s)
+    {
+        if (s == null) return "\"\"";
+        return "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", "\\r").Replace("\n", "\\n") + "\"";
     }
 
     static string DefaultWorkspace()
@@ -135,6 +315,36 @@ static class Program
     }
 
     static string NodeVersion(string node)
+    {
+        // 每次启动都为一个 `node -v` 起子进程（冷机 100~800ms，杀软在扫的时候更久），
+        // 而版本几乎不会变：按「node.exe 路径 + 修改时间」缓存起来，只在换过 node 时才重新问。
+        string cache = Path.Combine(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PackLeader"), "node-version.txt");
+        string stamp = node + "|" + SafeStamp(node);
+        try
+        {
+            if (File.Exists(cache))
+            {
+                string[] lines = File.ReadAllLines(cache);
+                if (lines.Length >= 2 && lines[0] == stamp) return lines[1].Length == 0 ? null : lines[1];
+            }
+        }
+        catch { }
+        string v = RunNodeVersion(node);
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(cache));
+            File.WriteAllLines(cache, new string[] { stamp, v == null ? "" : v });
+        }
+        catch { }
+        return v;
+    }
+
+    static string SafeStamp(string path)
+    {
+        try { return new FileInfo(path).LastWriteTimeUtc.Ticks.ToString(); } catch { return "0"; }
+    }
+
+    static string RunNodeVersion(string node)
     {
         try
         {

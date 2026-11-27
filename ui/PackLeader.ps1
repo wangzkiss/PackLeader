@@ -293,11 +293,22 @@ $script:perfMark.Restart()
 $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
         Title="PackLeader" Height="720" Width="1120" MinHeight="520" MinWidth="860"
         WindowStartupLocation="CenterScreen"
+        WindowStyle="None" ResizeMode="CanResize"
         Background="#0F1115" FontFamily="Segoe UI" FontSize="13"
         UseLayoutRounding="True" SnapsToDevicePixels="True"
         TextOptions.TextFormattingMode="Ideal">
+  <!-- 自绘标题栏：标题栏原来是系统画的（只有 PackLeader 名字和 - □ ×），
+       会话标题和设置只能另占一行。WindowStyle=None + WindowChrome 把非客户区收进客户区，
+       于是标题、设置、窗口按钮都能自己排；CaptionHeight=40 表示顶部 40px 仍由系统当
+       标题栏处理（拖动 / 双击最大化 / 右键系统菜单都不用手写）。
+       ResizeBorderThickness=6 留出四边的拉伸手柄。 -->
+  <shell:WindowChrome.WindowChrome>
+    <shell:WindowChrome CaptionHeight="40" ResizeBorderThickness="6" GlassFrameThickness="0"
+                        CornerRadius="0" UseAeroCaptionButtons="False"/>
+  </shell:WindowChrome.WindowChrome>
   <Window.Resources>
     <!-- 默认焦点虚线框在深色底上很跳，去掉 -->
     <Style TargetType="Button">
@@ -357,6 +368,11 @@ $xaml = @'
     </Style>
   </Window.Resources>
   <Grid x:Name="RootGrid">
+    <Grid.RowDefinitions>
+      <!-- 行 0 = 自绘标题栏（会话标题 / 设置 / 窗口按钮都在这条上）；行 1 = 原来的三列主界面 -->
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+    </Grid.RowDefinitions>
     <Grid.ColumnDefinitions>
       <!-- 列 0 = 左侧栏（宽度可拖）；列 1 = 分隔条；列 2 = 右侧对话区 -->
       <!-- 起始宽度给到 MinWidth，真实宽度由 Loaded 里的 Restore-SideWidth 决定。
@@ -366,8 +382,50 @@ $xaml = @'
       <ColumnDefinition Width="*" MinWidth="420"/>
     </Grid.ColumnDefinitions>
 
+    <!-- ================= 标题栏（自绘） ================= -->
+    <!-- 三种角色挤在一条 40px 里：左边是原来系统画的那份（logo + 名字），中间会话标题，
+         右边设置齿轮 + 最小化/最大化/关闭。条上的控件必须写 IsHitTestVisibleInChrome，
+         否则点击会被系统当成拖标题栏。
+         标题 MaxWidth 之外还留了左右 Margin：窗口窄时它先收、不会顶到两边的按钮。 -->
+    <Border Grid.Row="0" Grid.ColumnSpan="3" Height="40" Background="#0F1115"
+            BorderBrush="#12FFFFFF" BorderThickness="0,0,0,1">
+      <Grid>
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Center"
+                    Margin="14,0,0,0" IsHitTestVisible="False">
+          <Image x:Name="TitleLogo" Width="16" Height="16" Margin="0,0,8,0"
+                 RenderOptions.BitmapScalingMode="HighQuality"/>
+          <TextBlock Text="PackLeader" Foreground="#8A9099" FontSize="11.5" VerticalAlignment="Center"/>
+        </StackPanel>
+        <TextBlock x:Name="TitleText" Text="新对话" Foreground="#E6E8EE" FontSize="12.5"
+                   HorizontalAlignment="Center" VerticalAlignment="Center"
+                   TextTrimming="CharacterEllipsis" MaxWidth="420" Margin="132,0"/>
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Stretch">
+          <Button x:Name="SettingsBtn" shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                  Content="&#xE713;" Width="32" Height="24" Padding="0" Margin="0,0,8,0" Cursor="Hand"
+                  FontSize="12.5" FontFamily="Segoe MDL2 Assets" VerticalAlignment="Center"
+                  Background="Transparent" Foreground="#8A9099" BorderThickness="0"
+                  ToolTip="设置（模型端点 / API Key / 外观）"/>
+          <Button x:Name="MinBtn" shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                  Content="&#xE921;" Width="44" Padding="0" Cursor="Hand"
+                  FontSize="10" FontFamily="Segoe MDL2 Assets"
+                  Background="Transparent" Foreground="#C9CDD4" BorderThickness="0"
+                  ToolTip="最小化"/>
+          <Button x:Name="MaxBtn" shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                  Content="&#xE922;" Width="44" Padding="0" Cursor="Hand"
+                  FontSize="10" FontFamily="Segoe MDL2 Assets"
+                  Background="Transparent" Foreground="#C9CDD4" BorderThickness="0"
+                  ToolTip="最大化（双击标题栏也行）"/>
+          <Button x:Name="CloseBtn" shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                  Content="&#xE8BB;" Width="46" Padding="0" Cursor="Hand"
+                  FontSize="10" FontFamily="Segoe MDL2 Assets"
+                  Background="Transparent" Foreground="#C9CDD4" BorderThickness="0"
+                  ToolTip="关闭"/>
+        </StackPanel>
+      </Grid>
+    </Border>
+
     <!-- ================= 左侧栏 ================= -->
-    <Border Grid.Column="0" Background="#0B0D11">
+    <Border Grid.Row="1" Grid.Column="0" Background="#0B0D11">
       <Grid>
         <Grid.RowDefinitions>
           <RowDefinition Height="Auto"/>
@@ -412,7 +470,7 @@ $xaml = @'
     </Border>
 
     <!-- ================= 右侧 ================= -->
-    <GridSplitter x:Name="SideSplitter" Grid.Column="1" Width="6" HorizontalAlignment="Stretch"
+    <GridSplitter x:Name="SideSplitter" Grid.Row="1" Grid.Column="1" Width="6" HorizontalAlignment="Stretch"
                   VerticalAlignment="Stretch" ResizeBehavior="PreviousAndNext" ResizeDirection="Columns"
                   ShowsPreview="False" Background="Transparent" Cursor="SizeWE"
                   ToolTip="拖动调整左右宽度（双击复位）">
@@ -433,31 +491,16 @@ $xaml = @'
       </GridSplitter.Template>
     </GridSplitter>
 
-    <Grid Grid.Column="2">
+    <Grid Grid.Row="1" Grid.Column="2">
       <Grid.RowDefinitions>
-        <RowDefinition Height="Auto"/>
         <RowDefinition Height="*"/>
         <!-- 读秒条：坐在输入框正上方、会话区之外（空闲时整行高度为 0） -->
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
       </Grid.RowDefinitions>
 
-      <!-- 顶栏：标题居中、设置贴右——两样都放同一个单元格各自对齐，
-           这样标题是「相对整个内容区」居中的；拆成三列时两侧列宽不等会把标题推偏。 -->
-      <Border Grid.Row="0" BorderBrush="#12FFFFFF" BorderThickness="0,0,0,1" Padding="24,0" Height="48">
-        <Grid>
-          <TextBlock x:Name="TitleText" Text="新对话" Foreground="#F9FAFB" FontSize="16"
-                     FontWeight="SemiBold" HorizontalAlignment="Center" VerticalAlignment="Center"
-                     TextTrimming="CharacterEllipsis" MaxWidth="520" Margin="72,0"/>
-          <Button x:Name="SettingsBtn" Content="设置" Height="24" Padding="8,0" Cursor="Hand"
-                  FontSize="11" Background="Transparent" Foreground="#7C838E" BorderBrush="#1FFFFFFF"
-                  BorderThickness="1" HorizontalAlignment="Right" VerticalAlignment="Center"
-                  ToolTip="填写模型端点地址和 API Key"/>
-        </Grid>
-      </Border>
-
       <!-- 读秒条：这一轮在跑时贴在输入框上方显示「思考中 · 用时 12 秒」，空闲时收起（整行高度归零） -->
-      <Border Grid.Row="2" x:Name="ThinkRow" Visibility="Collapsed" HorizontalAlignment="Left"
+      <Border Grid.Row="1" x:Name="ThinkRow" Visibility="Collapsed" HorizontalAlignment="Left"
               Margin="24,0,24,8" Background="#141821" BorderBrush="#1FFFFFFF" BorderThickness="1"
               CornerRadius="6" Padding="8,3">
         <StackPanel Orientation="Horizontal">
@@ -468,7 +511,7 @@ $xaml = @'
       </Border>
 
       <!-- 会话内容 + 提问缩略索引。索引独立于历史控件，未加载的提问也能直接跳转。 -->
-      <Grid Grid.Row="1">
+      <Grid Grid.Row="0">
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="30"/>
           <ColumnDefinition Width="*"/>
@@ -488,7 +531,7 @@ $xaml = @'
       </Grid>
 
       <!-- 输入区 -->
-      <Grid Grid.Row="3" Margin="24,0,24,14">
+      <Grid Grid.Row="2" Margin="24,0,24,14">
         <Border Background="#14171D" BorderBrush="#24FFFFFF" BorderThickness="1" CornerRadius="16" Padding="14,12,12,10">
           <StackPanel>
             <WrapPanel x:Name="AttachList" Orientation="Horizontal" Margin="0,0,0,7" Visibility="Collapsed"/>
@@ -508,7 +551,7 @@ $xaml = @'
                       Cursor="Hand" FontSize="15" Margin="0,0,8,0" VerticalAlignment="Center"
                       Background="Transparent" Foreground="#8A9099" BorderBrush="#1FFFFFFF" BorderThickness="1"
                       ToolTip="添加附件（也可 Ctrl+V 贴图 / 拖文件进来）"/>
-              <Button x:Name="PickFolderBtn" DockPanel.Dock="Left" Content="目录" Height="26" Padding="9,0"
+              <Button x:Name="PickFolderBtn" AutomationProperties.AutomationId="PickFolderBtn" DockPanel.Dock="Left" Content="目录" Height="26" Padding="9,0"
                       Cursor="Hand" FontSize="11" Margin="0,0,10,0" MaxWidth="240" VerticalAlignment="Center"
                       Background="Transparent" Foreground="#8A9099" BorderBrush="#1FFFFFFF" BorderThickness="1"
                       ToolTip="切换工作目录"/>
@@ -525,9 +568,13 @@ $xaml = @'
                 <Button x:Name="ModePill" Height="26" Padding="8,0" Cursor="Hand" FontSize="11"
                         Background="#16181D" Foreground="#ADB2B8" BorderBrush="#1FFFFFFF"
                         BorderThickness="1" ToolTip="点一下切换权限档位" Margin="0,0,10,0"/>
-                <Button x:Name="StopBtn" Content="停止" Height="26" Padding="10,0" Cursor="Hand" FontSize="11.5"
-                        Background="Transparent" Foreground="#F87171" BorderBrush="#66F87171" BorderThickness="1"
-                        IsEnabled="False" Visibility="Collapsed"/>
+                <!-- 停止键：暗红胶囊 + 小方块图标，和发送圆钮之间留 10px，
+                     否则两个按钮贴在一起看不出是两件事（原来只有一圈细红边，hover 还会变灰） -->
+                <Button x:Name="StopBtn" Content="停止" Height="28" Padding="11,0,12,0" Margin="0,0,10,0"
+                        Cursor="Hand" FontSize="11.5" VerticalAlignment="Center"
+                        Background="#2A1417" Foreground="#F87171" BorderBrush="#4DF87171" BorderThickness="1"
+                        IsEnabled="False" Visibility="Collapsed"
+                        ToolTip="中断这一轮（Esc）"/>
                 <!-- 发送键：圆形蓝底箭头（Segoe MDL2 的 E724），图标不随忙碌态改字，靠 ToolTip 区分发送/插话 -->
                 <Button x:Name="SendBtn" Content="&#xE724;" Height="28" Width="28" Padding="0" Cursor="Hand"
                         FontSize="12" FontFamily="Segoe MDL2 Assets"
@@ -544,7 +591,7 @@ $xaml = @'
     </Grid>
 
     <!-- 设置面板：做成遮罩层而不是第二个窗口，省掉嵌套消息循环那堆坑 -->
-    <Grid x:Name="SettingsOverlay" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#B8000000">
+    <Grid x:Name="SettingsOverlay" Grid.Row="1" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#B8000000">
       <Border Width="452" Background="#16181D" BorderBrush="#26FFFFFF" BorderThickness="1" CornerRadius="12"
               HorizontalAlignment="Center" VerticalAlignment="Stretch" Margin="0,20" Padding="22,18,22,16">
         <Grid>
@@ -642,7 +689,7 @@ $xaml = @'
 
     <!-- 删除类操作的确认框：用窗口内的深色浮层，不用系统 MessageBox
          —— 后者是白底系统字，在这套深色界面里像从别的程序弹出来的 -->
-    <Grid x:Name="ConfirmOverlay" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#B8000000">
+    <Grid x:Name="ConfirmOverlay" Grid.Row="1" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#B8000000">
       <Border Width="420" Background="#16181D" BorderBrush="#26FFFFFF" BorderThickness="1" CornerRadius="12"
               HorizontalAlignment="Center" VerticalAlignment="Center" Padding="22,20,22,18">
         <StackPanel>
@@ -662,7 +709,7 @@ $xaml = @'
     </Grid>
 
     <!-- 单行输入浮层：重命名会话、填分组名都用它（同样不用系统 InputBox，那是白底对话框） -->
-    <Grid x:Name="InputOverlay" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#B8000000">
+    <Grid x:Name="InputOverlay" Grid.Row="1" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#B8000000">
       <Border Width="420" Background="#16181D" BorderBrush="#26FFFFFF" BorderThickness="1" CornerRadius="12"
               HorizontalAlignment="Center" VerticalAlignment="Center" Padding="22,20,22,18">
         <StackPanel>
@@ -692,8 +739,57 @@ $xaml = @'
         </StackPanel>
       </Border>
     </Grid>
+    <!-- 目录选择浮层：系统 FolderBrowserDialog 是白底 + 英文标题（Browse For Folder）、Win7 那种小列表，
+         和这套深色界面不像一家人，所以自己画一个：路径栏（可直接粘路径回车跳）+ 目录列表（点行进入）+ 底部确认 -->
+    <Grid x:Name="FolderOverlay" Grid.Row="1" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#B8000000">
+      <Border Width="568" Background="#16181D" BorderBrush="#26FFFFFF" BorderThickness="1" CornerRadius="12"
+              HorizontalAlignment="Center" VerticalAlignment="Center" Padding="22,18,22,16">
+        <Grid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+          <StackPanel Grid.Row="0">
+            <TextBlock Text="选择工作目录" Foreground="#F9FAFB" FontSize="14" FontWeight="SemiBold"/>
+            <TextBlock x:Name="FolderHint" Text="" Foreground="#7C838E" FontSize="11" Margin="0,5,0,0" TextWrapping="Wrap"/>
+          </StackPanel>
+          <DockPanel Grid.Row="1" Margin="0,14,0,10">
+            <Button x:Name="FolderUp" DockPanel.Dock="Left" Content="↑" Width="32" Height="30" Cursor="Hand"
+                    FontSize="13" Margin="0,0,8,0" Background="Transparent" Foreground="#ADB2B8"
+                    BorderBrush="#1FFFFFFF" BorderThickness="1" ToolTip="上一级"/>
+            <Button x:Name="FolderRoot" DockPanel.Dock="Right" Content="此电脑" Height="30" Padding="10,0" Cursor="Hand"
+                    FontSize="11.5" Margin="8,0,0,0" Background="Transparent" Foreground="#ADB2B8"
+                    BorderBrush="#1FFFFFFF" BorderThickness="1"/>
+            <TextBox x:Name="FolderPath" AutomationProperties.AutomationId="FolderPath" Height="30"
+                     Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF" BorderThickness="1"
+                     Padding="9,0" VerticalContentAlignment="Center" FontSize="11.5" CaretBrush="#8AB4FF"
+                     FontFamily="Cascadia Mono, Consolas" ToolTip="可以直接粘路径，回车跳过去"/>
+          </DockPanel>
+          <Border Grid.Row="2" Background="#0F1115" BorderBrush="#1FFFFFFF" BorderThickness="1" CornerRadius="8" Padding="4">
+            <ScrollViewer x:Name="FolderScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
+                          MinHeight="180" MaxHeight="384">
+              <StackPanel x:Name="FolderList" AutomationProperties.AutomationId="FolderList"/>
+            </ScrollViewer>
+          </Border>
+          <TextBlock x:Name="FolderEmpty" Grid.Row="2" Text="" Foreground="#5B626D" FontSize="11.5"
+                     HorizontalAlignment="Center" VerticalAlignment="Center" TextAlignment="Center"
+                     MaxWidth="420" TextWrapping="Wrap" Visibility="Collapsed"/>
+          <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
+            <Button x:Name="FolderCancel" Content="取消" Height="28" Padding="14,0" Cursor="Hand" FontSize="11.5"
+                    Background="Transparent" Foreground="#ADB2B8" BorderBrush="#1FFFFFFF" BorderThickness="1"
+                    Margin="0,0,8,0"/>
+            <Button x:Name="FolderPick" AutomationProperties.AutomationId="FolderPick" Content="用这个目录" Height="28"
+                    Padding="18,0" Cursor="Hand" FontSize="11.5" FontWeight="SemiBold" Background="#2B5CFF"
+                    Foreground="White" BorderThickness="0"/>
+          </StackPanel>
+        </Grid>
+      </Border>
+    </Grid>
+
     <!-- 图片预览：点缩略图弹大图，点背景 / × / Esc 都能关 -->
-    <Grid x:Name="ImagePreview" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#F2000000">
+    <Grid x:Name="ImagePreview" Grid.Row="1" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#F2000000">
       <Grid.RowDefinitions>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="*"/>
@@ -713,7 +809,7 @@ $xaml = @'
 
     <!-- 提问索引的悬停预览卡：挂在根 Grid 上做覆盖层。
          Popup 在这台 125% DPI 的机器上会飘到窗口外看不见，改成窗口内浮层 -->
-    <Border x:Name="QPreviewCard" Grid.ColumnSpan="3" HorizontalAlignment="Left" VerticalAlignment="Top" MaxWidth="380" MaxHeight="240"
+    <Border x:Name="QPreviewCard" Grid.Row="1" Grid.ColumnSpan="3" HorizontalAlignment="Left" VerticalAlignment="Top" MaxWidth="380" MaxHeight="240"
             Background="#1C1F26" BorderBrush="#2E3440" BorderThickness="1" CornerRadius="10" Padding="13,11,13,10"
             Visibility="Collapsed" IsHitTestVisible="False" Panel.ZIndex="60">
       <Border.Effect>
@@ -939,6 +1035,11 @@ $CfgProviderAdd = $window.FindName('CfgProviderAdd')
 $CfgProviderDel = $window.FindName('CfgProviderDel')
 $ModelChips = $window.FindName('ModelChips')
 $ModelHint = $window.FindName('ModelHint')
+# 自绘标题栏上的控件（logo / 会话标题 / 设置齿轮 / 三个窗口按钮）
+$TitleLogo = $window.FindName('TitleLogo')
+$MinBtn = $window.FindName('MinBtn')
+$MaxBtn = $window.FindName('MaxBtn')
+$CloseBtn = $window.FindName('CloseBtn')
 $AttachBtn = $window.FindName('AttachBtn')
 
 $AttachList = $window.FindName('AttachList')
@@ -962,6 +1063,16 @@ $InputYes = $window.FindName('InputYes')
 $InputNo = $window.FindName('InputNo')
 $InputGroupBox = $window.FindName('InputGroupBox')
 $InputGroupList = $window.FindName('InputGroupList')
+$FolderOverlay = $window.FindName('FolderOverlay')
+$FolderHint = $window.FindName('FolderHint')
+$FolderPath = $window.FindName('FolderPath')
+$FolderList = $window.FindName('FolderList')
+$FolderScroll = $window.FindName('FolderScroll')
+$FolderEmpty = $window.FindName('FolderEmpty')
+$FolderUp = $window.FindName('FolderUp')
+$FolderRoot = $window.FindName('FolderRoot')
+$FolderPick = $window.FindName('FolderPick')
+$FolderCancel = $window.FindName('FolderCancel')
 
 # ---------------------------------------------------------------- 画东西的小工具
 # Brush / FontFamily 缓存：回放长会话要建几千个，每次都解析颜色字符串、每次新建 FontFamily 太浪费
@@ -4798,6 +4909,42 @@ if ($Demo) {
   }
 }
 
+# ---------- 窗口标题栏配色（DWM） ----------
+# 注意这一整段必须放在 Start-Host 之外：演示模式（-Demo）下 Start-Host 第一行就 return，
+# 以前那段 Add-Type 写在函数体里，于是演示窗口的标题栏一直是系统配色（用户正是从这个窗口报的问题）。
+# 标题栏必须是界面自己的颜色，不能交给系统：Win11 默认让非客户区吃 Mica，
+# 于是深灰的界面顶上顶着一条由桌面壁纸染色的暗紫/暗红条（用户报了「边框和整体颜色不一致」）。
+#   DWMWA_USE_IMMERSIVE_DARK_MODE = 20（Win10 2004+，更早的版本是 19）：让按钮/文字走深色
+#   DWMWA_BORDER_COLOR  = 34、DWMWA_CAPTION_COLOR = 35、DWMWA_TEXT_COLOR = 36（Win11 22H2+）
+#   DWMWA_SYSTEMBACKDROP_TYPE = 38，值 1 = DWMSBT_NONE：关掉 Mica/亚克力
+# 颜色按 COLORREF 传（0x00BBGGRR，和 WPF 的 #RRGGBB 反着来）。
+function Set-TitleBarLook([IntPtr]$h) {
+  # Add-Type 放在函数里而不是脚本顶层：它要现编译一个小程序集（几十毫秒），
+  # 写在顶层就排到 ShowDialog 之前，白白推迟首帧；第一次调用时编译，窗口已经画出来了。
+  if (-not ('PL.Dwm' -as [type])) {
+    Add-Type -Namespace PL -Name Dwm -MemberDefinition @'
+[DllImport("dwmapi.dll")]
+public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+'@
+  }
+  $attrs = @(
+    @(38, 1),          # 背景：不透明纯色，不跟壁纸
+    @(20, 1), @(19, 1),# 深色模式（新旧两个属性号都试）
+    @(35, 0x0015110F), # 标题栏 #0F1115，和主内容区同一色
+    @(36, 0x00EEE8E6), # 标题文字 #E6E8EE，和界面主文字同一色
+    @(34, 0x0015110F), # 外框线也同色，省掉一圈突兀的亮边
+    @(33, 2)           # DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND：
+                       # WindowStyle=None 之后系统不再给圆角，角就变成直角了，这里要回来
+  )
+  foreach ($a in $attrs) {
+    # 逐条 try：老系统上 34/35/36/38 会失败，不能让一条把后面的全带下去
+    try {
+      $v = [int]$a[1]
+      [void][PL.Dwm]::DwmSetWindowAttribute($h, [int]$a[0], [ref]$v, 4)
+    } catch { }
+  }
+}
+
 # ---------- host 启动（挪到窗口显示之后，见 Add_Loaded） ----------
 # 实测这一段要 ~300ms（node 冷启动 + LinePump 现编译）。放在 ShowDialog 之前，
 # 就是「双击后先干等 0.3 秒」。窗口先出来，host 在 Loaded 里补上；这期间发的消息先排队。
@@ -4845,12 +4992,6 @@ $script:hostStarted = $true
 $script:proc = [System.Diagnostics.Process]::Start($psi)
 Log "host 已启动 pid=$($script:proc.Id)"
 Perf 'span' 'host-spawn' $script:hostT0.ElapsedMilliseconds @{ pid = $script:proc.Id }
-
-# 深色标题栏：WPF 自己的 chrome 是白色的，只能调 DWM
-Add-Type -Namespace PL -Name Dwm -MemberDefinition @'
-[DllImport("dwmapi.dll")]
-public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
-'@
 
 # 为什么需要这个东西：PowerShell 的脚本事件处理器（Add_OutputDataReceived）在
 # ShowDialog() 阻塞期间不会被调度（runspace 被占着），子进程的输出永远读不到。
@@ -5153,6 +5294,177 @@ function Update-CwdPill([string]$path) {
   $PickFolderBtn.ToolTip = $(if ($path) { '工作目录：' + $path + '（点一下换）' } else { '选择工作目录' })
 }
 
+# ---------------------------------------------------------------- 工作目录选择浮层
+# 系统 FolderBrowserDialog 是白底原生框，和这套深色界面不像一家人，所以自己画一个。
+# 交互：路径栏可直接粘路径回车跳；列表点一行就进去；底部「用这个目录」确认当前位置。
+$script:folderSel = ''          # 当前浏览到的目录；'' = 此电脑（列盘符）
+$script:folderPickRun = $null   # 确认回调；为空时默认给 host 发 cwd
+
+function Get-FolderDirs([string]$path) {
+  # 只列子目录，跳过隐藏/系统目录（$Recycle.Bin、System Volume Information 点进去只会报错）。
+  # 用 DirectoryInfo 枚举而不是 Get-ChildItem：列 C:\Windows\System32 这种大目录时快得多。
+  $list = New-Object System.Collections.ArrayList
+  if (-not $path) {
+    foreach ($d in [System.IO.DriveInfo]::GetDrives()) {
+      if (-not $d.IsReady) { continue }
+      $note = [string]$d.VolumeLabel
+      $list.Add([pscustomobject]@{ path = $d.RootDirectory.FullName; name = $d.RootDirectory.FullName; note = $note }) | Out-Null
+    }
+    return @($list)
+  }
+  try {
+    $di = New-Object System.IO.DirectoryInfo $path
+    foreach ($d in $di.EnumerateDirectories()) {
+      $at = $d.Attributes
+      if (($at -band [System.IO.FileAttributes]::Hidden) -ne 0) { continue }
+      if (($at -band [System.IO.FileAttributes]::System) -ne 0) { continue }
+      $list.Add([pscustomobject]@{ path = $d.FullName; name = $d.Name; note = '' }) | Out-Null
+    }
+  } catch { }
+  # 别在返回处多包一层逗号：PowerShell 会把整个数组当成"一个"目录名传下去，
+  # 结果所有子文件夹挤进同一行文本（踩过）
+  return @($list | Sort-Object name)
+}
+
+function New-FolderRow([string]$path, [string]$name, [string]$note) {
+  $b = New-Object System.Windows.Controls.Button
+  $b.Padding = '9,0'
+  $b.Height = 28
+  $b.Margin = '0,0,0,1'
+  $b.HorizontalContentAlignment = 'Left'
+  $b.Cursor = 'Hand'
+  $b.Foreground = (Brush '#C7CBD2')
+  $b.Background = [System.Windows.Media.Brushes]::Transparent
+  $b.BorderThickness = '0'
+  $b.FontSize = 12
+  $b.Template = (New-FlatTemplate)
+  $b.Tag = [string]$path
+  $dp = New-Object System.Windows.Controls.DockPanel
+  if ($note) {
+    $nt = New-Object System.Windows.Controls.TextBlock
+    $nt.Text = $note
+    $nt.FontSize = 10.5
+    $nt.Foreground = (Brush '#5B626D')
+    $nt.VerticalAlignment = 'Center'
+    $nt.Margin = '8,0,2,0'
+    [System.Windows.Controls.DockPanel]::SetDock($nt, 'Right')
+    $dp.Children.Add($nt) | Out-Null
+  }
+  $ic = New-Object System.Windows.Controls.TextBlock
+  $ic.Text = '📁'
+  $ic.FontSize = 12
+  $ic.Margin = '0,0,8,0'
+  $ic.VerticalAlignment = 'Center'
+  [System.Windows.Controls.DockPanel]::SetDock($ic, 'Left')
+  $dp.Children.Add($ic) | Out-Null
+  $tb = New-Object System.Windows.Controls.TextBlock
+  $tb.Text = $name
+  $tb.FontSize = 12
+  $tb.TextTrimming = 'CharacterEllipsis'
+  $tb.TextWrapping = 'NoWrap'
+  $tb.VerticalAlignment = 'Center'
+  $dp.Children.Add($tb) | Out-Null
+  $b.Content = $dp
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($b, 'FolderRow')
+  [System.Windows.Automation.AutomationProperties]::SetName($b, $name)
+  $b.Add_Click({
+    param($s, $e)
+    # 点一行就进去：不搞「先选中再打开」，路径栏本身就是「当前在哪」的反馈
+    Set-FolderPath ([string]$s.Tag)
+  })
+  return $b
+}
+
+function Get-ParentFolder([string]$path) {
+  if (-not $path) { return '' }
+  $p = [System.IO.Directory]::GetParent($path)
+  if ($p) { return $p.FullName }
+  return ''   # 已经在盘根：上一级＝此电脑
+}
+
+function Show-FolderList {
+  $FolderList.Children.Clear()
+  $dirs = @(Get-FolderDirs $script:folderSel)
+  if ($dirs.Count -eq 0) {
+    $FolderEmpty.Text = $(if ($script:folderSel) { "「$($script:folderSel)」下面没有子文件夹，可以直接点「用这个目录」。" } else { '没有可用的磁盘。' })
+    $FolderEmpty.Visibility = 'Visible'
+  } else {
+    $FolderEmpty.Visibility = 'Collapsed'
+    foreach ($d in $dirs) { $FolderList.Children.Add((New-FolderRow $d.path $d.name $d.note)) | Out-Null }
+  }
+  $FolderHint.Text = $(if ($script:folderSel) { '点一行进入该文件夹；也可以用上面的路径栏直接粘路径。' } else { '选一个磁盘，或直接在路径栏里粘完整路径再回车。' })
+  # 「此电脑」视图没有「当前目录」可确认，按钮置灰避免点了个空
+  $FolderPick.IsEnabled = [bool]$script:folderSel
+  $FolderUp.IsEnabled = $true
+  try { $FolderScroll.ScrollToTop() } catch { }
+}
+
+function Set-FolderPath([string]$path) {
+  $p = ([string]$path).Trim()
+  if ($p) {
+    $p = $p.Trim('"').Trim()
+    if ($p.Length -gt 3) { $p = $p.TrimEnd([char]92, [char]47) }
+    if (-not [System.IO.Directory]::Exists($p)) {
+      # 路径不存在：不清掉列表，只在中间提示一下，用户还能继续点别的
+      $FolderEmpty.Text = '路径不存在：' + $p
+      $FolderEmpty.Visibility = 'Visible'
+      return
+    }
+  }
+  $script:folderSel = $p
+  $FolderPath.Text = $p
+  Show-FolderList
+}
+
+function Show-FolderPicker {
+  param([scriptblock]$onPick, [string]$start)
+  $s = [string]$start
+  if (-not $s) { $s = [string]$script:cwdPath }
+  if (-not $s) { $s = [string]$env:USERPROFILE }
+  if ($s -and -not [System.IO.Directory]::Exists($s)) { $s = [string]$env:USERPROFILE }
+  $script:folderPickRun = $onPick
+  $script:folderSel = ''
+  $FolderOverlay.Visibility = 'Visible'
+  Set-FolderPath $s
+}
+
+function Hide-FolderPicker {
+  $FolderOverlay.Visibility = 'Collapsed'
+  $FolderList.Children.Clear()
+  $script:folderPickRun = $null
+}
+
+function Confirm-FolderPick {
+  $p = [string]$script:folderSel
+  if (-not $p) { return }
+  $run = $script:folderPickRun
+  Hide-FolderPicker
+  if ($run) { & $run $p }
+  else {
+    # 先乐观更新胶囊：host 那边还要走一趟（切 cwd 可能要重启工具环境），
+    # 不等它的 cwd 事件，点了就立刻看到新目录，host 回来再覆盖一次同样的值。
+    Update-CwdPill $p
+    Send-Host @{ cmd = 'cwd'; dir = $p }
+  }
+}
+
+$FolderCancel.Add_Click({ Hide-FolderPicker })
+$FolderPick.Add_Click({ Confirm-FolderPick })
+$FolderUp.Add_Click({ Set-FolderPath (Get-ParentFolder $script:folderSel) })
+$FolderRoot.Add_Click({ Set-FolderPath '' })
+$FolderPath.Add_PreviewKeyDown({
+  param($s, $e)
+  if ($e.Key -eq [System.Windows.Input.Key]::Return) {
+    $e.Handled = $true
+    Set-FolderPath $FolderPath.Text
+  }
+})
+$FolderOverlay.Add_MouseLeftButtonUp({
+  param($s, $e)
+  # 点遮罩空白处＝取消（点在卡片上时 OriginalSource 不是遮罩本身）
+  if ([object]::ReferenceEquals($e.OriginalSource, $FolderOverlay)) { Hide-FolderPicker }
+})
+
 # 下拉菜单自己画：ContextMenu 的 MenuItem 是系统模板（白底、蓝高亮），深色界面上太跳
 function New-FlatTemplate {
   if ($script:flatTpl) { return $script:flatTpl }
@@ -5247,6 +5559,87 @@ function New-SendCircleTemplate {
   return $script:sendCircleTpl
 }
 
+# 停止键：暗红胶囊 + 左边一个小方块（原模块里没有对应图标字，直接用矩形画，缩放不失真）。
+# Content 仍然是文字：跑的时候代码会把 Content 改成「正在中断…」，宽度自然长出去。
+function New-StopTemplate {
+  if ($script:stopTpl) { return $script:stopTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+          BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="14" Padding="{TemplateBinding Padding}">
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center">
+      <Rectangle x:Name="sq" Width="8" Height="8" RadiusX="2" RadiusY="2"
+                 Fill="{TemplateBinding Foreground}" VerticalAlignment="Center" Margin="0,0,7,0"/>
+      <ContentPresenter VerticalAlignment="Center"/>
+    </StackPanel>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#3A1A1F"/>
+      <Setter TargetName="bd" Property="BorderBrush" Value="#80F87171"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#4A2027"/>
+    </Trigger>
+    <Trigger Property="IsEnabled" Value="False">
+      <Setter Property="Opacity" Value="0.55"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:stopTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:stopTpl
+}
+
+# 标题栏的窗口按钮（最小化 / 最大化）：透明底、悬停一层白纱，高度铺满标题栏
+function New-CaptionTemplate {
+  if ($script:captionTpl) { return $script:captionTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+  <Border x:Name="bd" Background="{TemplateBinding Background}">
+    <ContentPresenter x:Name="cp" HorizontalAlignment="Center" VerticalAlignment="Center"
+                      TextBlock.Foreground="{TemplateBinding Foreground}"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#22FFFFFF"/>
+      <Setter TargetName="cp" Property="TextBlock.Foreground" Value="#FFFFFF"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#38FFFFFF"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:captionTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:captionTpl
+}
+
+# 关闭键：悬停是 Windows 惯例的红底白字，不跟着另外两个按钮走白纱
+function New-CaptionCloseTemplate {
+  if ($script:captionCloseTpl) { return $script:captionCloseTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+  <Border x:Name="bd" Background="{TemplateBinding Background}">
+    <ContentPresenter x:Name="cp" HorizontalAlignment="Center" VerticalAlignment="Center"
+                      TextBlock.Foreground="{TemplateBinding Foreground}"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#C42B1C"/>
+      <Setter TargetName="cp" Property="TextBlock.Foreground" Value="#FFFFFF"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#9E2014"/>
+      <Setter TargetName="cp" Property="TextBlock.Foreground" Value="#FFFFFF"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:captionCloseTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:captionCloseTpl
+}
+
 # 危险操作（删除/确认删）：红底按钮，悬停亮一点；不走系统模板，避免悬停变白底
 function New-DangerTemplate {
   if ($script:dangerTpl) { return $script:dangerTpl }
@@ -5278,7 +5671,10 @@ $ModePill.Template = (New-FlatTemplate)
 $AttachBtn.Template = (New-FlatTemplate)
 
 $PickFolderBtn.Template = (New-FlatTemplate)
-$StopBtn.Template = (New-FlatTemplate)
+$StopBtn.Template = (New-StopTemplate)
+$MinBtn.Template = (New-CaptionTemplate)
+$MaxBtn.Template = (New-CaptionTemplate)
+$CloseBtn.Template = (New-CaptionCloseTemplate)
 $NewChatBtn.Template = (New-FlatTemplate)
 $SettingsBtn.Template = (New-FlatTemplate)
 $SendBtn.Template = (New-SendCircleTemplate)
@@ -5288,6 +5684,10 @@ $CfgOpenLogs.Template = (New-FlatTemplate)
 $CfgCancel.Template = (New-FlatTemplate)
 $ConfirmNo.Template = (New-FlatTemplate)
 $InputNo.Template = (New-FlatTemplate)
+$FolderUp.Template = (New-FlatTemplate)
+$FolderRoot.Template = (New-FlatTemplate)
+$FolderCancel.Template = (New-FlatTemplate)
+$FolderPick.Template = (New-SendTemplate)
 $PreviewClose.Template = (New-FlatTemplate)
 $CfgSave.Template = (New-SendTemplate)
 $InputYes.Template = (New-SendTemplate)
@@ -6816,6 +7216,30 @@ $StopBtn.Add_Click({
 # 设置面板
 $SettingsBtn.Add_Click({ Perf-Action 'open-settings'; Open-Settings })
 
+# ---------------------------------------------------------------- 标题栏按钮
+# WindowChrome 之后 - □ × 要自己实现；点击顺序和系统一致：最小化 → 最大化/还原 → 关闭
+$MinBtn.Add_Click({ $window.WindowState = 'Minimized' })
+$MaxBtn.Add_Click({
+  if ($window.WindowState -eq 'Maximized') { $window.WindowState = 'Normal' }
+  else { $window.WindowState = 'Maximized' }
+})
+$CloseBtn.Add_Click({ $window.Close() })
+# 最大化后按钮要换成「还原」（E923），否则图标和实际行为对不上；
+# 用户从任务栏还原、双击标题栏、Aero Snap 拖回来也都会走这个事件。
+function Update-MaxBtnVisual {
+  if ($window.WindowState -eq 'Maximized') {
+    $MaxBtn.Content = [string][char]0xE923
+    $MaxBtn.ToolTip = '还原（双击标题栏也行）'
+  } else {
+    $MaxBtn.Content = [string][char]0xE922
+    $MaxBtn.ToolTip = '最大化（双击标题栏也行）'
+  }
+}
+$window.Add_StateChanged({ Update-MaxBtnVisual })
+Update-MaxBtnVisual
+# 标题栏左边那枚 logo 直接复用窗口图标（New-LogoBitmap 画的 256px 那张）
+if ($window.Icon) { $TitleLogo.Source = $window.Icon }
+
 # 供应商：新增一行空白（端点留空，保存时会拦住并提示），删掉当前选中的那一家
 $CfgProviderAdd.Add_Click({
   Apply-FormToProvider
@@ -6923,6 +7347,10 @@ $window.Add_PreviewKeyDown({
     $e.Handled = $true
     Hide-ImagePreview
   }
+  elseif ($e.Key -eq [System.Windows.Input.Key]::Escape -and $FolderOverlay.Visibility -eq 'Visible') {
+    $e.Handled = $true
+    Hide-FolderPicker
+  }
 })
 
 $NewChatBtn.Add_Click({
@@ -6943,13 +7371,8 @@ $ModePill.Add_Click({
 
 $PickFolderBtn.Add_Click({
   Perf-Action 'pick-folder'
-  $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-  $dlg.Description = '选择工作目录'
-  $dlg.SelectedPath = $(if ($script:cwdPath) { $script:cwdPath } else { $env:USERPROFILE })
-  $dlg.ShowNewFolderButton = $false
-  if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-    Send-Host @{ cmd = 'cwd'; dir = $dlg.SelectedPath }
-  }
+  # 自绘的深色目录浮层，不用系统 FolderBrowserDialog（白底 + 英文标题，跟界面不像一家人）
+  Show-FolderPicker
 })
 
 # ---------------------------------------------------------------- 定时器：抽事件 + 流式渲染
@@ -7210,14 +7633,11 @@ $window.Add_Loaded({
   $script:perfMark.Restart()
   # host 放到窗口画完之后再起：省掉首帧前那 ~300ms，界面先出来
   Start-Host
-  # 深色标题栏：WPF 默认给的是白色系统 chrome，和深色底不搭。
-  # DWMWA_USE_IMMERSIVE_DARK_MODE = 20（Win10 2004+），更早的版本用 19。
+  # 标题栏：和界面同色（细节见 Set-TitleBarLook 的注释）
   try {
     $h = (New-Object System.Windows.Interop.WindowInteropHelper $window).Handle
-    $on = 1
-    [void][PL.Dwm]::DwmSetWindowAttribute($h, 20, [ref]$on, 4)
-    [void][PL.Dwm]::DwmSetWindowAttribute($h, 19, [ref]$on, 4)
-  } catch { Log ("深色标题栏失败: " + ($_ | Out-String)) }
+    Set-TitleBarLook $h
+  } catch { Log ("标题栏配色失败: " + ($_ | Out-String)) }
   Update-CwdPill $Cwd
   Update-ModelPill ([string]$Model)
   Set-ModeVisual $Mode

@@ -14,6 +14,13 @@ import { dirname, join } from 'node:path'
 import type { EventInput, SessionEvent } from './events.ts'
 import type { ImagePart, LlmMessage } from './types.ts'
 
+/**
+ * 缺结果的工具调用补这句：会话里只要有一条 assistant(tool_calls) 没有对应 tool 消息，
+ * 之后每一次请求都会被服务端 400 拒掉（「must be followed by tool messages」），
+ * 会话等于永久报废。投影时补一条占位，模型能看懂「那次调用没结果」，可以重来。
+ */
+const MISSING_TOOL_RESULT = '[中断] 这次工具调用没有执行完（进程中断、窗口被关或用户中止），结果已丢失。需要就重新调用一次。'
+
 /** 会话元信息：不进入 session.jsonl，避免污染模型历史投影 */
 export interface SessionMeta {
   /** 自定义标题；空/缺省 = 用首条用户消息自动生成 */
@@ -322,6 +329,10 @@ export class Session {
     // 紧跟对应的 tool 消息，中间夹一条 user 会让服务端把整批工具结果判为无效 ——
     // 表现就是「插话没生效」：模型照旧按老计划走，那句提醒等于没发。
     // 这里不改日志，只在投影结果上把这句 user 挪到这批工具结果之后。
+    //
+    // 顺带把「缺结果」的调用补成占位行：工具跑到一半进程被杀（关窗口、Ctrl+C、崩溃）时，
+    // 日志里会留下 assistant(tool_calls) 而没有对应的 tool/result。原样投影出去，服务端
+    // 每次请求都回 400「must be followed by tool messages」，整个会话从此永久卡死。
     function hoistInterjections(msgs: LlmMessage[]): void {
       // 思路：一趟扫过去，遇到「带 tool_calls 的 assistant」就把它后面属于这批的 tool 消息
       // 全部收齐，夹在中间的其它消息（插话）排到这批 tool 之后。这样产出的序列永远满足
@@ -333,39 +344,53 @@ export class Session {
         out2.push(m)
         i++
         if (m.role !== 'assistant' || !m.toolCalls?.length) continue
-        const ids = new Set(m.toolCalls.map((c) => c.id))
+        const ids = m.toolCalls.map((c) => c.id)
+        const want = new Set(ids)
         const tools: LlmMessage[] = []
         const strays: LlmMessage[] = []
         // 往后看：连续的 tool 属于这批；夹在其中的非 tool 先攒着；遇到别的东西就停
         while (i < msgs.length) {
           const n = msgs[i]!
-          if (n.role === 'tool') {
+          if (n.role === 'tool' && want.has(n.toolCallId ?? '')) {
             tools.push(n)
             i++
             continue
           }
-          // 非 tool：这批结果还没收齐时可能是被插话打断（说明工具还在跑、result 尚未写入），
-          // 记下来；收齐之后遇到的就不是打断，而是下一段对话，停止。
-          if (tools.length < ids.size) {
+          // 非 tool：这批结果还没收齐时可能是被插话打断，记下来；收齐之后遇到的就不是打断，
+          // 而是下一段对话，停止。不属于这批的 tool 也停：交给它自己的 assistant 认领。
+          if (tools.length < ids.length && n.role !== 'tool') {
             strays.push(n)
             i++
             continue
           }
           break
         }
-        // 一条 tool 结果都没有（工具正在执行中）：原样保留，插话照旧排在 assistant 之后，
-        // 等下一轮投影时 result 已经写入，自然会走到上面的重排分支。
-        if (!tools.length) {
-          out2.push(...strays)
-          continue
-        }
-        out2.push(...tools, ...strays)
+        const got = new Set(tools.map((t) => t.toolCallId))
+        const missing: LlmMessage[] = ids
+          .filter((id) => !got.has(id))
+          .map((id) => ({ role: 'tool', toolCallId: id, content: MISSING_TOOL_RESULT }))
+        out2.push(...tools, ...missing, ...strays)
+      }
+      msgs.length = 0
+      msgs.push(...out2)
+    }
+
+    // 反向的孤儿：tool 消息前面没有对应的调用（历史被裁剪、或日志被手工改过），
+    // 服务端同样会拒收。这种消息对模型也没有信息量，直接丢掉。
+    function dropOrphanToolMessages(msgs: LlmMessage[]): void {
+      const known = new Set<string>()
+      const out2: LlmMessage[] = []
+      for (const m of msgs) {
+        if (m.role === 'assistant') for (const c of m.toolCalls ?? []) known.add(c.id)
+        if (m.role === 'tool' && !known.has(m.toolCallId ?? '')) continue
+        out2.push(m)
       }
       msgs.length = 0
       msgs.push(...out2)
     }
 
     hoistInterjections(out)
+    dropOrphanToolMessages(out)
     return out
   }
 }

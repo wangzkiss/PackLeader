@@ -286,6 +286,12 @@ export function createFsTools(root: string): Tool[] {
     },
   }
 
+  // PowerShell 5.1 只认带 BOM 的 UTF-8 脚本：无 BOM 时按 ANSI（中文机上是 GBK）读，
+  // 中文注释/字符串一乱语法就崩——「Add-Type : 未能找到类型 Bitmap」「Missing ')'」都是这么来的
+  function needsBom(file: string): boolean {
+    return /\.(ps1|psm1|psd1)$/i.test(file)
+  }
+
   const write: Tool = {
     name: 'write',
     description: '整体写入一个文件（会覆盖），必要时自动创建父目录。要小改动用 edit。',
@@ -303,10 +309,11 @@ export function createFsTools(root: string): Tool[] {
       const file = abs(needString(args, 'path'))
       const content = typeof args.content === 'string' ? args.content : String(args.content ?? '')
       await mkdir(dirname(file), { recursive: true })
-      await writeFile(file, content, 'utf8')
+      const body = needsBom(file) && !content.startsWith('\uFEFF') ? '\uFEFF' + content : content
+      await writeFile(file, body, 'utf8')
       dropReadCache(file)
       const n = content.split('\n').length
-      return { content: `已写入 ${rel(root, file)}（${content.length} 字节，${n} 行）` }
+      return { content: `已写入 ${rel(root, file)}（${Buffer.byteLength(body)} 字节，${n} 行）` }
     },
   }
 
@@ -361,6 +368,12 @@ export function createFsTools(root: string): Tool[] {
       // 这两类差异按行比对一下就绕过去了（缩进内容本身的差异不放过）。
       const lines = text.split('\n')
       const tail = (s: string) => s.replace(/[ \t\r]+$/, '')
+      const clip = (s: string) => (s.length > 120 ? `${s.slice(0, 120)}…` : s)
+      const commonPrefix = (a: string, b: string) => {
+        let i = 0
+        while (i < a.length && i < b.length && a[i] === b[i]) i++
+        return i
+      }
       const want = oldText.replace(/\r\n/g, '\n').split('\n').map(tail)
       const hits: number[] = []
       for (let i = 0; i + want.length <= lines.length; i++) {
@@ -374,10 +387,38 @@ export function createFsTools(root: string): Tool[] {
         if (ok) hits.push(i)
       }
       if (hits.length === 0) {
-        // 把 old 第一行在文件里的位置告诉模型，它照着那一行的原文重发就能一次改对
-        const at = lines.findIndex((l) => tail(l) === (want[0] ?? ''))
-        const hint =
-          at >= 0 ? `；第 ${at + 1} 行开头一样：${JSON.stringify((lines[at] ?? '').slice(0, 120))}` : ''
+        // 只说「没找到」，模型只能把 old 整段重抄一遍，抄出来还是同样的错。
+        // 所以指出第一处对不上的位置：第几行、第几列，文件里是什么、它给的是什么。
+        const first = want[0] ?? ''
+        const at = lines.findIndex((l) => tail(l) === first)
+        let hint = ''
+        if (at >= 0) {
+          // 第一行对上了，往下逐行比，第一处不同就是它该改的地方
+          let j = 1
+          while (j < want.length && tail(lines[at + j] ?? '') === (want[j] ?? '')) j++
+          hint =
+            j < want.length
+              ? `；第 ${at + 1} 行开头一样，但 old 的第 ${j + 1} 行（文件第 ${at + j + 1} 行）对不上：` +
+                `文件里是 ${JSON.stringify(clip(tail(lines[at + j] ?? '')))}，old 里是 ${JSON.stringify(clip(want[j] ?? ''))}`
+              : `；第 ${at + 1} 行开头一样，但文件到第 ${lines.length} 行就结束了，old 还有 ${want.length - j} 行`
+        } else {
+          // 连第一行都不在：找公共前缀最长的那一行，说清从第几列开始岔开
+          let best = -1
+          let bestLen = 0
+          for (let i = 0; i < lines.length; i++) {
+            const n = commonPrefix(tail(lines[i] ?? ''), first)
+            if (n > bestLen) {
+              bestLen = n
+              best = i
+            }
+          }
+          if (best >= 0) {
+            const line = tail(lines[best] ?? '')
+            hint =
+              `；最接近的是第 ${best + 1} 行，从第 ${bestLen + 1} 列开始不一样：` +
+              `文件里是 ${JSON.stringify(clip(line.slice(bestLen)))}，old 里是 ${JSON.stringify(clip(first.slice(bestLen)))}`
+          }
+        }
         throw new Error(
           `没找到要替换的原文（前 80 字符：${JSON.stringify(oldText.slice(0, 80))}）${hint}`,
         )

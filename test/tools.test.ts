@@ -39,6 +39,26 @@ test('fs.write 自动建父目录', async () => {
   assert.equal(await readFile(join(root, 'deep/nested/b.txt'), 'utf8'), 'hi')
 })
 
+// PS 5.1 读无 BOM 的 UTF-8 脚本会按 GBK 解，中文注释一乱语法就崩。
+test('fs.write 写 .ps1 自动带 BOM，写 .ts 不带', async () => {
+  const { root, ctx, tools } = await ws()
+  const w = tools.get('write')!
+  await w.run(ctx, { path: 'x/t.ps1', content: "# 中文注释\nWrite-Output '好'\n" })
+  const ps1 = await readFile(join(root, 'x/t.ps1'))
+  assert.deepEqual([...ps1.subarray(0, 3)], [0xef, 0xbb, 0xbf], '.ps1 应该以 UTF-8 BOM 开头')
+
+  await w.run(ctx, { path: 'x/a.ts', content: 'export const a = 1\n' })
+  const ts = await readFile(join(root, 'x/a.ts'))
+  assert.notDeepEqual([...ts.subarray(0, 3)], [0xef, 0xbb, 0xbf], '.ts 不该带 BOM')
+})
+
+test('fs.write 不会把已有的 BOM 叠成两个', async () => {
+  const { root, ctx, tools } = await ws()
+  await tools.get('write')!.run(ctx, { path: 'x/b.psm1', content: '\uFEFF# 已经带了\n' })
+  const buf = await readFile(join(root, 'x/b.psm1'))
+  assert.deepEqual([...buf.subarray(0, 6)], [0xef, 0xbb, 0xbf, 0x23, 0x20, 0xe5], '只该有一个 BOM')
+})
+
 test('fs.edit 要求唯一命中，多处时报错并给出数量', async () => {
   const { ctx, tools } = await ws()
   const edit = tools.get('edit')!
@@ -145,6 +165,26 @@ test('fs.edit 不命中时指出最接近的行号', async () => {
   await assert.rejects(
     () => edit.run(ctx, { path: 'src/a.ts', old: '// TODO: fix\nconst zzz = 9', new: 'x' }),
     /第 2 行/,
+  )
+})
+
+// 只说「没找到」时，模型只能把 old 整段重抄，抄出来还是同样的错。
+// 报出「第几行第几列、两边各是什么」，它才改得对。
+test('fs.edit 不命中时指出第一处不一致的行（首行对得上就往下比）', async () => {
+  const { ctx, tools } = await ws()
+  const edit = tools.get('edit')!
+  await assert.rejects(
+    () => edit.run(ctx, { path: 'src/a.ts', old: '// TODO: fix\nconst zzz = 9', new: 'x' }),
+    /第 2 行开头一样，但 old 的第 2 行（文件第 3 行）对不上/,
+  )
+})
+
+test('fs.edit 不命中时指出第一处不一致的列（首行也不对就找最接近的一行）', async () => {
+  const { ctx, tools } = await ws()
+  const edit = tools.get('edit')!
+  await assert.rejects(
+    () => edit.run(ctx, { path: 'src/a.ts', old: 'export const b = 1\n// TODO: fix', new: 'x' }),
+    /最接近的是第 1 行，从第 14 列开始不一样/,
   )
 })
 

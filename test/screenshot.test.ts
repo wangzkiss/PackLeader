@@ -45,6 +45,25 @@ test('screenshot: 生成脚本时参数内联，单引号双写转义', () => {
   assert.match(s, /\$out = 'C:\\tmp\\a''b\.png'/)
   // 太宽的图要缩放，不然 4K 整屏直接把请求撑爆
   assert.match(s, /InterpolationMode/)
+  // 输出编码定成 UTF-8，否则 PS 报错中文按 GBK 出来就是一片乱码
+  assert.match(s, /Console\]::OutputEncoding = \[Text\.Encoding\]::UTF8/)
+})
+
+// 日志里 3 次截图失败：process 填的是窗口标题（PackLeader），或者机器上根本没有的 pwsh。
+test('screenshot: process 按名找不到时退回拿它当标题找，并把候选列给模型', () => {
+  const s = buildShotScript({
+    target: 'window',
+    process: 'PackLeader',
+    title: '',
+    click: '',
+    waitMs: 0,
+    maxWidth: 1600,
+    out: 'a.png',
+  })
+  assert.match(s, /\$want = \$procName -replace/) // 容忍带不带 .exe
+  assert.match(s, /ProcessName -eq \$want/) // 先按进程名
+  assert.match(s, /MainWindowTitle -like "\*\$want\*"/) // 再当标题片段
+  assert.match(s, /当前带窗口的/) // 找不到时把候选给出来
 })
 
 test('screenshot: view_image 把图片交给模型（带 mime 和尺寸）', async () => {

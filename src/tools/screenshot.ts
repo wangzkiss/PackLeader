@@ -15,6 +15,7 @@ import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { extname, isAbsolute, join, resolve } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import type { Tool } from '../core/tools.ts'
 import { needString, optNumber, optString } from '../core/tools.ts'
 import type { ImageRef } from '../core/types.ts'
@@ -118,17 +119,23 @@ function runPsFile(scriptPath: string, timeoutMs: number, signal?: AbortSignal):
     const timer = setTimeout(onAbort, timeoutMs)
     if (signal?.aborted) onAbort()
     else signal?.addEventListener('abort', onAbort, { once: true })
+    const outDec = new StringDecoder('utf8')
+    const errDec = new StringDecoder('utf8')
     child.stdout?.on('data', (b: Buffer) => {
-      stdout += b.toString('utf8')
+      stdout += outDec.write(b)
     })
     child.stderr?.on('data', (b: Buffer) => {
-      stderr += b.toString('utf8')
+      stderr += errDec.write(b)
     })
     child.on('error', (e) => {
       stderr += `[无法启动 PowerShell] ${e.message}`
       finish(127)
     })
-    child.on('close', (code) => finish(code ?? -1))
+    child.on('close', (code) => {
+      stdout += outDec.end()
+      stderr += errDec.end()
+      finish(code ?? -1)
+    })
   })
 }
 
@@ -149,6 +156,8 @@ interface ShotArgs {
 export function buildShotScript(a: ShotArgs): string {
   return `
 $ErrorActionPreference = 'Stop'
+# 输出统一 UTF-8：中文 Windows 上 PowerShell 默认按 GBK 写管道，调用方按 UTF-8 解就是乱码
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type @'
@@ -187,11 +196,22 @@ if ($target -eq 'screen') {
   if ($procName -eq '') {
     $h = [PlShot]::GetForegroundWindow()
   } else {
-    $proc = Get-Process $procName -ErrorAction SilentlyContinue |
-      Where-Object { $_.MainWindowHandle -ne 0 -and ($title -eq '' -or $_.MainWindowTitle -like "*$title*") } |
-      Select-Object -First 1
-    if (-not $proc) { throw "没找到带窗口的进程：$procName" }
-    $h = $proc.MainWindowHandle
+    $want = $procName -replace '\.exe$', ''
+    # 带窗口的进程先筛一遍：后面两种匹配都在这个池子里找
+    $pool = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+      $_.MainWindowHandle -ne 0 -and ($title -eq '' -or $_.MainWindowTitle -like "*$title*")
+    })
+    # 先按进程名（大小写不敏感，带不带 .exe 都行）
+    $hit = $pool | Where-Object { $_.ProcessName -eq $want } | Select-Object -First 1
+    # 再把它当窗口标题的片段找一次：模型经常把标题（如 PackLeader）填进 process
+    # 而真实的进程是 node / powershell——日志里 3 次截图失败全踩这个
+    if (-not $hit) { $hit = $pool | Where-Object { $_.MainWindowTitle -like "*$want*" } | Select-Object -First 1 }
+    if (-not $hit) {
+      $names = ($pool | Select-Object -First 12 | ForEach-Object { $_.ProcessName + '(' + $_.MainWindowTitle + ')' }) -join '、'
+      if (-not $names) { $names = '当前没有任何带窗口的进程' }
+      throw "没找到窗口：process='$procName' title='$title'。当前带窗口的：$names"
+    }
+    $h = $hit.MainWindowHandle
   }
   if ($h -eq [IntPtr]::Zero) { throw '没有可截的前台窗口（target=window 且没给 process）' }
   # 最小化时 GetWindowRect 返回 -32000，先还原；临时置顶，避免别的窗口把它盖住

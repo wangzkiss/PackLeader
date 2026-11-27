@@ -292,6 +292,31 @@ export function createFsTools(root: string): Tool[] {
     return /\.(ps1|psm1|psd1)$/i.test(file)
   }
 
+  // 多命中时的报错：光给行号模型还得再 read 一遍才能构造出唯一的 old（日志里 10 次 edit
+  // 失败有 3 次是这么来的）。把每处上下相邻行也摆出来，它照着补就够。
+  // span 是这次命中占掉的「额外行数」（old 带尾换行时是 split 长度 - 1）。
+  function multiHitError(text: string, hits: Array<{ line: number; span: number }>): string {
+    const lines = text.split('\n')
+    const clipCtx = (s: string) => (s.length > 120 ? `${s.slice(0, 120)}…` : s.trimEnd())
+    const ctx = hits
+      .slice(0, 6)
+      .map(({ line, span }) => {
+        const before = clipCtx(lines[line - 2] ?? '')
+        const after = clipCtx(lines[line - 1 + span] ?? '')
+        const parts: string[] = []
+        if (before) parts.push(`上一行 ${JSON.stringify(before)}`)
+        if (after) parts.push(`下一行 ${JSON.stringify(after)}`)
+        return `  第 ${line} 行${parts.length ? `：${parts.join('，')}` : '（在文件边界上，没有相邻行）'}`
+      })
+      .join('\n')
+    const more = hits.length > 6 ? `\n  ……还有 ${hits.length - 6} 处` : ''
+    const where = hits.map((h) => h.line).join('、')
+    return (
+      `原文命中 ${hits.length} 处（第 ${where} 行），不唯一；` +
+      `请把相邻行也写进 old 里只留一处，或设 replace_all=true 全改：\n${ctx}${more}`
+    )
+  }
+
   const write: Tool = {
     name: 'write',
     description: '整体写入一个文件（会覆盖），必要时自动创建父目录。要小改动用 edit。',
@@ -353,9 +378,9 @@ export function createFsTools(root: string): Tool[] {
       const count = text.split(oldText).length - 1
 
       if (count > 1 && !all) {
-        throw new Error(
-          `原文命中 ${count} 处（第 ${hitLines(text, oldText).join('、')} 行），不唯一；请补充上下文或设 replace_all=true`,
-        )
+        // old 带尾换行时，命中实际吃到「下一行行首」，相邻行要按这个跨度算
+        const span = oldText.endsWith('\n') ? oldText.split('\n').length - 1 : oldText.split('\n').length
+        throw new Error(multiHitError(text, hitLines(text, oldText).map((line) => ({ line, span }))))
       }
       if (count >= 1) {
         const hit = all ? text.split(oldText).join(newText) : text.replace(oldText, newText)
@@ -424,9 +449,8 @@ export function createFsTools(root: string): Tool[] {
         )
       }
       if (hits.length > 1 && !all) {
-        throw new Error(
-          `原文命中 ${hits.length} 处（第 ${hits.map((i) => i + 1).join('、')} 行），不唯一；请补充上下文或设 replace_all=true`,
-        )
+        // want 是 old 按行切出来的，它的长度就是这次命中占的额外行数
+        throw new Error(multiHitError(text, hits.map((i) => ({ line: i + 1, span: want.length }))))
       }
 
       const crlf = text.includes('\r\n')

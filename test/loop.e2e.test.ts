@@ -303,6 +303,33 @@ test('e2e: 工具输出远超上限时按 64KB 预算截断（不是只裁 15%�
   }
 })
 
+test('e2e: 一字不差的重复调用不再整段回灌输出', async () => {
+  const big = `node -e "process.stdout.write('y'.repeat(4000))"`
+  const s = await setup(
+    [
+      { toolCalls: [{ name: 'shell', args: { command: big } }] },
+      { toolCalls: [{ name: 'shell', args: { command: big } }] },
+      { text: 'done' },
+    ],
+    { mode: 'full', approval: 'allow' },
+  )
+  try {
+    await s.agent.runTurn('同一条命令跑两次')
+    const results = s.session.events.filter((e) => e.kind === 'tool/result') as Array<{
+      content?: string
+      ok?: boolean
+    }>
+    assert.equal(results.length, 2)
+    assert.doesNotMatch(String(results[0]!.content), /完全相同/, '第一次不该带重复提示')
+    const dup = String(results[1]!.content)
+    assert.match(dup, /完全相同/)
+    assert.match(dup, /正文已省略/)
+    assert.ok(dup.length < 400, `重复结果应被压到一两百字，实际 ${dup.length}`)
+  } finally {
+    await s.close()
+  }
+})
+
 test('e2e: 系统提示要求思考过程用中文', async () => {
   const s = await setup([{ reasoning: '先想一想', text: '好' }])
   try {

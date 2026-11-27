@@ -151,6 +151,14 @@ export function truncateOutput(
   }
 }
 
+/**
+ * 重复调用时留在正文里的片段：头 200 字足已让模型认出「就是上次那个结果」，
+ * 又不会把整段（有的上万字）再塞一遍上下文。
+ */
+function headOfDup(s: string, max = 200): string {
+  return s.length <= max ? s : `${s.slice(0, max)}…`
+}
+
 export class Agent {
   private opts: AgentOptions
   private pendingApproval: string | null = null
@@ -557,10 +565,16 @@ export class Agent {
           for (let k = 0; k < batch.calls.length; k++) {
             const call = batch.calls[k]!
             const { result } = outcomes[k]!
-            // 一字不差的重复调用：结果照给，但提醒一句，别让模型把它当新信息
+            // 一字不差的重复调用：结果照给，但提醒一句，别让模型把它当新信息。
+            // 正文不再整段回灌——日志里 68 次重复调用（最多一条命令原样跑了 7 遍）每次都把
+            // 相同输出重新塞进上下文，白白吃 token；模型真要原文会自己 read。
             const dupOf = dupOfs[k]
             if (dupOf !== undefined) {
-              result.content = `[提示] 这一步的调用与第 ${dupOf} 步完全相同，结果应当一致；若确实没变化，就换别的查法。\n${result.content}`
+              const before = result.content.length
+              result.content =
+                `[提示] 这一步的调用与第 ${dupOf} 步完全相同，结果同上，正文已省略` +
+                `（原本 ${before} 字）。若确实没变化，就换别的查法。` +
+                (result.ok ? '' : `\n原文：${headOfDup(result.content)}`)
             }
             // 只有真的写成功了才算"改过文件"，后面据此决定要不要跑验证
             if (result.ok && (call.name === 'write' || call.name === 'edit')) {

@@ -79,7 +79,9 @@ export async function ingestFiles(
     const att: Attachment = { name, path: dest, bytes: st.size, mime }
 
     if (mime.startsWith('image/')) {
-      lines.push(`- ${name} — ${humanSize(st.size)}, ${mime}${opts.vision ? '（已作为图片附上，可以直接看）' : '（当前模型没开视觉，看不到内容，只能按文件名/大小判断）'}`)
+      // 路径必须给真的落盘路径（dest 带序号前缀，跟 name 不一样）：只报名字时模型会自己拼
+      // destDir/name 去 view_image，日志里 3 次全是这么失败的
+      lines.push(`- ${name} — ${humanSize(st.size)}, ${mime}${opts.vision ? `（已作为图片附上，可以直接看；要再看一遍就用 view_image，path 填 ${dest}）` : `（当前模型没开视觉，看不到内容，只能按文件名/大小判断；路径 ${dest}）`}`)
     } else if (mime.startsWith('text/') && st.size <= INLINE_MAX) {
       const raw = await readFile(dest, 'utf8').catch(() => '')
       // PowerShell 的 Set-Content/Out-File 会写 BOM。它会作为不可见字符进上下文，

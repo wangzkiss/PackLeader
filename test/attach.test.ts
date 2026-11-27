@@ -53,6 +53,9 @@ test('attach: 图片不内联，按视觉开关给不同说法', async () => {
 
   const on = await ingestFiles(data, 's-abc-3', [f], { vision: true })
   assert.match(on.text, /已作为图片附上/)
+  // 提示里必须给真实落盘路径（带序号前缀），否则模型照 name 拼路径去 view_image 会找不到
+  assert.ok(on.text.includes(on.attachments[0]!.path), `提示里应含落盘路径，实际：${on.text}`)
+  assert.match(on.text, /view_image/)
 })
 
 test('attach: 同名文件不互相覆盖，序号前缀保证都在', async () => {

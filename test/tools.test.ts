@@ -194,3 +194,17 @@ test('fs.edit 多命中时列出每个命中的行号', async () => {
   await writeFile(join(ctx.root, 'dup2.txt'), 'aa\nbb\naa\n', 'utf8')
   await assert.rejects(() => edit.run(ctx, { path: 'dup2.txt', old: 'aa\n', new: 'xx\n' }), /第 1、3 行/)
 })
+
+test('fs.edit 多命中时把每处的相邻行也摆出来，省得模型再 read 一遍', async () => {
+  const { ctx, tools } = await ws()
+  const edit = tools.get('edit')!
+  await writeFile(join(ctx.root, 'dup3.txt'), 'top\nDUP\nafter1\nmid\nDUP\nafter2\n', 'utf8')
+  const err = await edit
+    .run(ctx, { path: 'dup3.txt', old: 'DUP\n', new: 'X\n' })
+    .then(() => '')
+    .catch((e: Error) => e.message)
+  assert.match(err, /第 2、5 行/)
+  assert.match(err, /第 2 行：上一行 "top"，下一行 "after1"/)
+  assert.match(err, /第 5 行：上一行 "mid"，下一行 "after2"/)
+  assert.doesNotMatch(err, /^$/)
+})

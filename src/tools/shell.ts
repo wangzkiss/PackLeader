@@ -216,13 +216,18 @@ export function runShell(
 export function createShellTools(opts: { cwd: string; timeoutMs?: number }): Tool[] {
   const shell: ShellSpec = resolveShell()
   const legacyHint = shell.legacy ? '注意这是 Windows PowerShell 5.1：不支持 && 和 ||，请用 ; 分隔语句。' : ''
+  // 输出编码由 runShell 在每条命令前自动设好，但描述里不写明的话模型会照旧自己拼
+  // chcp 65001 / $OutputEncoding（日志里 219/271 条命令带了手工前缀，还有拼错把注释带崩的）。
+  const utf8Hint = shell.prefix
+    ? '输出已由工具自动按 UTF-8 解码，中文不会乱码：不要再自己加 chcp 65001 或设 $OutputEncoding，纯属多余。'
+    : ''
   const tool: Tool = {
     name: 'shell',
     description: isWin
-      ? `执行一条 ${shell.label} 命令（一次性，不保留状态）。工作目录是 workspace 根。${legacyHint}` +
+      ? `执行一条 ${shell.label} 命令（一次性，不保留状态）。工作目录是 workspace 根。${legacyHint}${utf8Hint}` +
         '复杂脚本、带中文或引号的命令，先 write 到临时文件再用 -File 执行，比在命令行里拼更稳。' +
         '要等进程/端口/窗口/文件出现，用 waitfor，别在命令里 sleep。'
-      : `执行一条 ${shell.label} 命令（一次性，不保留状态）。工作目录是 workspace 根。` +
+      : `执行一条 ${shell.label} 命令（一次性，不保留状态）。工作目录是 workspace 根。${utf8Hint}` +
         '要等端口/文件出现，用 waitfor，别在命令里 sleep。',
     parameters: {
       type: 'object',

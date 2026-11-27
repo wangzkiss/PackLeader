@@ -299,23 +299,73 @@ export class Session {
         // 一批 tool/result 到此结束，截图可以补上了
         flushShots()
         if (e.kind === 'user/message') {
-        // 图片存在 attachment 目录里，请求前才读成 base64：日志里不存二进制
-        const images = (e.files ?? [])
-          .filter((f) => f.mime.startsWith('image/'))
-          .map((f) => {
-            try {
-              return { mime: f.mime, dataBase64: readFileSync(f.path).toString('base64') }
-            } catch {
-              return null
-            }
-          })
-          .filter((x): x is { mime: string; dataBase64: string } => x !== null)
-        out.push({ role: 'user', content: e.text, ...(images.length ? { images } : {}) })
-        } else if (e.kind === 'assistant/message')
+          // 图片存在 attachment 目录里，请求前才读成 base64：日志里不存二进制
+          const images = (e.files ?? [])
+            .filter((f) => f.mime.startsWith('image/'))
+            .map((f) => {
+              try {
+                return { mime: f.mime, dataBase64: readFileSync(f.path).toString('base64') }
+              } catch {
+                return null
+              }
+            })
+            .filter((x): x is { mime: string; dataBase64: string } => x !== null)
+          out.push({ role: 'user', content: e.text, ...(images.length ? { images } : {}) })
+        } else if (e.kind === 'assistant/message') {
           out.push({ role: 'assistant', content: e.text, toolCalls: (e.toolCalls ?? []).length ? e.toolCalls : undefined })
+        }
       }
     }
     flushShots()
+    // 插话（界面上的「插一句」）是在某一轮跑到一半时 append 进日志的，落点常常正好在
+    // assistant(tool_calls) 与它的 tool/result 之间。带 tool_calls 的 assistant 后面必须
+    // 紧跟对应的 tool 消息，中间夹一条 user 会让服务端把整批工具结果判为无效 ——
+    // 表现就是「插话没生效」：模型照旧按老计划走，那句提醒等于没发。
+    // 这里不改日志，只在投影结果上把这句 user 挪到这批工具结果之后。
+    function hoistInterjections(msgs: LlmMessage[]): void {
+      // 思路：一趟扫过去，遇到「带 tool_calls 的 assistant」就把它后面属于这批的 tool 消息
+      // 全部收齐，夹在中间的其它消息（插话）排到这批 tool 之后。这样产出的序列永远满足
+      // 「assistant(tool_calls) → 紧跟着它的 tool 消息」。
+      const out2: LlmMessage[] = []
+      let i = 0
+      while (i < msgs.length) {
+        const m = msgs[i]!
+        out2.push(m)
+        i++
+        if (m.role !== 'assistant' || !m.toolCalls?.length) continue
+        const ids = new Set(m.toolCalls.map((c) => c.id))
+        const tools: LlmMessage[] = []
+        const strays: LlmMessage[] = []
+        // 往后看：连续的 tool 属于这批；夹在其中的非 tool 先攒着；遇到别的东西就停
+        while (i < msgs.length) {
+          const n = msgs[i]!
+          if (n.role === 'tool') {
+            tools.push(n)
+            i++
+            continue
+          }
+          // 非 tool：这批结果还没收齐时可能是被插话打断（说明工具还在跑、result 尚未写入），
+          // 记下来；收齐之后遇到的就不是打断，而是下一段对话，停止。
+          if (tools.length < ids.size) {
+            strays.push(n)
+            i++
+            continue
+          }
+          break
+        }
+        // 一条 tool 结果都没有（工具正在执行中）：原样保留，插话照旧排在 assistant 之后，
+        // 等下一轮投影时 result 已经写入，自然会走到上面的重排分支。
+        if (!tools.length) {
+          out2.push(...strays)
+          continue
+        }
+        out2.push(...tools, ...strays)
+      }
+      msgs.length = 0
+      msgs.push(...out2)
+    }
+
+    hoistInterjections(out)
     return out
   }
 }

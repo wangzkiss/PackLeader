@@ -130,6 +130,67 @@ test('insert: 跑着的时候插话，模型下一步能看到，且不另起一
   }
 })
 
+test('insert: 插话落在工具执行期间，也要排在这批工具结果之后（否则服务端整批判无效）', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pl-insert-mid-ws-'))
+  const dataDir = await mkdtemp(join(tmpdir(), 'pl-insert-mid-data-'))
+  // 用一条会卡住的命令撑开「tool/call 已写入、tool/result 还没写」的窗口，
+  // 让插话正好落在这段里——这正是用户实际遇到的情况。
+  const llm = await startFakeLlm([
+    {
+      toolCalls: [
+        {
+          id: 'c1',
+          name: 'shell',
+          args: { command: 'node -e "setTimeout(()=>{},600)"', timeout: 30000 },
+        },
+      ],
+    },
+    { text: '看到了插话' },
+  ])
+  const host = new HostProc([
+    '--cwd', root,
+    '--data-dir', dataDir,
+    '--base-url', llm.url,
+    '--api-key', 'sk-x',
+    '--model', 'demo-model',
+  ])
+
+  try {
+    await host.next('ready')
+    host.send({ cmd: 'task', text: '跑个慢命令' })
+    await host.next('turn-start')
+
+    const ap = await host.next('approval')
+    host.send({ cmd: 'approve', reqId: ap.reqId, decision: 'allowed-once' })
+
+    // 工具已经开始执行（tool-start 已到、tool-end 还没来）：此刻插话
+    await host.next('tool-start')
+    host.send({ cmd: 'insert', text: '别跑完，直接换计划' })
+    assert.match(String((await host.next('notice')).text), /已插话/)
+
+    await host.next('tool-end')
+    assert.equal((await host.next('turn-end')).reason, 'done')
+
+    // 关键断言：第二步请求里，插话那条 user 消息必须排在那条 tool 结果之后，
+    // 否则 assistant(tool_calls) 与 tool 之间夹了 user，整批会被判无效、插话等于没发。
+    const msgs = (llm.requests[llm.requests.length - 1] as { messages: Array<{ role: string; content: string }> }).messages
+    const userIdx = msgs.findIndex((m) => m.role === 'user' && m.content.includes('别跑完，直接换计划'))
+    const toolIdx = msgs.findIndex((m) => m.role === 'tool')
+    assert.ok(userIdx >= 0, '插话必须出现在请求里')
+    assert.ok(toolIdx >= 0, 'tool 结果必须还在')
+    assert.ok(userIdx > toolIdx, `插话应排在 tool 结果之后，实际 user@${userIdx} tool@${toolIdx}`)
+    // 第二条 assistant(tool_calls) 与其 tool 结果之间不许夹 user
+    const callIdx = msgs.findIndex((m) => m.role === 'assistant' && (m as { toolCalls?: unknown[] }).toolCalls?.length)
+    if (callIdx >= 0) {
+      const between = msgs.slice(callIdx + 1, toolIdx)
+      assert.equal(between.filter((m) => m.role === 'user').length, 0, 'tool_calls 与 tool 结果之间不该夹 user 消息')
+    }
+  } finally {
+    await host.close()
+    await llm.close()
+  }
+})
+
 test('insert: 插话也能带附件——图片和文件的处理跟正常发一轮一致', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pl-insert3-ws-'))
   const dataDir = await mkdtemp(join(tmpdir(), 'pl-insert3-data-'))

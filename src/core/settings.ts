@@ -41,6 +41,11 @@ export interface Provider {
   baseURL: string
   apiKey: string
   model: string
+  /**
+   * 这家能用的模型名。对话框底部的模型菜单按它分组列出来；没拉取过就是空，
+   * 由 modelsOf 用当前 model 兜底（老 config.json 没有这个字段也能用）。
+   */
+  models?: string[]
 }
 
 export interface Settings {
@@ -157,6 +162,12 @@ function coerceProvider(raw: unknown): Provider | undefined {
   if (!baseURL) return undefined
   const id = str('id') || `p-${Math.random().toString(36).slice(2, 10)}`
   const p: Provider = { id, name: str('name'), baseURL, apiKey: str('apiKey'), model: str('model') }
+  const models = cleanModels(obj.models)
+  if (models) {
+    // 当前 model 必须在这家的列表里：菜单上要靠它打勾
+    if (p.model && !models.includes(p.model)) models.unshift(p.model)
+    p.models = models
+  }
   return p
 }
 
@@ -193,6 +204,33 @@ export function activeProviderOf(s: Settings): Provider | undefined {
   return list.find((p) => p.id === active) ?? list[0]
 }
 
+/** 模型名清洗：去空、去重（保序）、上限 200 条；一条都没有就当没写 */
+function cleanModels(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const out: string[] = []
+  for (const x of raw) {
+    if (typeof x !== 'string') continue
+    const m = x.trim()
+    if (!m || out.includes(m)) continue
+    out.push(m)
+    if (out.length >= 200) break
+  }
+  return out.length ? out : undefined
+}
+
+/**
+ * 一家供应商可供选择的模型：缓存过的列表优先，没缓存就用当前 model 兜底。
+ *
+ * 界面底部的模型菜单按这个分组画；返回的列表里一定包含当前正在用的那个模型，
+ * 否则菜单上「打勾的那一项」会找不到自己在哪一行。
+ */
+export function modelsOf(p: Provider): string[] {
+  const list = cleanModels(p.models) ?? []
+  const cur = p.model?.trim() ?? ''
+  if (cur && !list.includes(cur)) list.unshift(cur)
+  return list
+}
+
 /** 界面上的显示名：没起名字就用端点 */
 export function providerLabel(p: Provider): string {
   return p.name || p.baseURL
@@ -215,6 +253,11 @@ export function normalizeProviders(list: Provider[]): Provider[] {
       baseURL,
       apiKey: raw.apiKey?.trim() ?? '',
       model: raw.model?.trim() ?? '',
+    }
+    const models = cleanModels(raw.models)
+    if (models) {
+      if (p.model && !models.includes(p.model)) models.unshift(p.model)
+      p.models = models
     }
     out.push(p)
   }

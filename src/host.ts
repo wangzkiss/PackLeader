@@ -28,6 +28,7 @@ import {
   llmTimeoutsOf,
   loadSettings,
   maskKey,
+  modelsOf,
   normalizeProviders,
   providersOf,
   saveSettings,
@@ -569,6 +570,8 @@ async function main(): Promise<void> {
     name: p.name,
     baseURL: p.baseURL,
     model: p.model,
+    // 这家的模型列表：没拉取过时用当前 model 兜底，菜单总能有东西可列
+    models: modelsOf(p),
     apiKeyMasked: maskKey(p.apiKey),
     hasKey: Boolean(p.apiKey),
   })
@@ -829,6 +832,61 @@ async function main(): Promise<void> {
         break
       }
       case 'list-models': {
+        /**
+         * all=true：对话框底部的模型菜单要一次看到「所有供应商 × 各自的模型」，所以并发拉每一家的 /models。
+         * 一家失败（没 Key / 404 / 超时）只记在那家名下，不影响别家——菜单该照常能用；
+         * 拉不到时退回那家缓存过的列表（或当前 model），至少不空着。
+         */
+        if (cmd.all) {
+          const targets = providerList.filter((p) => p.apiKey)
+          const rows: Array<{ id: string; name: string; items: string[]; error?: string }> = []
+          await Promise.all(
+            targets.map(async (p) => {
+              const row: { id: string; name: string; items: string[]; error?: string } = {
+                id: p.id,
+                name: p.name || p.baseURL,
+                items: [],
+              }
+              try {
+                const r = await fetch(`${p.baseURL.replace(/\/+$/, '')}/models`, {
+                  headers: { authorization: `Bearer ${p.apiKey}` },
+                  signal: AbortSignal.timeout(8_000),
+                })
+                const body = (await r.json().catch(() => ({}))) as {
+                  data?: Array<{ id?: string }>
+                  error?: { message?: string }
+                }
+                if (!r.ok) {
+                  row.error = `HTTP ${r.status}${body.error?.message ? '：' + body.error.message : ''}`
+                } else {
+                  const items = (body.data ?? []).map((m) => String(m.id ?? '')).filter(Boolean).sort()
+                  if (items.length) {
+                    p.models = items
+                    row.items = modelsOf(p)
+                  }
+                }
+              } catch (e) {
+                row.error = (e as Error).message
+              }
+              if (!row.items.length) row.items = modelsOf(p)
+              rows.push(row)
+            }),
+          )
+          // 按 providerList 的原顺序排（不能按并发完成的先后）：不然搜索框里的分组顺序每次打开都在跳
+          rows.sort((a, b) => providerList.findIndex((p) => p.id === a.id) - providerList.findIndex((p) => p.id === b.id))
+          // 拉到的列表缓存进 config.json：下次打开菜单不再等这一轮网络
+          if (rows.some((r) => !r.error && r.items.length)) {
+            void saveSettings(opts.dataDir, { providers: providerList }).catch(() => {})
+          }
+          send({
+            type: 'models',
+            items: rows.flatMap((r) => r.items),
+            byProvider: rows,
+            providers: providerList.map(publicProvider),
+            activeProvider: activeId,
+          })
+          break
+        }
         // providerId 给了就按「那一家」的端点/Key 拉（设置面板里可能正在看别家，还没保存）
         const wantProvider = String(cmd.providerId ?? '').trim()
         const fromList = wantProvider ? providerList.find((p) => p.id === wantProvider) : undefined
@@ -849,7 +907,20 @@ async function main(): Promise<void> {
             break
           }
           const items = (body.data ?? []).map((m) => String(m.id ?? '')).filter(Boolean).sort()
-          send({ type: 'models', items })
+          // 记住这一家的模型列表：设置面板点一次「拉取」之后，对话框的模型菜单
+          // 下次打开就有分组可列，不用再等一轮网络
+          const owner = fromList ?? providerList.find((p) => p.baseURL === baseURL)
+          if (owner && items.length) {
+            owner.models = modelsOf({ ...owner, models: items })
+            void saveSettings(opts.dataDir, { providers: providerList }).catch(() => {})
+          }
+          send({
+            type: 'models',
+            items,
+            providerId: owner?.id ?? null,
+            providers: providerList.map(publicProvider),
+            activeProvider: activeId,
+          })
         } catch (e) {
           send({ type: 'error', message: `拉取模型失败：${(e as Error).message}` })
         }
@@ -923,6 +994,44 @@ async function main(): Promise<void> {
           void saveSettings(opts.dataDir, { model: m }).catch(() => {})
           send({ type: 'model', model: m })
         }
+        break
+      }
+      case 'use-model': {
+        // 底部模型菜单选中的「某一家的某个模型」：切供应商 + 换模型，一次到位。
+        // 和上一个 case 的区别：那个只改当前这家的模型名、不动供应商；
+        // 这里是「从 A 家的 x 模型跳到 B 家的 y 模型」，两边都得改，还得落盘。
+        const wantPid = String(cmd.providerId ?? '').trim()
+        const wantModel = String(cmd.model ?? '').trim()
+        if (!wantModel) {
+          send({ type: 'error', message: '没有指定模型' })
+          break
+        }
+        const target = wantPid
+          ? providerList.find((p) => p.id === wantPid)
+          : providerList.find((p) => p.id === activeId)
+        if (!target) {
+          send({ type: 'error', message: '找不到这个供应商（可能在设置里被删了），重开一下模型菜单' })
+          break
+        }
+        // 正在跑的那一轮不打断，只影响下一轮（和切档、切模型的行为一致）
+        applyProvider(target)
+        target.model = wantModel
+        llm.cfg.model = wantModel
+        opts.model = wantModel
+        // 选中的模型要进这家的列表，否则菜单下次打开时「打勾的那一行」找不到
+        target.models = modelsOf(target)
+        try {
+          await saveSettings(opts.dataDir, {
+            providers: providerList,
+            activeProvider: target.id,
+            baseURL: target.baseURL,
+            apiKey: target.apiKey,
+            model: wantModel,
+          })
+        } catch (e) {
+          send({ type: 'error', message: `模型已切换，但没写进磁盘：${(e as Error).message}` })
+        }
+        send({ type: 'model', model: wantModel, providerId: target.id, providerName: target.name || target.baseURL })
         break
       }
       case 'load-config': {

@@ -5283,6 +5283,73 @@ function New-MenuRow([string]$text, [string]$mark) {
   return $b
 }
 
+# 模型菜单的内容区：按供应商分组列出各自的模型，$filter 非空时按名字过滤。
+#
+# 为什么要分组：一个人常同时配好几家（公司网关、官方 API、本地 Ollama），
+# 同一个模型名在不同家往往是不同的东西；平铺成一列时看不出「这行是哪家的」，
+# 选错了还得回设置里翻半天。
+function Update-ModelRows([string]$filter) {
+  $rows = $script:modelRows
+  if (-not $rows) { return }
+  $rows.Children.Clear()
+  $f = ([string]$filter).Trim().ToLowerInvariant()
+  $providers = @($script:cfgProviders)
+  # 一家都没配（老配置只有顶层 baseURL/apiKey/model）：当成唯一一家「默认」列出来
+  if ($providers.Count -eq 0) {
+    $providers = @([pscustomobject]@{
+      id = ''; name = ''; baseURL = $script:cfgBaseURL
+      model = $script:modelName; models = @($script:modelChoices)
+    })
+  }
+  $any = $false
+  foreach ($p in $providers) {
+    $models = @($p.models | Where-Object { $_ })
+    if ($models.Count -eq 0 -and $p.model) { $models = @([string]$p.model) }
+    $matched = @()
+    foreach ($m in $models) {
+      if ($f -and -not ([string]$m).ToLowerInvariant().Contains($f)) { continue }
+      $matched += [string]$m
+    }
+    if ($matched.Count -eq 0) { continue }
+    $any = $true
+
+    # 组头：供应商名（没起名字就用端点，和设置面板上的显示一致）
+    $head = New-Object System.Windows.Controls.TextBlock
+    $pname = [string]$p.name
+    if (-not $pname) { $pname = [string]$p.baseURL }
+    $head.Text = $pname
+    $head.FontSize = 10.5
+    $head.FontFamily = 'Segoe UI'
+    $head.Foreground = (Brush '#7C838E')
+    $head.Margin = '10,9,10,3'
+    $head.TextTrimming = 'CharacterEllipsis'
+    $rows.Children.Add($head) | Out-Null
+
+    foreach ($m in $matched) {
+      $isCur = ([string]$m -eq [string]$script:modelName) -and
+               ((-not $p.id) -or ([string]$p.id -eq [string]$script:cfgActiveProvider))
+      $row = New-MenuRow $m $(if ($isCur) { '✓' } else { '' })
+      # PS 5.1 的坑：事件里别用 GetNewClosure（会把整个作用域复制一份，$script 里改的东西全丢），
+      # 要传的值都塞进 Tag，处理时再拆开
+      $row.Tag = ([string]$p.id) + [char]1 + $m
+      $row.Add_Click({
+        param($s, $e)
+        if ($script:modelPopup) { $script:modelPopup.IsOpen = $false }
+        $parts = ([string]$s.Tag) -split ([char]1), 2
+        $msg = @{ cmd = 'use-model'; model = $parts[1] }
+        if ($parts[0]) { $msg['providerId'] = $parts[0] }
+        Send-Host $msg
+      })
+      $rows.Children.Add($row) | Out-Null
+    }
+  }
+  if (-not $any) {
+    $tip = $(if ($f) { '没有匹配的模型' } else { '还没有模型列表，打开设置拉一次' })
+    $rows.Children.Add((New-MenuRow $tip '')) | Out-Null
+  }
+}
+
+# 底部模型按钮的菜单：搜索框 + 按供应商分组 + 当前项打勾
 function Show-ModelMenu([object]$anchor) {
   if ($script:modelPopup) { $script:modelPopup.IsOpen = $false }
   $box = New-Object System.Windows.Controls.Border
@@ -5291,26 +5358,49 @@ function Show-ModelMenu([object]$anchor) {
   $box.BorderThickness = '1'
   $box.CornerRadius = '8'
   $box.Padding = '4'
-  $box.MinWidth = 240
-  $box.MaxWidth = 460
+  $box.MinWidth = 260
+  $box.MaxWidth = 470
   $col = New-Object System.Windows.Controls.StackPanel
 
-  $list = @($script:modelChoices)
-  if ($list.Count -eq 0 -and $script:modelName) { $list = @($script:modelName) }
-  foreach ($m in $list) {
-    $isCur = ([string]$m -eq [string]$script:modelName)
-    $row = New-MenuRow ([string]$m) $(if ($isCur) { '✓' } else { '' })
-    $row.Tag = [string]$m
-    $row.Add_Click({
-      param($s, $e)
-      if ($script:modelPopup) { $script:modelPopup.IsOpen = $false }
-      Send-Host @{ cmd = 'model'; model = [string]$s.Tag }
-    })
-    $col.Children.Add($row) | Out-Null
-  }
-  if ($list.Count -eq 0) {
-    $col.Children.Add((New-MenuRow '还没有模型列表，先去设置里拉一次' '')) | Out-Null
-  }
+  # 搜索框：一家端点就可能列出上百个模型，没有搜索只能一路滚
+  $searchLabel = New-Object System.Windows.Controls.TextBlock
+  $searchLabel.Text = '搜索模型'
+  $searchLabel.FontSize = 10
+  $searchLabel.FontFamily = 'Segoe UI'
+  $searchLabel.Foreground = (Brush '#5B626D')
+  $searchLabel.Margin = '8,4,8,3'
+  $col.Children.Add($searchLabel) | Out-Null
+
+  $search = New-Object System.Windows.Controls.TextBox
+  $search.FontSize = 11.5
+  $search.FontFamily = 'Cascadia Mono, Consolas'
+  $search.Foreground = (Brush '#E5E7EB')
+  $search.Background = (Brush '#16181D')
+  $search.BorderThickness = '1'
+  $search.BorderBrush = (Brush '#26FFFFFF')
+  $search.Padding = '7,5'
+  $search.Margin = '4,0,4,4'
+  $search.CaretBrush = (Brush '#8AB4FF')
+  $col.Children.Add($search) | Out-Null
+
+  $rows = New-Object System.Windows.Controls.StackPanel
+  $script:modelRows = $rows
+  $scroll = New-Object System.Windows.Controls.ScrollViewer
+  $scroll.MaxHeight = 330
+  $scroll.VerticalScrollBarVisibility = 'Auto'
+  $scroll.HorizontalScrollBarVisibility = 'Disabled'
+  # 坑：ScrollViewer 的 Child 是 protected，PS 里 $scroll.Child = ... 会抛
+  # 「The property 'Child' cannot be found on this object」，整条点击链跟着崩；要用 Content
+  $scroll.Content = $rows
+  $col.Children.Add($scroll) | Out-Null
+
+  # 边打字边过滤（内容区重画，菜单本身不重建，焦点不丢）
+  $search.Add_TextChanged({
+    param($s, $e)
+    Update-ModelRows ([string]$s.Text)
+  })
+
+  Update-ModelRows ''
 
   $sep = New-Object System.Windows.Controls.Border
   $sep.Height = '1'
@@ -5337,6 +5427,15 @@ function Show-ModelMenu([object]$anchor) {
   $pop.Child = $box
   $script:modelPopup = $pop
   $pop.IsOpen = $true
+
+  # 有哪家的模型列表还是空的（新加的供应商 / 从没拉过）：趁菜单开着先问一次，
+  # 回包后由 'models' 事件重画内容区，不用让用户再点第二遍
+  $needFetch = $false
+  foreach ($p in @($script:cfgProviders)) { if (@($p.models | Where-Object { $_ }).Count -eq 0) { $needFetch = $true } }
+  if ($script:hasKey -and ($needFetch -or @($script:cfgProviders).Count -eq 0)) {
+    Send-Host @{ cmd = 'list-models'; all = $true }
+  }
+  try { $search.Focus() | Out-Null } catch { }
 }
 
 
@@ -6370,17 +6469,33 @@ function Handle-Event-Core([string]$line) {
     }
     'models' {
       $script:fetching = $false
-      # 端点里真实存在的模型：点一个就填进「模型名」
-      $ModelChips.Children.Clear()
       $items = @($e.items)
       # 底部模型菜单用同一份列表
       $script:modelChoices = @($items)
+      # list-models all 的回包带着整份供应商列表：刷进来，菜单分组才和刚拉到的对上
+      if ($null -ne $e.providers) {
+        $script:cfgProviders = @($e.providers)
+        if ($e.activeProvider) { $script:cfgActiveProvider = [string]$e.activeProvider }
+      }
+      # 每家的模型列表：JSON 转出来的对象没这个属性时直接赋值会报错，统一 Add-Member -Force
+      if ($null -ne $e.byProvider) {
+        foreach ($bp in @($e.byProvider)) {
+          $hit = @($script:cfgProviders | Where-Object { [string]$_.id -eq [string]$bp.id })
+          if ($hit.Count -gt 0) {
+            $hit[0] | Add-Member -NotePropertyName models -NotePropertyValue @($bp.items) -Force
+          }
+        }
+      }
+      # 菜单开着就重画：用户可能正盯着它等模型出来
+      if ($script:modelPopup -and $script:modelPopup.IsOpen) { Update-ModelRows '' }
+      # 端点里真实存在的模型：点一个就填进「模型名」
+      $ModelChips.Children.Clear()
       if ($items.Count -eq 0) {
         $ModelHint.Foreground = (Brush '#F87171')
         $ModelHint.Text = '端点没返回任何模型（检查地址要不要带 /v1）'
       } else {
         $ModelHint.Foreground = (Brush '#7C838E')
-        $ModelHint.Text = "共 $($items.Count) 个，点一下填进上面的框"
+        $ModelHint.Text = "共 $($items.Count) 个，点一下填进上面的框（已记住，对话框里的模型菜单也能直接选）"
         $ModelChips.Visibility = 'Visible'
         foreach ($id in $items) {
           $btn = New-Object System.Windows.Controls.Button
@@ -6561,10 +6676,7 @@ $InputBox.Add_PreviewKeyDown({
 # 底部模型按钮：点开就是可选模型列表，选一个直接切
 $ModelPill.Add_Click({
   param($s, $e)
-  # 还没拉过列表就先问一次；没 key 就不问，免得每点一下都往对话里塞一条错误
-  if ($script:modelChoices.Count -eq 0 -and $script:hasKey) {
-    Send-Host @{ cmd = 'list-models'; baseURL = $script:cfgBaseURL }
-  }
+  # 菜单自己会在「有哪家还没拉到模型」时去拉一次（list-models all），这里只管弹菜单
   Show-ModelMenu $s
 })
 

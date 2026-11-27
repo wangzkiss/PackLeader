@@ -114,8 +114,29 @@ OpenAI 兼容流式适配器：`tool_calls` 按 index 分片聚合、`reasoning_
 | `idleSecs` | 流式输出中两段数据之间最长间隔（取值 5–3600） | 180 秒 |
 | `requestSecs` | 单次请求整体上限（取值 30–7200） | 900 秒 |
 | `perf` | 性能日志档：`off` / `basic` / `full` | `basic` |
+| `providers` | 多个模型供应商（每项 `id` / `name` / `baseURL` / `apiKey` / `model` / `models`） | 无（单家时折算成 `p-default`） |
+| `activeProvider` | 当前用哪一家 | 最后用的那家 |
+| `models` | （每家供应商里）拉取过的模型列表，菜单直接用它，不必每次等网络 | 自动缓存 |
 
 超时项在界面上暂不暴露，手改 `config.json` 即可；别的字段在设置面板里都能改。长上下文一轮下来上下文十几万 token 时，服务端 prefill 就可能一两分钟才吐第一个字，所以默认放宽到 120 秒；网关更慢就写 300 / 600。界面上 Key 输入框永远留空，只显示 `sk-p…3456` 这类掩码。
+
+### 多个供应商：在对话框里换模型
+
+`config.json` 可以写好几家（OpenAI 兼容就行），`activeProvider` 指当前这家；顶层 `baseURL` / `apiKey` / `model` 只是当前生效值的快照，换一家会跟着变：
+
+```json
+{
+  "providers": [
+    { "id": "p-default", "name": "DeepSeek 账号", "baseURL": "https://api.deepseek.com/v1", "apiKey": "sk-...", "model": "deepseek-chat" },
+    { "id": "p-gw",      "name": "公司网关",     "baseURL": "http://127.0.0.1:19790/v1", "apiKey": "sk-...", "model": "deepseek-flash" }
+  ],
+  "activeProvider": "p-gw"
+}
+```
+
+对话框右下角的模型按钮点开就是一个菜单：顶上搜索框按名字过滤，下面按供应商分组，当前在用的那一行打 ✓，点任一行就切到「那家的那个模型」——立刻生效并写回 `config.json`，下一句就打到那家，不用重启。
+
+每家拉过一次模型列表（菜单里一个模型都没有时点一下按钮就会去这家端点的 `/models` 拉，一家连不上不影响别家）后，结果记进这家的 `models`，下次打开菜单直接显示、不再等网络；菜单里列的是端点报的模型名，外加这家自己的当前 `model`。设置面板里拖「拉取模型」也走同一套缓存。
 
 ### 数据目录
 默认 `~/.packleader`（`PACKLEADER_HOME` 可改）：

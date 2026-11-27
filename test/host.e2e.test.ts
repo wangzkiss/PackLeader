@@ -4,6 +4,7 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { createServer } from 'node:http'
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -98,6 +99,25 @@ async function setup(): Promise<{ host: HostProc; root: string; dataDir: string;
     'demo-model',
   ])
   return { host, root, dataDir, llm, close: async () => { await host.close(); await llm.close() } }
+}
+
+/** 只回 /models 的假端点：验证「一次拉所有供应商」时的正常那一家 */
+async function startModelServer(ids: string[]): Promise<{ url: string; close: () => Promise<void> }> {
+  const server = createServer((req, res) => {
+    if (req.url?.endsWith('/models')) {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ data: ids.map((id) => ({ id })) }))
+      return
+    }
+    res.writeHead(404).end('not found')
+  })
+  await new Promise<void>((ok) => server.listen(0, '127.0.0.1', ok))
+  const addr = server.address()
+  if (!addr || typeof addr === 'string') throw new Error('假 /models 启动失败')
+  return {
+    url: `http://127.0.0.1:${addr.port}/v1`,
+    close: () => new Promise<void>((ok, fail) => server.close((e) => (e ? fail(e) : ok()))),
+  }
 }
 
 test('host: load-config reloads hand-edited settings and applies them to the running client', async () => {
@@ -330,5 +350,105 @@ test('host: 未知命令回 error，ping 回 pong，sessions 可列', async () =
     assert.ok(Array.isArray(list.items))
   } finally {
     await s.close()
+  }
+})
+
+test('host: use-model 切到另一家的模型，下一轮真的打到那家，且落盘', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pl-usemodel-ws-'))
+  const dataDir = await mkdtemp(join(tmpdir(), 'pl-usemodel-data-'))
+  const a = await startFakeLlm([{ text: '甲家回答' }])
+  const b = await startFakeLlm([{ text: '乙家回答' }])
+  await writeFile(
+    join(dataDir, 'config.json'),
+    JSON.stringify({
+      providers: [
+        { id: 'p-a', name: '甲家', baseURL: a.url, apiKey: 'sk-a', model: 'a-1' },
+        { id: 'p-b', name: '乙家', baseURL: b.url, apiKey: 'sk-b', model: 'b-1' },
+      ],
+      activeProvider: 'p-a',
+    }),
+    'utf8',
+  )
+  // 不传 --base-url/--api-key/--model：让 host 完全按 config.json 里的供应商列表走
+  const host = new HostProc(['--cwd', root, '--data-dir', dataDir, '--mode', 'read-only'])
+  try {
+    const ready = await host.next('ready')
+    assert.equal(ready.model, 'a-1')
+    const provs = ready.providers as Array<{ id: string; models: string[] }>
+    assert.equal(provs.length, 2)
+    assert.deepEqual(provs[0]?.models, ['a-1'], '没缓存过就退化成当前模型一项')
+
+    host.send({ cmd: 'use-model', providerId: 'p-b', model: 'b-2' })
+    const switched = await host.next('model')
+    assert.equal(switched.model, 'b-2')
+    assert.equal(switched.providerId, 'p-b')
+
+    host.send({ cmd: 'task', text: '你好' })
+    await host.next('turn-end')
+    assert.equal(b.requests.length, 1, '应该打到乙家')
+    assert.equal((b.requests[0] as Record<string, unknown>).model, 'b-2', '带的是刚选的那个模型')
+    assert.equal(a.requests.length, 0, '不该再打甲家')
+
+    const cfg = JSON.parse(await readFile(join(dataDir, 'config.json'), 'utf8')) as {
+      activeProvider: string
+      model: string
+      baseURL: string
+      providers: Array<{ id: string; models?: string[] }>
+    }
+    assert.equal(cfg.activeProvider, 'p-b')
+    assert.equal(cfg.model, 'b-2')
+    assert.equal(cfg.baseURL, b.url)
+    assert.ok(cfg.providers.find((p) => p.id === 'p-b')?.models?.includes('b-2'), '选过的模型要进这家的列表')
+  } finally {
+    await host.close()
+    await a.close()
+    await b.close()
+  }
+})
+
+test('host: list-models all 并发拉所有供应商，一家连不上不影响别家，拉到的会缓存', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pl-listmodels-ws-'))
+  const dataDir = await mkdtemp(join(tmpdir(), 'pl-listmodels-data-'))
+  const good = await startModelServer(['g-1', 'g-2'])
+  // 坏的一家：拿一个刚关掉的端口，连不上＝真实场景里那家端点挂了
+  const dead = await startModelServer([])
+  const deadUrl = dead.url
+  await dead.close()
+  await writeFile(
+    join(dataDir, 'config.json'),
+    JSON.stringify({
+      providers: [
+        { id: 'p-good', name: '好的一家', baseURL: good.url, apiKey: 'sk-g', model: 'g-1' },
+        { id: 'p-bad', name: '坏的一家', baseURL: deadUrl, apiKey: 'sk-d', model: 'd-1' },
+      ],
+      activeProvider: 'p-good',
+    }),
+    'utf8',
+  )
+  const host = new HostProc(['--cwd', root, '--data-dir', dataDir, '--mode', 'read-only'])
+  try {
+    await host.next('ready')
+    host.send({ cmd: 'list-models', all: true })
+    const evt = await host.next('models', 30_000)
+    const rows = evt.byProvider as Array<{ id: string; name: string; items: string[]; error?: string }>
+    const goodRow = rows.find((r) => r.id === 'p-good')
+    const badRow = rows.find((r) => r.id === 'p-bad')
+    assert.ok(goodRow, '正常那家要在回包里')
+    assert.ok(goodRow!.items.includes('g-1') && goodRow!.items.includes('g-2'), '拉到端点上的模型')
+    assert.equal(goodRow!.error, undefined)
+    assert.ok(badRow, '挂了的那家也要在回包里（只是带 error）')
+    assert.ok(badRow!.error, '连不上要报出来')
+    assert.deepEqual(badRow!.items, ['d-1'], '拉不到就用它自己的当前模型兜底，菜单不至于空着')
+
+    const cfg = JSON.parse(await readFile(join(dataDir, 'config.json'), 'utf8')) as {
+      providers: Array<{ id: string; models?: string[] }>
+    }
+    assert.ok(
+      cfg.providers.find((p) => p.id === 'p-good')?.models?.includes('g-2'),
+      '拉到的列表要缓存进 config.json，下次打开菜单不用再等网络',
+    )
+  } finally {
+    await host.close()
+    await good.close()
   }
 })

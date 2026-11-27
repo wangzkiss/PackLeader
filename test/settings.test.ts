@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { Session } from '../src/core/session.ts'
-import { DEFAULT_VISION, activeProviderOf, llmTimeoutsOf, loadSettings, loadSettingsSync, maskKey, providersOf, saveSettings, settingsPath, TIMEOUT_RANGES, visionFrom } from '../src/core/settings.ts'
+import { DEFAULT_VISION, activeProviderOf, llmTimeoutsOf, loadSettings, loadSettingsSync, maskKey, modelsOf, providersOf, saveSettings, settingsPath, TIMEOUT_RANGES, visionFrom } from '../src/core/settings.ts'
 
 const tmp = (): Promise<string> => mkdtemp(join(tmpdir(), 'pl-settings-'))
 
@@ -262,4 +262,26 @@ test('settings: 权限档存进 config.json，下次启动接着用；写坏的�
   const back = await loadSettings(dir)
   assert.equal(back.mode, 'read-only')
   assert.equal(back.model, 'm1')
+})
+
+test('settings: 每家供应商记住自己的模型列表，读回来去空去重，没记过的用当前 model 兜底', async () => {
+  const dir = await tmp()
+  await saveSettings(dir, {
+    providers: [
+      // 手改出来的脏数据：空串、前后空白、重复项都要被清掉
+      { id: 'p-a', name: 'A 家', baseURL: 'https://a.example/v1', apiKey: 'sk-a', model: 'a-2', models: ['a-1', 'a-2', ' a-1 ', ''] },
+      { id: 'p-b', name: 'B 家', baseURL: 'https://b.example/v1', apiKey: 'sk-b', model: 'b-1' },
+    ],
+    activeProvider: 'p-a',
+  })
+  const back = await loadSettings(dir)
+  const { list, active } = providersOf(back)
+  assert.equal(active, 'p-a')
+  assert.deepEqual(list[0]?.models, ['a-1', 'a-2'], '去空、去重、保序')
+
+  // 没写过 models 的那家（旧 config.json 的形态）：用当前 model 兜底，
+  // 否则对话框里那家的分组下面一行都没有
+  assert.deepEqual(modelsOf(list[1]!), ['b-1'])
+  // 当前模型不在缓存列表里时也要补进去：菜单靠它在某一行打勾
+  assert.deepEqual(modelsOf({ ...list[1]!, models: ['b-0'] }), ['b-1', 'b-0'])
 })

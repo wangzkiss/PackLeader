@@ -104,7 +104,8 @@ function resolveConfig(flags: Record<string, string | boolean>): Config {
   // 优先级：命令行 > 环境变量 > <data>/config.json > 内置默认。
   // 界面里填的端点/Key 也写这个文件，所以装完之后不设任何环境变量也能用。
   const saved = loadSettingsSync(dataDir)
-  const mode = (str(flags, 'mode') ?? process.env.PL_MODE ?? 'guarded') as Mode
+  // 权限档：命令行 > 环境变量 > config.json（界面上切过的档）> guarded
+  const mode = (str(flags, 'mode') ?? process.env.PL_MODE ?? saved.mode ?? 'guarded') as Mode
   if (!['read-only', 'guarded', 'full'].includes(mode)) throw new Error(`--mode 只能是 read-only / guarded / full，收到 ${mode}`)
   const approval = flags.deny ? 'deny' : flags.yes ? 'allow' : ((process.env.PL_APPROVAL as Config['approval']) ?? 'ask')
   return {

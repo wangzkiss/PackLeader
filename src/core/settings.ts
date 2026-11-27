@@ -11,11 +11,21 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import type { Mode } from './types.ts'
+
+/** 三档权限；config.json 里写坏了就当没写 */
+export const MODES = ['read-only', 'guarded', 'full'] as const
 
 export interface Settings {
   baseURL?: string
   apiKey?: string
   model?: string
+  /**
+   * 权限档：界面上切过一次就记下来，下次启动接着用。
+   * 不记的话每次开程序都退回 guarded——用户以为「完全权限」已经给过了，
+   * 实际每一步写/执行仍在弹审批。
+   */
+  mode?: Mode
   /** 验证命令：留空＝自动识别（npm test / cargo test / go test / pytest） */
   verify?: string
   /** 模型能不能看图；开了才把图片作为 image part 发过去。缺省＝开（见 DEFAULT_VISION） */
@@ -71,6 +81,9 @@ function coerce(raw: unknown): Settings {
     if (typeof v === 'string' && v.trim()) out[k] = v.trim()
   }
   if (typeof obj.vision === 'boolean') out.vision = obj.vision
+  if (typeof obj.mode === 'string' && (MODES as readonly string[]).includes(obj.mode)) {
+    out.mode = obj.mode as Mode
+  }
   for (const k of ['firstByteSecs', 'idleSecs', 'requestSecs'] as const) {
     const v = obj[k]
     if (typeof v !== 'number' || !Number.isFinite(v)) continue
@@ -106,6 +119,8 @@ export async function saveSettings(dataDir: string, patch: Settings): Promise<Se
   if (patch.baseURL?.trim()) merged.baseURL = patch.baseURL.trim()
   if (patch.apiKey?.trim()) merged.apiKey = patch.apiKey.trim()
   if (patch.model?.trim()) merged.model = patch.model.trim()
+  // 权限档：只接三档合法值，手改坏了不能把策略带进一个没有分支的状态
+  if (patch.mode !== undefined && (MODES as readonly string[]).includes(patch.mode)) merged.mode = patch.mode
   // verify 是唯一「空串也有意义」的字段：空串＝回到自动识别，所以得真删掉
   if (patch.vision !== undefined) {
     // 默认值是 true，所以 false 必须明确写进文件——删掉字段会被当成"没设置过"，

@@ -59,6 +59,8 @@ interface Opts {
   dataDir: string
   root: string
   mode: Mode
+  /** mode 是否由命令行/环境变量显式指定（否则就以 config.json 里记的档为准） */
+  modeSet: boolean
   apiKey: string
   baseURL: string
   model: string
@@ -100,6 +102,7 @@ function parseArgs(argv: string[]): Opts {
     dataDir: resolve(s('data-dir') ?? process.env.PACKLEADER_HOME ?? join(homedir(), '.packleader')),
     root: resolve(s('cwd') ?? process.cwd()),
     mode,
+    modeSet: s('mode') !== undefined || process.env.PL_MODE !== undefined,
     apiKey: s('api-key') ?? process.env.PL_API_KEY ?? process.env.DEEPSEEK_API_KEY ?? process.env.OPENAI_API_KEY ?? '',
     baseURL: s('base-url') ?? process.env.PL_BASE_URL ?? process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com/v1',
     model: s('model') ?? process.env.PL_MODEL ?? 'deepseek-chat',
@@ -216,6 +219,9 @@ async function main(): Promise<void> {
   }
   // 看图：命令行/环境变量没显式指定就听 config.json 的，那里也没有就按默认（开）。
   // 注意这条不能塞进上面的 if：Key 来自环境变量时也得读到用户存过的开关。
+  // 权限档同理：界面上切过一次就记进了 config.json，命令行没显式指定时按它来。
+  // 不读这个字段的话，用户切到「完全权限」一关窗口就丢，下次启动又是每步都问。
+  if (!opts.modeSet && saved.mode) opts.mode = saved.mode
   if (!opts.visionSet) opts.vision = visionFrom(saved)
   // 请求超时同理：config.json 写过就按它，没写过由客户端给默认（首字节 120s / 空闲 180s / 整体 900s）
   opts.llmTimeouts = llmTimeoutsOf(saved)
@@ -757,6 +763,8 @@ async function main(): Promise<void> {
         const m = String(cmd.mode ?? '') as Mode
         if (['read-only', 'guarded', 'full'].includes(m)) {
           setModeAll(m)
+          // 界面里切的档要留住：不然关掉重开又回到 guarded，用户每一步还在被问
+          void saveSettings(opts.dataDir, { mode: m }).catch(() => {})
           send({ type: 'mode', mode: m })
         } else send({ type: 'error', message: `未知权限档：${m}` })
         break

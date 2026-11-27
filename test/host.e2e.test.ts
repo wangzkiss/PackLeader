@@ -245,8 +245,47 @@ test('host: 拒绝审批 → 不写入；read-only 档连审批都不弹', async
     s.host.send({ cmd: 'mode', mode: 'read-only' })
     assert.equal((await s.host.next('mode')).mode, 'read-only')
     assert.equal(s.host.has('approval'), true, '之前那次 guarded 审批应该已经出现过')
+
+    // 切的档要落进 config.json：界面显示「完全权限」而 host 还停在 guarded，
+    // 就是因为以前这个命令根本没发出去，也不能靠重启把它找回来
+    let savedMode = ''
+    for (let i = 0; i < 100 && savedMode !== 'read-only'; i++) {
+      try {
+        savedMode = String((JSON.parse(await readFile(join(s.dataDir, 'config.json'), 'utf8')) as Record<string, unknown>).mode ?? '')
+      } catch {
+        savedMode = ''
+      }
+      if (savedMode !== 'read-only') await new Promise((r) => setTimeout(r, 20))
+    }
+    assert.equal(savedMode, 'read-only', '界面切的档要落进 config.json')
   } finally {
     await s.close()
+  }
+})
+
+test('host: 命令行没指定 --mode 时，按 config.json 里记的档启动', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pl-mode-ws-'))
+  const dataDir = await mkdtemp(join(tmpdir(), 'pl-mode-data-'))
+  await writeFile(join(dataDir, 'config.json'), JSON.stringify({ mode: 'full' }), 'utf8')
+  const llm = await startFakeLlm([{ text: 'ok' }])
+  const host = new HostProc([
+    '--cwd',
+    root,
+    '--data-dir',
+    dataDir,
+    '--base-url',
+    llm.url,
+    '--api-key',
+    'sk-x',
+    '--model',
+    'demo-model',
+  ])
+  try {
+    const ready = await host.next('ready')
+    assert.equal(ready.mode, 'full', '上次切的档要接着用，不能让用户每次启动重新点一遍')
+  } finally {
+    await host.close()
+    await llm.close()
   }
 })
 

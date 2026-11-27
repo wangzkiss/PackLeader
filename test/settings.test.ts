@@ -172,3 +172,19 @@ test('settings: 从没配过超时：llmTimeoutsOf 返回空对象，客户端�
   const dir = await tmp()
   assert.deepEqual(llmTimeoutsOf(await loadSettings(dir)), {})
 })
+
+test('settings: 权限档存进 config.json，下次启动接着用；写坏的档当没写过', async () => {
+  const dir = await tmp()
+  await saveSettings(dir, { mode: 'full' })
+  assert.equal((await loadSettings(dir)).mode, 'full', '界面切过的档要留住')
+
+  // 手改成不存在的档：当没写过，不能让策略落进一个没有分支的状态
+  await writeFile(settingsPath(dir), JSON.stringify({ mode: 'banana' }), 'utf8')
+  assert.equal((await loadSettings(dir)).mode, undefined)
+
+  // 再存一项：不能把档位洗掉，也不能把已有字段带跑
+  await saveSettings(dir, { mode: 'read-only', model: 'm1' })
+  const back = await loadSettings(dir)
+  assert.equal(back.mode, 'read-only')
+  assert.equal(back.model, 'm1')
+})

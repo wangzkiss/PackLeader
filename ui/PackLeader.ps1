@@ -5373,13 +5373,8 @@ function Show-ModeMenu() {
     $row.Add_Click({
       param($s, $e)
       if ($script:modePopup) { $script:modePopup.IsOpen = $false; $script:modePopup = $null }
-      $mm = [string]$s.Tag
-      Set-ModeVisual $mm
-      # 只在真的换了档时才通知 host，点中当前档位不该白跑一趟
-      if ($mm -ne [string]$script:modeSent) {
-        $script:modeSent = $mm
-        Send-Host @{ cmd = 'mode'; mode = $mm }
-      }
+      # -Notify：用户点的这一下必须真的告诉 host（点中当前档时内部自己跳过）
+      Set-ModeVisual ([string]$s.Tag) -Notify
     })
     $col.Children.Add($row) | Out-Null
   }
@@ -5401,10 +5396,16 @@ function Show-ModeMenu() {
 }
 
 # 设置档位并刷新胶囊（菜单选中、host 回报、启动初始化都走这一处）
-function Set-ModeVisual([string]$m) {
+# -Notify：这是用户点菜单换的档，必须真的发给 host。
+# 曾经的做法是调用方先 Set-ModeVisual（里面已经改掉 $script:modeSent），之后再比较
+# 「和上次一样吗」——条件永远为假，mode 命令一次都没发出去：胶囊显示「完全权限」，
+# host 却一直停在启动时的 guarded，于是每个写/执行工具都要弹一次审批。
+function Set-ModeVisual([string]$m, [switch]$Notify) {
   if (-not $script:modeSpec.Contains($m)) { $m = 'guarded' }
+  $changed = ([string]$script:modeSent -ne $m)
   $script:modeSent = $m
   Update-ModePill $m
+  if ($Notify -and $changed) { Send-Host @{ cmd = 'mode'; mode = $m } }
 }
 
 # ---------------------------------------------------------------- 读秒

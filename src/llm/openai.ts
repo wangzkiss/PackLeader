@@ -244,7 +244,9 @@ export class OpenAiClient {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          authorization: `Bearer ${this.cfg.apiKey}`,
+          // 空 key ＝ 这家端点不校验鉴权（本地 llama.cpp / 中转网关常见），此时干脆不发这个头，
+          // 免得带上一个空的 `Bearer ` 反被某些网关当成错误凭证
+          ...(this.cfg.apiKey ? { authorization: `Bearer ${this.cfg.apiKey}` } : {}),
           accept: 'text/event-stream',
         },
         body: JSON.stringify(body),

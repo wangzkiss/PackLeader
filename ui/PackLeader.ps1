@@ -560,7 +560,7 @@ $xaml = @'
           <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
             <StackPanel Margin="0,0,8,0">
           <TextBlock Text="模型设置" Foreground="#F9FAFB" FontSize="14.5" FontWeight="SemiBold"/>
-          <TextBlock Text="填 OpenAI 兼容的端点地址和 Key，保存后立刻生效，并写进数据目录的 config.json。"
+          <TextBlock Text="填 OpenAI 兼容的端点地址和 Key（端点不校验鉴权时 Key 可留空），保存后立刻生效，并写进数据目录的 config.json。"
                      Foreground="#7C838E" FontSize="11" Margin="0,5,0,16" TextWrapping="Wrap"/>
 
           <!-- 供应商列表：公司网关 / 本地 Ollama / 官方 API 各存一套端点和 Key，点一行就切过去。
@@ -577,7 +577,7 @@ $xaml = @'
           <Border Background="#0F1115" BorderBrush="#1FFFFFFF" BorderThickness="1" CornerRadius="6" Padding="4">
             <StackPanel x:Name="CfgProviderList"/>
           </Border>
-          <TextBlock Text="点一行＝选中它编辑；行上的「当前」＝正在使用的那家（保存后立刻生效）。"
+          <TextBlock Text="点一行＝选中它编辑（改完点下面「保存」，每一家的端点/Key/模型都会记住）；行上的「● 当前」＝正在使用的那家，双击别家可直接设为当前。"
                      Foreground="#5B626D" FontSize="10.5" Margin="0,5,0,0" TextWrapping="Wrap"/>
 
           <TextBlock Text="名称（可选）" Foreground="#ADB2B8" FontSize="11" Margin="0,13,0,5"/>
@@ -3421,9 +3421,16 @@ function Update-TodoCard($items) {
     $body = New-Object System.Windows.Controls.StackPanel
     $body.Margin = '0,6,0,0'
     $sp.Children.Add($body) | Out-Null
+    # 轮末状态行：清单写完之后模型可能再没回写过，这里补一句「还剩 n 项 / 全部完成」，
+    # 否则界面停在那次写入的进度上，看着像一步都没做
+    $tail = New-Text '' 10.5 '#6F7684' 'Normal' 'Segoe UI' 0
+    $tail.Margin = '0,6,0,0'
+    $tail.Visibility = 'Collapsed'
+    [System.Windows.Automation.AutomationProperties]::SetAutomationId($tail, 'TodoTail')
+    $sp.Children.Add($tail) | Out-Null
     $card.Child = $sp
 
-    $script:todoCard = @{ card = $card; body = $body; count = $cnt }
+    $script:todoCard = @{ card = $card; body = $body; count = $cnt; tail = $tail; done = 0; total = 0 }
     $script:renderHost.Children.Add($card) | Out-Null
   }
 
@@ -3455,6 +3462,21 @@ function Update-TodoCard($items) {
     $script:todoCard.body.Children.Add($row) | Out-Null
   }
   $script:todoCard.count.Text = "$done/$($arr.Count)"
+  $script:todoCard.done = $done
+  $script:todoCard.total = $arr.Count
+  # 刚写进来的清单还没到轮末：状态行先收起（等 turn-end 再定论）
+  $script:todoCard.tail.Text = ''
+  $script:todoCard.tail.Visibility = 'Collapsed'
+}
+
+# 轮末给执行方案卡补一句状态：模型没回写时也能看出「这一轮结束了，还差几项」
+function Set-TodoCardTail($text, $color) {
+  if (-not $script:todoCard) { return }
+  $c = $script:todoCard.card
+  if ($null -eq $c.Parent) { return }
+  $script:todoCard.tail.Text = [string]$text
+  $script:todoCard.tail.Foreground = (Brush $color)
+  $script:todoCard.tail.Visibility = 'Visible'
 }
 
 function Format-Ago($ms) {
@@ -3823,6 +3845,8 @@ function Render-ReplayEvent($ev) {
     # 一轮从用户消息开始：上一轮的过程卡和工具块在这里收掉，回放也是一轮一张
     Close-TurnProc
     Reset-ToolGroup
+    # 执行方案卡一轮一张：回放时上一轮的卡不能接着被下一轮的清单改写
+    $script:todoCard = $null
     Add-UserMessage ([string]$ev.text) $ev.files
     $script:replayHasUser = $true
   }
@@ -3888,6 +3912,23 @@ function Render-ReplayEvent($ev) {
       if ($preview.Length -gt 2000) { $preview = $preview.Substring(0, 2000) + '…' }
       if ($ev.ok) { Set-ToolLineDone ([string]$ev.callId) "✓  $($ev.ms)ms" $true ([int]$ev.ms) $preview }
       else { Set-ToolLineDone ([string]$ev.callId) '✕  失败' $false ([int]$ev.ms) $preview }
+    }
+    # 执行方案：历史里只存了文本结果（「待办 3/4」+ [x]/[ ] 行），解析回清单再画卡。
+    # 回放的这一轮已经结束，所以卡尾直接给最终状态。
+    if ([string]$ev.name -eq 'todo_write') {
+      $titems = @()
+      foreach ($ln in ([string]$ev.content -split "`n")) {
+        $m = [regex]::Match($ln, '^\s*\[( |x|X)\]\s*(.+)$')
+        if ($m.Success) {
+          $titems += @{ text = $m.Groups[2].Value.Trim(); done = ($m.Groups[1].Value -ne ' ') }
+        }
+      }
+      if ($titems.Count -gt 0) {
+        Update-TodoCard $titems
+        $tleft = @($titems | Where-Object { -not $_.done }).Count
+        if ($tleft -le 0) { Set-TodoCardTail '本轮结束 · 全部完成' '#4ADE80' }
+        else { Set-TodoCardTail "本轮结束 · 还剩 $tleft 项未完成" '#FBBF24' }
+      }
     }
   }
   elseif ($ev.kind -eq 'memory/saved') {
@@ -4925,7 +4966,8 @@ $script:verifyCmd = ''
 # 看图默认开（和 src/core/settings.ts 的 DEFAULT_VISION 一致）；host 的 ready 事件会带来真实值
 $script:visionOn = $true
 $script:logsDir = ''
-$script:hasKey = $true
+# 初始「有没有 Key」按掩码判断（启动时为没有）；host 的 ready / config-loaded 事件会带来真实值
+$script:hasKey = $false
 
 # ---------------------------------------------------------------- 确认框
 # 为什么不用 MessageBox：它画的是系统白底，和这套深色界面完全不搭（用户原话：样式不统一）。
@@ -5429,10 +5471,12 @@ function Show-ModelMenu([object]$anchor) {
   $pop.IsOpen = $true
 
   # 有哪家的模型列表还是空的（新加的供应商 / 从没拉过）：趁菜单开着先问一次，
-  # 回包后由 'models' 事件重画内容区，不用让用户再点第二遍
+  # 回包后由 'models' 事件重画内容区，不用让用户再点第二遍。
+  # 不再要求「有 Key」：免鉴权的端点（本地推理服务、网关）没 Key 照样列得出模型，
+  # 卡在这儿会让设置里配好的模型在对话框里一个都不显示。
   $needFetch = $false
   foreach ($p in @($script:cfgProviders)) { if (@($p.models | Where-Object { $_ }).Count -eq 0) { $needFetch = $true } }
-  if ($script:hasKey -and ($needFetch -or @($script:cfgProviders).Count -eq 0)) {
+  if ($needFetch -or @($script:cfgProviders).Count -eq 0) {
     Send-Host @{ cmd = 'list-models'; all = $true }
   }
   try { $search.Focus() | Out-Null } catch { }
@@ -5686,6 +5730,8 @@ $window.Add_Drop({
 $script:providers = @()
 $script:activeProvider = ''
 $script:editingProvider = ''
+# 最近一次「拉取」拿到的候选模型名（只用来画 chips，勾选状态存在 $p.models 上）
+$script:modelChipAll = @()
 $script:provSelBrush = Brush '#1E2836'
 $script:provCurBrush = Brush '#1B2230'
 
@@ -5704,6 +5750,10 @@ function Apply-FormToProvider {
     $key = $CfgKey.Text.Trim()
     if ($key) { $p.apiKey = $key; $p.hasKey = $true; $p.newKey = $key }
     $p.model = $CfgModel.Text.Trim()
+    # 模型名框里那个必须留在这家的列表里：对话框菜单靠它在当前项上打勾
+    $models = @(Get-ProviderModels $p)
+    if ($p.model -and ($models -notcontains [string]$p.model)) { $models = @([string]$p.model) + $models }
+    Set-ProviderModels $p $models
     return
   }
 }
@@ -5713,12 +5763,145 @@ function Get-Provider($id) {
   return $null
 }
 
+# 一家供应商已保存的模型名（去空、保序）。老 config.json 里可能没有 models，一律用 @() 兜底
+function Get-ProviderModels($p) {
+  $out = @()
+  if (-not $p) { return $out }
+  foreach ($m in @($p.models)) { if ($m) { $out += [string]$m } }
+  return $out
+}
+
+function Set-ProviderModels($p, $list) {
+  if (-not $p) { return }
+  $clean = @()
+  foreach ($m in @($list)) {
+    $m = ([string]$m).Trim()
+    if ($m -and ($clean -notcontains $m)) { $clean += $m }
+  }
+  $p | Add-Member -NotePropertyName models -NotePropertyValue $clean -Force
+}
+
+# 勾上 / 取消勾一个模型。当前「模型名」框里那个不许取消：那家就没模型可用了，
+# 对话框菜单上「打勾的那一行」也会找不到自己。
+function Set-ModelChip([string]$m, [bool]$on) {
+  $p = Get-Provider $script:editingProvider
+  if (-not $p) { return }
+  $list = @(Get-ProviderModels $p)
+  if ($on) {
+    if ($list -notcontains $m) { $list += $m }
+  } else {
+    if ($m -eq $CfgModel.Text.Trim()) { return }
+    $list = @($list | Where-Object { $_ -ne $m })
+  }
+  Set-ProviderModels $p $list
+}
+
+# 模型 chips：打勾＝随保存写进这家；点一下顺带把它设成这家的默认模型。
+# 画料 = 这家已存的列表 ∪ 最近一次拉取的结果 ∪ 模型名框里的那个，
+# 所以不点「拉取」也能看到、能取消勾选之前存过的模型。
+function Draw-ModelChips([string]$hint) {
+  $ModelChips.Children.Clear()
+  $p = Get-Provider $script:editingProvider
+  $sel = @(Get-ProviderModels $p)
+  $cur = $CfgModel.Text.Trim()
+  if ($cur -and ($sel -notcontains $cur)) { $sel += $cur }
+  $items = @()
+  foreach ($m in @($sel) + @($script:modelChipAll)) {
+    $m = ([string]$m).Trim()
+    if ($m -and ($items -notcontains $m)) { $items += $m }
+  }
+  if ($items.Count -eq 0) {
+    $ModelChips.Visibility = 'Collapsed'
+    if (-not $hint) { $hint = '点「拉取」从端点列出可用模型；勾上的模型会保存到这家，所有对话都能选。' }
+    $ModelHint.Foreground = (Brush '#7C838E')
+    $ModelHint.Text = $hint
+    return
+  }
+  $ModelChips.Visibility = 'Visible'
+  # 全选 / 清空：端点常列出几十个模型，一个个点太累；清空只留下当前默认模型（那家不能一个模型都没有）
+  $allBtn = New-Object System.Windows.Controls.Button
+  $allBtn.Content = '全选'
+  $allBtn.FontSize = 10.5
+  $allBtn.Padding = '8,3,8,3'
+  $allBtn.Margin = '0,0,6,6'
+  $allBtn.Cursor = 'Hand'
+  $allBtn.BorderThickness = '0'
+  $allBtn.Template = (New-FlatTemplate)
+  $allBtn.Background = (Brush '#14161B')
+  $allBtn.Foreground = (Brush '#8AB4FF')
+  $allBtn.ToolTip = '把这个端点列出的模型全部勾上（保存后对话框菜单里都能选）'
+  $allBtn.Add_Click({
+    $pp = Get-Provider $script:editingProvider
+    if ($pp) { Set-ProviderModels $pp @($script:modelChipAll) }
+    Draw-ModelChips ''
+  })
+  $ModelChips.Children.Add($allBtn) | Out-Null
+
+  $noneBtn = New-Object System.Windows.Controls.Button
+  $noneBtn.Content = '清空'
+  $noneBtn.FontSize = 10.5
+  $noneBtn.Padding = '8,3,8,3'
+  $noneBtn.Margin = '0,0,6,6'
+  $noneBtn.Cursor = 'Hand'
+  $noneBtn.BorderThickness = '0'
+  $noneBtn.Template = (New-FlatTemplate)
+  $noneBtn.Background = (Brush '#14161B')
+  $noneBtn.Foreground = (Brush '#7C838E')
+  $noneBtn.ToolTip = '只留下当前默认模型（这一家的模型列表不能是空的）'
+  $noneBtn.Add_Click({
+    $pp = Get-Provider $script:editingProvider
+    if ($pp) { Set-ProviderModels $pp @($CfgModel.Text.Trim()) }
+    Draw-ModelChips ''
+  })
+  $ModelChips.Children.Add($noneBtn) | Out-Null
+  foreach ($m in $items) {
+    $on = ($sel -contains $m)
+    $btn = New-Object System.Windows.Controls.Button
+    $btn.Content = $(if ($on) { [string][char]0x2713 + ' ' + $m } else { $m })
+    $btn.FontSize = 10.5
+    $btn.FontFamily = 'Cascadia Mono, Consolas'
+    $btn.Padding = '8,3,8,3'
+    $btn.Margin = '0,0,6,6'
+    $btn.Cursor = 'Hand'
+    $btn.BorderThickness = '1'
+    $btn.BorderBrush = $(if ($on) { Brush '#4D8AB4FF' } else { Brush '#1FFFFFFF' })
+    $btn.Template = (New-FlatTemplate)
+    $btn.Background = $(if ($on) { Brush '#1E2836' } else { Brush '#1A1D24' })
+    $btn.Foreground = $(if ($on) { Brush '#8AB4FF' } else { Brush '#CFD3D6' })
+    $btn.ToolTip = $(if ($on) { '已保存到这家（点一下取消；当前默认模型不能取消）' } else { '点一下：保存到这家，并设为它的默认模型' })
+    $btn.Tag = [string]$m
+    $btn.Add_Click({
+      param($s, $e)
+      $name = [string]$s.Tag
+      $p2 = Get-Provider $script:editingProvider
+      if (-not $p2) { return }
+      if (@(Get-ProviderModels $p2) -contains $name) {
+        # 已勾选：再点一次取消；当前默认模型的那一项不做变化（取消它这家就没模型了）
+        if ($CfgModel.Text.Trim() -ne $name) { Set-ModelChip $name $false }
+      } else {
+        # 未勾选：勾上，顺带设为这家的默认模型（用户点它就是想把这家切到这个模型）
+        Set-ModelChip $name $true
+        $CfgModel.Text = $name
+      }
+      Draw-ModelChips ''
+    })
+    $ModelChips.Children.Add($btn) | Out-Null
+  }
+  $ModelHint.Foreground = (Brush '#7C838E')
+  if (-not $hint) {
+    $hint = "共 $($items.Count) 个候选，已勾 $($sel.Count) 个：勾上的会随保存写进这家，所有对话框底部的模型菜单都能选。"
+  }
+  $ModelHint.Text = $hint
+}
+
 # 选中某一行：先把当前编辑内容存回去，再换成这一行的值
 function Select-Provider([string]$id) {
   Apply-FormToProvider
   $p = Get-Provider $id
   if (-not $p) { return }
   $script:editingProvider = $p.id
+  # 换了行就换画料：chips 只显示这家存过的模型，别把上一家刚拉到的串过来
+  $script:modelChipAll = @()
   $CfgName.Text = [string]$p.name
   $CfgUrl.Text = [string]$p.baseURL
   $CfgKey.Text = ''
@@ -5726,8 +5909,9 @@ function Select-Provider([string]$id) {
   if ($p.hasKey) {
     $CfgKeyHint.Text = "已设置（$($p.apiKeyMasked)）；留空表示保持不变。"
   } else {
-    $CfgKeyHint.Text = '这一家还没填 Key，填一个才能用它对话。'
+    $CfgKeyHint.Text = '这一家没填 Key。端点不校验鉴权的话可以留空（请求时不带 Key）。'
   }
+  Draw-ModelChips ''
   Draw-ProviderList
 }
 
@@ -5773,7 +5957,8 @@ function Draw-ProviderList {
     $name.FontSize = 11.5
     $name.TextTrimming = 'CharacterEllipsis'
     $sub = New-Object System.Windows.Controls.TextBlock
-    $sub.Text = ([string]$p.baseURL + '  ·  ' + $(if ($p.model) { [string]$p.model } else { '未填模型' }))
+    $sub.Text = ([string]$p.baseURL + '  ·  ' + $(if ($p.model) { [string]$p.model } else { '未填模型' }) +
+      $(if (@(Get-ProviderModels $p).Count -gt 1) { '  ·  ' + @(Get-ProviderModels $p).Count + ' 个模型' } else { '' }))
     $sub.Foreground = (Brush '#6B7280')
     $sub.FontSize = 10
     $sub.Margin = '0,2,0,0'
@@ -5813,22 +5998,29 @@ function Sync-SettingsForm {
     $CfgUrl.Text = [string]$keep.baseURL
     $CfgKey.Text = ''
     $CfgModel.Text = [string]$keep.model
-    if ($keep.hasKey) { $CfgKeyHint.Text = "已设置（$($keep.apiKeyMasked)）；留空表示保持不变。" }
-    else { $CfgKeyHint.Text = '这一家还没填 Key，填一个才能用它对话。' }
+    if ($keep.hasKey -and $keep.apiKeyMasked) { $CfgKeyHint.Text = "已设置（$($keep.apiKeyMasked)）；留空表示保持不变。" }
+    else { $CfgKeyHint.Text = '这一家没填 Key。端点不校验鉴权的话可以留空（请求时不带 Key）。' }
   } else {
     $CfgName.Text = ''
     $CfgUrl.Text = $(if ($script:cfgBaseURL) { $script:cfgBaseURL } else { '' })
     $CfgKey.Text = ''
     $CfgModel.Text = $script:modelName
-    if ($script:hasKey) { $CfgKeyHint.Text = "已设置（$($script:cfgKeyMasked)）；留空表示保持不变。" }
-    else { $CfgKeyHint.Text = '还没有设置 Key，填一个才能开始对话。' }
+    # 判「有没有 Key」看掩码而不是 hasKey：没有 Key 时别显示「已设置（）」这种空门牌号
+    if ($script:cfgKeyMasked) { $CfgKeyHint.Text = "已设置（$($script:cfgKeyMasked)）；留空表示保持不变。" }
+    else { $CfgKeyHint.Text = '还没有设置 Key。端点不校验鉴权的话可以留空。' }
   }
   $CfgVerify.Text = $script:verifyCmd
   $CfgLogsDir.Text = $script:logsDir
   $CfgVision.IsChecked = [bool]$script:visionOn
-  $ModelChips.Children.Clear()
-  $ModelChips.Visibility = 'Collapsed'
-  $ModelHint.Text = '点「拉取」从端点列出可用模型。'
+  # 换了一份列表（打开设置 / 后台刷了 config）就得重挑画料：chips 回到这家的已存模型
+  $script:modelChipAll = @()
+  if ($script:editingProvider) { Draw-ModelChips '' }
+  else {
+    $ModelChips.Children.Clear()
+    $ModelChips.Visibility = 'Collapsed'
+    $ModelHint.Foreground = (Brush '#7C838E')
+    $ModelHint.Text = '点「拉取」从端点列出可用模型；勾上的模型会保存到这家，所有对话都能选。'
+  }
   $CfgError.Text = ''
   Draw-ProviderList
 }
@@ -5861,7 +6053,7 @@ function Save-Settings {
   foreach ($p in $script:providers) {
     if (-not $p.baseURL) { $CfgError.Text = '每家供应商都要填端点地址（例：http://127.0.0.1:19790/v1）'; return }
     if (-not ([string]$p.baseURL).StartsWith('http')) { $CfgError.Text = "「$($p.name)」的端点地址要以 http:// 或 https:// 开头"; return }
-    if (-not $p.hasKey) { $CfgError.Text = "「$($p.name)」还没填 API Key"; return }
+    # Key 不强制：免鉴权的端点（本地 llama.cpp / 内部网关）就是没有 Key，留空照样能存、能用
   }
   $CfgError.Text = ''
   # Key 只发新填的明文；没改过的那家不带 apiKey，host 会用列表里存的
@@ -5869,6 +6061,11 @@ function Save-Settings {
   foreach ($p in $script:providers) {
     $item = @{ id = [string]$p.id; name = [string]$p.name; baseURL = [string]$p.baseURL; model = [string]$p.model }
     if ($p.newKey) { $item.apiKey = [string]$p.newKey }
+    # 这家的模型列表整份带上：界面上勾了哪几个就存哪几个。
+    # 不带的话 host 会当成「没传」——保存一次就把刚拉到的列表抹掉了。
+    $models = @(Get-ProviderModels $p)
+    if ($item.model -and ($models -notcontains [string]$item.model)) { $models = @([string]$item.model) + $models }
+    if ($models.Count) { $item.models = $models }
     $list += $item
   }
   $cur = Get-Provider $script:activeProvider
@@ -6220,8 +6417,9 @@ function Handle-Event-Core([string]$line) {
       Update-ModelPill ([string]$e.model)
       $TitleText.Text = $(if ($e.title -and $e.title -ne '(empty)') { [string]$e.title } else { '新对话' })
       Set-ModeVisual ([string]$e.mode)
-      # 第一次用（没 Key）：直接把设置面板弹出来，别让用户对着输入框发呆
-      if (-not $script:hasKey) { Open-Settings }
+      # 第一次用（一家供应商都没配）：直接把设置面板弹出来，别让用户对着输入框发呆。
+      # 配过端点但没填 Key 的不再弹：有的端点（本地推理服务、免鉴权网关）本来就不需要 Key。
+      if (-not $script:hasKey -and @($script:cfgProviders).Count -eq 0) { Open-Settings }
 
       # 切了会话就必须重画（界面上还是上一个会话的内容）；同一个会话且不忙也重画
       if ($switched -or -not $mine) {
@@ -6268,6 +6466,9 @@ function Handle-Event-Core([string]$line) {
       # 新一轮开始：上一轮的过程卡收成一行，再给这一轮开一张
       Close-TurnProc
       Reset-ToolGroup
+      # 执行方案卡跟着轮走：上一轮那张已经定局了，这一轮再写清单要另起一张，
+      # 否则新进度会画进上一轮的卡里（位置还在上面，看着像没更新）
+      $script:todoCard = $null
       New-TurnProc | Out-Null
       $Scroller.ScrollToEnd()
     }
@@ -6446,7 +6647,10 @@ function Handle-Event-Core([string]$line) {
       if ($null -ne $e.vision) { $script:visionOn = [bool]$e.vision }
       if ($e.logsDir) { $script:logsDir = [string]$e.logsDir }
       $script:modelName = [string]$e.model
-      $script:hasKey = $true
+      # 没 Key 也能保存（免鉴权的端点），所以不能无脑置 true：按掩码判断到底有没有 Key
+      $script:hasKey = [bool]$e.apiKeyMasked
+      if ($null -ne $e.providers) { $script:cfgProviders = @($e.providers); $script:cfgActiveProvider = [string]$e.activeProvider }
+      if ($e.baseURL) { $script:cfgBaseURL = [string]$e.baseURL }
       Update-ModelPill ([string]$e.model)
       Close-Settings
       Add-SystemLine ("已切换模型：" + $e.model + " @ " + $e.baseURL) '#4ADE80'
@@ -6488,33 +6692,20 @@ function Handle-Event-Core([string]$line) {
       }
       # 菜单开着就重画：用户可能正盯着它等模型出来
       if ($script:modelPopup -and $script:modelPopup.IsOpen) { Update-ModelRows '' }
-      # 端点里真实存在的模型：点一个就填进「模型名」
-      $ModelChips.Children.Clear()
       if ($items.Count -eq 0) {
-        $ModelHint.Foreground = (Brush '#F87171')
-        $ModelHint.Text = '端点没返回任何模型（检查地址要不要带 /v1）'
-      } else {
-        $ModelHint.Foreground = (Brush '#7C838E')
-        $ModelHint.Text = "共 $($items.Count) 个，点一下填进上面的框（已记住，对话框里的模型菜单也能直接选）"
-        $ModelChips.Visibility = 'Visible'
-        foreach ($id in $items) {
-          $btn = New-Object System.Windows.Controls.Button
-          $btn.Content = [string]$id
-          $btn.FontSize = 10.5
-          $btn.FontFamily = 'Cascadia Mono, Consolas'
-          $btn.Padding = '8,3,8,3'
-          $btn.Margin = '0,0,6,6'
-          $btn.Cursor = 'Hand'
-          $btn.BorderThickness = '1'
-          $btn.BorderBrush = (Brush '#1FFFFFFF')
-          $btn.Template = (New-FlatTemplate)
-          $btn.Background = (Brush '#1A1D24')
-          $btn.Foreground = (Brush '#CFD3D6')
-          $btn.Tag = [string]$id
-          $btn.Add_Click({ param($s, $e) $CfgModel.Text = [string]$s.Tag })
-          $ModelChips.Children.Add($btn) | Out-Null
+        if ($null -eq $e.byProvider) {
+          $ModelChips.Children.Clear()
+          $ModelChips.Visibility = 'Collapsed'
+          $ModelHint.Foreground = (Brush '#F87171')
+          $ModelHint.Text = '端点没返回任何模型（检查地址要不要带 /v1）'
         }
+      } elseif ($null -eq $e.byProvider) {
+        # 单家拉取（设置面板里点的「拉取」）：拿到的只是候选，勾选状态仍以这家 models 为准，
+        # 点「保存」时才写进 config.json —— 不能拉一下就把整份列表存了，那样用户取消都没用
+        $script:modelChipAll = @($items)
+        Draw-ModelChips ''
       }
+      # list-models all（底部菜单补全空列表）的回包是各家合集，不能灌进当前这家的候选里
     }
     'usage' {
       $p = [int]$e.prompt; $c = [int]$e.completion; $cr = [int]$e.cacheRead
@@ -6535,6 +6726,20 @@ function Handle-Event-Core([string]$line) {
       }
       Set-Busy $false
       $script:currentAssistant = $null
+      # 执行方案卡在这一轮定局：把最终进度写在卡尾，别让它停在最后一次写入的样子
+      if ($script:todoCard -and $script:todoCard.card.Parent -and [int]$script:todoCard.total -gt 0) {
+        $tdone = [int]$script:todoCard.done
+        $tleft = [int]$script:todoCard.total - $tdone
+        if ($tleft -le 0) {
+          Set-TodoCardTail '本轮结束 · 全部完成' '#4ADE80'
+        } elseif ($e.reason -eq 'cancelled') {
+          Set-TodoCardTail "已中断 · 还剩 $tleft 项未完成" '#FBBF24'
+        } elseif ($e.reason -eq 'error') {
+          Set-TodoCardTail "本轮出错 · 还剩 $tleft 项未完成" '#F87171'
+        } else {
+          Set-TodoCardTail "本轮结束 · 还剩 $tleft 项未完成" '#FBBF24'
+        }
+      }
       # 到步数上限时 core 已经发过一条「转入收尾」的 notice，这里不再重复第二句
       if ($e.reason -eq 'cancelled') { Add-SystemLine '已中断' '#FBBF24' }
       if ($e.reason -eq 'error') { Add-SystemLine '本轮出错' '#F87171' }
@@ -6545,7 +6750,35 @@ function Handle-Event-Core([string]$line) {
     'memory-undone' { Set-MemoryUndone @($e.ids) }
     'sessions' { Set-Sessions $e.items }
     'mode' { Set-ModeVisual ([string]$e.mode) }
-    'model' { $script:modelName = [string]$e.model; Update-ModelPill ([string]$e.model) }
+    'model' {
+      $script:modelName = [string]$e.model
+      # use-model 是从「某一家的某个模型」切过来的：当前供应商要跟着换，
+      # 否则设置面板里那行「● 当前」和模型菜单打勾会停在旧的那家
+      if ($e.providerId) {
+        $script:cfgActiveProvider = [string]$e.providerId
+        foreach ($p in @($script:cfgProviders)) {
+          if ([string]$p.id -eq [string]$e.providerId) {
+            $p | Add-Member -NotePropertyName model -NotePropertyValue $script:modelName -Force
+            $ms = @()
+            foreach ($m in @($p.models)) { if ($m) { $ms += [string]$m } }
+            if ($script:modelName -and ($ms -notcontains $script:modelName)) { $ms = @($script:modelName) + $ms }
+            $p | Add-Member -NotePropertyName models -NotePropertyValue $ms -Force
+          }
+        }
+        $script:cfgBaseURL = ''
+        foreach ($p in @($script:cfgProviders)) { if ([string]$p.id -eq [string]$e.providerId) { $script:cfgBaseURL = [string]$p.baseURL } }
+      }
+      Update-ModelPill ([string]$e.model)
+      # 设置面板开着时只刷新「● 当前」标记与当前那家的模型名，不重画整个表单：
+      # Sync-SettingsForm 会用 host 的值覆盖输入框，把用户没保存的编辑冲掉
+      if ($SettingsOverlay.Visibility -eq 'Visible') {
+        if ($script:editingProvider -and $script:editingProvider -eq [string]$e.providerId) {
+          $CfgModel.Text = $script:modelName
+          Draw-ModelChips ''
+        }
+        Draw-ProviderList
+      }
+    }
     'cwd' {
       Update-CwdPill ([string]$e.cwd)
       # 记住上次用的目录：下次双击启动直接从这里开始，不用每次都换
@@ -6620,12 +6853,14 @@ $CfgOpenLogs.Add_Click({
 # 拉取模型：用对话框里当前填的地址和 Key（Key 留空就让 host 用已保存的那个）
 $CfgFetch.Add_Click({
   & $script:boot '拉取模型: 点击'
-  $ModelChips.Children.Clear()
-  $ModelChips.Visibility = 'Collapsed'
+  # 保留已存的 chips（拉取只是多给候选），只把提示换成"拉取中"
   $ModelHint.Foreground = (Brush '#7C838E')
   $ModelHint.Text = '拉取中…'
   $script:fetching = $true
-  Send-Host @{ cmd = 'list-models'; baseURL = $CfgUrl.Text.Trim(); apiKey = $CfgKey.Text.Trim() }
+  $msg = @{ cmd = 'list-models'; baseURL = $CfgUrl.Text.Trim(); apiKey = $CfgKey.Text.Trim() }
+  # 带上 providerId：host 才知道这份结果属于哪一家（表单里改过端点也认得出来）
+  if ($script:editingProvider) { $msg.providerId = [string]$script:editingProvider }
+  Send-Host $msg
 })
 $CfgCancel.Add_Click({ Close-Settings })
 $CfgSave.Add_Click({ Save-Settings })

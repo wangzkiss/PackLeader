@@ -1,0 +1,29 @@
+{
+  "providers": [
+    {
+      "id": "p-a",
+      "name": "自己",
+      "baseURL": "https://api.deepseek.com/v1",
+      "apiKey": "sk-testkey-1234",
+      "model": "deepseek-flash",
+      "models": [
+        "deepseek-flash",
+        "deepseek-v4-pro",
+        "deepseek-chat"
+      ]
+    },
+    {
+      "id": "p-b",
+      "name": "本地",
+      "baseURL": "http://127.0.0.1:11434/v1",
+      "apiKey": "",
+      "model": "qwen2.5:7b",
+      "models": [
+        "qwen2.5:7b"
+      ]
+    }
+  ],
+  "activeProvider": "p-b",
+  "baseURL": "http://127.0.0.1:11434/v1",
+  "model": "qwen2.5:7b"
+}

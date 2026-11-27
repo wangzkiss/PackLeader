@@ -95,6 +95,8 @@ interface Config {
   mode: Mode
   apiKey: string
   baseURL: string
+  /** 端点是不是用户显式给的（命令行 / 环境变量 / config.json 里那家）；false ＝ 还在内置的 DeepSeek 官方端点 */
+  baseExplicit: boolean
   model: string
   approval: 'ask' | 'allow' | 'deny'
   maxSteps: number
@@ -138,6 +140,9 @@ function resolveConfig(flags: Record<string, string | boolean>): Config {
       process.env.DEEPSEEK_BASE_URL ??
       providerUrl ??
       'https://api.deepseek.com/v1',
+    baseExplicit: Boolean(
+      str(flags, 'base-url') || process.env.PL_BASE_URL || process.env.DEEPSEEK_BASE_URL || providerUrl,
+    ),
     model: str(flags, 'model') ?? process.env.PL_MODEL ?? providerModel ?? 'deepseek-chat',
     approval,
     maxSteps: num(flags, 'max-steps') ?? 100,
@@ -352,7 +357,15 @@ async function cmdDoctor(cfg: Config, flags: Record<string, string | boolean>): 
     endpointDetail = `${cfg.baseURL} 不可达：${(e as Error).message}`
   }
   rows.push({ name: 'model', ok: modelOk, detail: endpointDetail })
-  if (!cfg.apiKey) rows.push({ name: 'api-key', ok: false, detail: '未设置（PL_API_KEY / DEEPSEEK_API_KEY / --api-key）' })
+  if (!cfg.apiKey) {
+    // 免鉴权的端点（本地 llama.cpp / 内部网关）本来就没有 Key：只要端点是自己指定的，
+    // 这里就只当提示（–），不算没通过
+    rows.push(
+      cfg.baseExplicit
+        ? { name: 'api-key', ok: 'skip', detail: `未设置（${cfg.baseURL} 不校验鉴权时可以没有）` }
+        : { name: 'api-key', ok: false, detail: '未设置（PL_API_KEY / DEEPSEEK_API_KEY / --api-key）' },
+    )
+  }
 
   process.stdout.write(`${bold('PackLeader doctor')}\n`)
   for (const r of rows) {
@@ -461,12 +474,17 @@ async function main(): Promise<void> {
   if (command === 'perf') return cmdPerf(cfg, flags)
 
   if (!cfg.apiKey) {
-    process.stderr.write(
-      `${red('缺少 API Key')}\n  设置 PL_API_KEY，或用 --api-key / DEEPSEEK_API_KEY 传入。\n` +
-        `  端点和模型可用 PL_BASE_URL / PL_MODEL 指定（默认 ${cfg.baseURL} · ${cfg.model}）。\n`,
-    )
-    process.exitCode = 2
-    return
+    // 没 Key 本身不算错：本地推理服务、免鉴权网关的 Key 就是空的。
+    // 只有「既没 Key、端点也没自己指定过」（＝还在内置的 DeepSeek 官方端点）时才提前拦下，
+    // 省得跑起来等一个 401 才看懂。
+    if (!cfg.baseExplicit) {
+      process.stderr.write(
+        `${red('缺少 API Key')}\n  设置 PL_API_KEY，或用 --api-key / DEEPSEEK_API_KEY 传入。\n` +
+          `  端点不校验鉴权的话，用 --base-url 指定端点即可不带 Key（默认 ${cfg.baseURL} · ${cfg.model}）。\n`,
+      )
+      process.exitCode = 2
+      return
+    }
   }
 
   const json = flags.json === true

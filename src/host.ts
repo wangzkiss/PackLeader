@@ -661,8 +661,14 @@ async function main(): Promise<void> {
       })
       return
     }
-    if (!opts.apiKey) {
-      send({ type: 'error', message: '还没配置模型：点右上角的设置，填端点地址和 API Key', needsSetup: true })
+    // 一家供应商都没配过才拦：有的端点（本地 llama.cpp、免鉴权网关）根本不需要 Key，
+    // 那时 baseURL 要填、apiKey 可以空，不能因为缺 Key 就不让人开跑
+    if (!opts.apiKey && providerList.length === 0) {
+      send({
+        type: 'error',
+        message: '还没配置模型：点右上角的设置，填端点地址（端点不校验鉴权时 API Key 可以留空）',
+        needsSetup: true,
+      })
       return
     }
     // 这一轮绑定发起时的会话与 agent：中途切到别的会话时，内容、记忆、用量都要落回原会话
@@ -838,7 +844,8 @@ async function main(): Promise<void> {
          * 拉不到时退回那家缓存过的列表（或当前 model），至少不空着。
          */
         if (cmd.all) {
-          const targets = providerList.filter((p) => p.apiKey)
+          // 没 Key 的那家也要拉：免鉴权的端点照样能列模型
+          const targets = providerList.filter((p) => p.baseURL)
           const rows: Array<{ id: string; name: string; items: string[]; error?: string }> = []
           await Promise.all(
             targets.map(async (p) => {
@@ -849,7 +856,7 @@ async function main(): Promise<void> {
               }
               try {
                 const r = await fetch(`${p.baseURL.replace(/\/+$/, '')}/models`, {
-                  headers: { authorization: `Bearer ${p.apiKey}` },
+                  headers: p.apiKey ? { authorization: `Bearer ${p.apiKey}` } : {},
                   signal: AbortSignal.timeout(8_000),
                 })
                 const body = (await r.json().catch(() => ({}))) as {
@@ -874,9 +881,11 @@ async function main(): Promise<void> {
           )
           // 按 providerList 的原顺序排（不能按并发完成的先后）：不然搜索框里的分组顺序每次打开都在跳
           rows.sort((a, b) => providerList.findIndex((p) => p.id === a.id) - providerList.findIndex((p) => p.id === b.id))
-          // 拉到的列表缓存进 config.json：下次打开菜单不再等这一轮网络
+          // 拉到的列表缓存进 config.json：下次打开菜单不再等这一轮网络。
+          // 等它写完再回包：界面收到 models 后可能立刻保存设置，两边并发写同一个
+          // config.json 会互相覆盖（测试也会读到写了一半的文件）
           if (rows.some((r) => !r.error && r.items.length)) {
-            void saveSettings(opts.dataDir, { providers: providerList }).catch(() => {})
+            await saveSettings(opts.dataDir, { providers: providerList }).catch(() => {})
           }
           send({
             type: 'models',
@@ -892,13 +901,10 @@ async function main(): Promise<void> {
         const fromList = wantProvider ? providerList.find((p) => p.id === wantProvider) : undefined
         const baseURL = String(cmd.baseURL ?? '').trim() || fromList?.baseURL || opts.baseURL
         const apiKey = String(cmd.apiKey ?? '').trim() || fromList?.apiKey || opts.apiKey
-        if (!apiKey) {
-          send({ type: 'error', message: '先填 API Key，再拉取模型列表', needsSetup: true })
-          break
-        }
+        // 没 Key 也照拉：免鉴权的端点（本地推理服务/网关）不该被卡在这儿
         try {
           const r = await fetch(`${baseURL.replace(/\/+$/, '')}/models`, {
-            headers: { authorization: `Bearer ${apiKey}` },
+            headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
             signal: AbortSignal.timeout(15_000),
           })
           const body = (await r.json().catch(() => ({}))) as { data?: Array<{ id?: string }>; error?: { message?: string } }
@@ -907,13 +913,9 @@ async function main(): Promise<void> {
             break
           }
           const items = (body.data ?? []).map((m) => String(m.id ?? '')).filter(Boolean).sort()
-          // 记住这一家的模型列表：设置面板点一次「拉取」之后，对话框的模型菜单
-          // 下次打开就有分组可列，不用再等一轮网络
+          // 只当候选回给界面，不覆盖这家已勾选的模型列表：
+          // 设置面板里还要让人挑，点「保存」才落盘（拉一下就把整份列表存了，用户点「取消」也改不掉）。
           const owner = fromList ?? providerList.find((p) => p.baseURL === baseURL)
-          if (owner && items.length) {
-            owner.models = modelsOf({ ...owner, models: items })
-            void saveSettings(opts.dataDir, { providers: providerList }).catch(() => {})
-          }
           send({
             type: 'models',
             items,
@@ -1104,15 +1106,21 @@ async function main(): Promise<void> {
           incoming = [picked]
         }
         if (!picked.apiKey) {
-          // Key 留空＝保持原值；新填的那家留空才是真缺
+          // Key 留空＝保持原值；新填的那家留空也允许：有的端点不校验鉴权（本地 llama.cpp、免鉴权网关），
+          // 以空的 apiKey 存下去，请求时就不带 authorization 头
           const prev = providerList.find((p) => p.id === picked!.id)
           if (prev?.apiKey) picked.apiKey = prev.apiKey
         }
-        if (!picked.apiKey) {
-          send({ type: 'error', message: `供应商「${picked.name || picked.baseURL}」还没填 API Key` })
-          break
-        }
         if (!incoming.some((p) => p.id === picked!.id)) incoming.unshift(picked)
+        // 界面没带 models 的那家沿用之前的列表（老版本界面、或只改了端点/Key）：
+        // 不补的话保存一次就把对话框模型菜单里那家的模型全抹掉了
+        for (const p of incoming) {
+          if (p.models?.length) continue
+          const prev = providerList.find((x) => x.id === p.id)
+          if (prev?.models?.length) p.models = modelsOf({ ...p, models: prev.models })
+        }
+        // 这家当前用的模型必须留在列表里：菜单靠它给当前项打勾
+        if (picked.models?.length) picked.models = modelsOf(picked)
         providerList = incoming
         // 立刻生效：下一轮请求就走这家
         applyProvider(picked)

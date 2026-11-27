@@ -23,6 +23,8 @@ export interface ScriptStep {
 export interface FakeLlm {
   url: string
   requests: Array<Record<string, any>>
+  /** 每个请求带的请求头（小写），用来验证「没 Key 时不该带 authorization」这类行为 */
+  headers: Array<Record<string, string | string[] | undefined>>
   close: () => Promise<void>
 }
 
@@ -31,6 +33,7 @@ const tick = () => new Promise((r) => setTimeout(r, 2))
 export async function startFakeLlm(steps: ScriptStep[]): Promise<FakeLlm> {
   const queue = [...steps]
   const requests: Array<Record<string, any>> = []
+  const headers: Array<Record<string, string | string[] | undefined>> = []
 
   const server: Server = createServer(async (req, res) => {
     if (!req.url?.includes('/chat/completions')) {
@@ -40,6 +43,7 @@ export async function startFakeLlm(steps: ScriptStep[]): Promise<FakeLlm> {
     let body = ''
     for await (const chunk of req) body += chunk
     requests.push(JSON.parse(body) as Record<string, any>)
+    headers.push({ ...req.headers })
 
     const step = queue.shift() ?? { text: '（脚本已用尽）' }
     res.writeHead(200, {
@@ -118,6 +122,7 @@ export async function startFakeLlm(steps: ScriptStep[]): Promise<FakeLlm> {
   return {
     url: `http://127.0.0.1:${addr.port}/v1`,
     requests,
+    headers,
     close: () => new Promise<void>((ok, fail) => server.close((e) => (e ? fail(e) : ok()))),
   }
 }

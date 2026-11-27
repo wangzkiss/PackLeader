@@ -27,10 +27,12 @@ class HostProc {
   readonly seen: Line[] = []
   stderr = ''
 
-  constructor(args: string[]) {
+  constructor(args: string[], extraEnv: Record<string, string> = {}) {
     this.child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', HOST, ...args], {
       // PL_PERF=off：测试起的 host 不要往用户真实的 perf 目录里写日志
-      env: { ...process.env, NO_COLOR: '1', PL_PERF: 'off' },
+      // extraEnv 用来把跑测试那台机器上的 PL_API_KEY / OPENAI_API_KEY 之类清成空串，
+      // 否则「不传 --api-key」的测试会悄悄吃到开发机的环境变量
+      env: { ...process.env, NO_COLOR: '1', PL_PERF: 'off', ...extraEnv },
       windowsHide: true,
     })
     this.child.stdout.on('data', (b: Buffer) => {
@@ -370,7 +372,12 @@ test('host: use-model 切到另一家的模型，下一轮真的打到那家，�
     'utf8',
   )
   // 不传 --base-url/--api-key/--model：让 host 完全按 config.json 里的供应商列表走
-  const host = new HostProc(['--cwd', root, '--data-dir', dataDir, '--mode', 'read-only'])
+  // （环境变量也清空，否则开发机上的 OPENAI_API_KEY 会让 host 跳过 config.json 里的那家）
+  const host = new HostProc(['--cwd', root, '--data-dir', dataDir, '--mode', 'read-only'], {
+    PL_API_KEY: '',
+    DEEPSEEK_API_KEY: '',
+    OPENAI_API_KEY: '',
+  })
   try {
     const ready = await host.next('ready')
     assert.equal(ready.model, 'a-1')
@@ -403,6 +410,61 @@ test('host: use-model 切到另一家的模型，下一轮真的打到那家，�
     await host.close()
     await a.close()
     await b.close()
+  }
+})
+
+test('host: config 一家可以存多个模型；界面没带 models 的那家沿用旧列表（别被保存抹掉）', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pl-modelsave-ws-'))
+  const dataDir = await mkdtemp(join(tmpdir(), 'pl-modelsave-data-'))
+  const base = 'https://models.example/v1'
+  await writeFile(
+    join(dataDir, 'config.json'),
+    JSON.stringify({
+      providers: [{ id: 'p-a', name: '甲家', baseURL: base, apiKey: 'sk-a', model: 'a-1', models: ['a-1', 'a-2'] }],
+      activeProvider: 'p-a',
+    }),
+    'utf8',
+  )
+  const host = new HostProc(['--cwd', root, '--data-dir', dataDir, '--mode', 'read-only'], {
+    PL_API_KEY: '',
+    DEEPSEEK_API_KEY: '',
+    OPENAI_API_KEY: '',
+  })
+  try {
+    await host.next('ready')
+    // 1) 不带 models 保存（只是改了 Key）：这家的旧列表不能被抹成空
+    host.send({
+      cmd: 'config',
+      providers: [{ id: 'p-a', name: '甲家', baseURL: base, apiKey: 'sk-a', model: 'a-1' }],
+      activeProvider: 'p-a',
+      baseURL: base,
+      model: 'a-1',
+    })
+    const saved = await host.next('config')
+    assert.deepEqual(
+      (saved.providers as Array<{ models: string[] }>)[0]?.models,
+      ['a-1', 'a-2'],
+      '界面没带 models 时沿用旧列表',
+    )
+
+    // 2) 带上勾选的两个模型（换掉 a-2、加上 a-3）：整份落盘
+    host.send({
+      cmd: 'config',
+      providers: [{ id: 'p-a', name: '甲家', baseURL: base, model: 'a-3', models: ['a-1', 'a-3'] }],
+      activeProvider: 'p-a',
+      baseURL: base,
+      model: 'a-3',
+    })
+    const multi = await host.next('config')
+    assert.deepEqual((multi.providers as Array<{ models: string[] }>)[0]?.models, ['a-1', 'a-3'])
+    const cfg = JSON.parse(await readFile(join(dataDir, 'config.json'), 'utf8')) as {
+      providers: Array<{ models?: string[]; model: string }>
+      model: string
+    }
+    assert.deepEqual(cfg.providers[0]?.models, ['a-1', 'a-3'], '勾选的多个模型要落盘')
+    assert.equal(cfg.model, 'a-3')
+  } finally {
+    await host.close()
   }
 })
 
@@ -450,5 +512,48 @@ test('host: list-models all 并发拉所有供应商，一家连不上不影响�
   } finally {
     await host.close()
     await good.close()
+  }
+})
+
+test('host: 免鉴权的端点（不填 API Key）也能保存并用，请求不带 authorization', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pl-nokey-ws-'))
+  const dataDir = await mkdtemp(join(tmpdir(), 'pl-nokey-data-'))
+  const llm = await startFakeLlm([{ text: '本地服务不需要 Key' }])
+  // 开发机上常有 PL_API_KEY / OPENAI_API_KEY：清空才测得到「真没 Key」这条路
+  const host = new HostProc(
+    ['--cwd', root, '--data-dir', dataDir, '--mode', 'read-only'],
+    { PL_API_KEY: '', DEEPSEEK_API_KEY: '', OPENAI_API_KEY: '' },
+  )
+  try {
+    await host.next('ready')
+    // 界面点保存：这家只有端点，没有 apiKey
+    host.send({
+      cmd: 'config',
+      providers: [{ id: 'p-local', name: '本地 llama', baseURL: llm.url, model: 'local-1' }],
+      activeProvider: 'p-local',
+      baseURL: llm.url,
+      model: 'local-1',
+      verify: '',
+    })
+    const saved = await host.next('config')
+    assert.equal(saved.saved, true, '没 Key 也要能存下来，不能被校验挡住')
+    assert.equal(saved.apiKeyMasked, '', '掩码是空的，界面据此知道这家没 Key')
+
+    host.send({ cmd: 'task', text: '问一句' })
+    await host.next('turn-end')
+    assert.equal(llm.requests.length, 1)
+    assert.equal((llm.requests[0] as Record<string, unknown>).model, 'local-1')
+    assert.equal(llm.headers[0]?.authorization, undefined, '没 Key 就不该带一个空的 Bearer')
+
+    const cfg = JSON.parse(await readFile(join(dataDir, 'config.json'), 'utf8')) as {
+      apiKey?: string
+      providers: Array<{ id: string; apiKey: string; model: string }>
+    }
+    assert.equal(cfg.providers[0]?.apiKey, '', '空 Key 原样落盘')
+    assert.equal(cfg.apiKey, undefined, '顶层快照没有 Key 就不写这个字段')
+    assert.equal(cfg.providers[0]?.model, 'local-1')
+  } finally {
+    await host.close()
+    await llm.close()
   }
 })

@@ -30,6 +30,24 @@ static class Program
         }
 
         PerfInit();
+        // ---------------------------------------------------------------- 单实例
+        // 双击两次桌面图标不能变成两个程序：第二个只负责把已有窗口叫出来，然后自己退出。
+        // 为什么互斥锁捏在启动器手里（而不是界面里）：界面是 powershell 子进程，启动器本来
+        // 就要等它，锁放在这一层「一个 exe = 一个实例」最直观；--cli 不参与（命令行可以开多个）。
+        Mutex single = null;
+        if (!cli && !HasFlag(args, "--allow-multi"))
+        {
+            bool created;
+            single = new Mutex(true, @"Local\PackLeader.SingleInstance", out created);
+            if (!created)
+            {
+                ActivateRunningInstance();
+                return 0;
+            }
+            // 退出时不能留一串「幽灵实例」：进程被强杀时锁要靠这个释放
+            AppDomain.CurrentDomain.ProcessExit += delegate { try { single.ReleaseMutex(); } catch { } };
+        }
+
         if (!cli) ShowSplash();
         PerfWrite("span", "splash", PerfClock.Elapsed.TotalMilliseconds, null);
         double mark = PerfClock.Elapsed.TotalMilliseconds;
@@ -224,6 +242,69 @@ static class Program
             };
         }
     }
+
+    // ---------------- 单实例 ----------------
+    static bool HasFlag(string[] args, string name)
+    {
+        foreach (string a in args) if (string.Equals(a, name, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    const string WindowTitle = "PackLeader";
+    /// <summary>
+    /// 把已经在跑的那个窗口叫出来。两步：先按窗口类前缀找（WPF 的类名是
+    /// HwndWrapper[PackLeader.xxx;;guid]，标题会随会话变，只能当兜底），
+    /// 找到就还原+置前；找不到（比如它正收在托盘里、窗口 Hidden）就退回广播
+    /// 一个自定义消息，界面那边在 Loaded 时挂了钩子，会自己 Show 出来。
+    /// </summary>
+    static void ActivateRunningInstance()
+    {
+        try
+        {
+            IntPtr h = FindWindowEx(IntPtr.Zero, IntPtr.Zero, null, WindowTitle);
+            if (h == IntPtr.Zero) h = FindByClassPrefix(WPF_CLASS_PREFIX);
+            if (h != IntPtr.Zero)
+            {
+                if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
+                else ShowWindow(h, SW_SHOW);
+                SetForegroundWindow(h);
+            }
+            // 不管找没找到都广播一次：窗口被 Hidden 时照样能被界面自己叫出来
+            PostMessage(HWND_BROADCAST, WM_PL_ACTIVATE, IntPtr.Zero, IntPtr.Zero);
+        }
+        catch { }
+    }
+
+    static IntPtr FindByClassPrefix(string prefix)
+    {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows(delegate(IntPtr h, IntPtr l)
+        {
+            StringBuilder sb = new StringBuilder(512);
+            if (GetClassName(h, sb, sb.Capacity) > 0 && sb.ToString().StartsWith(prefix, StringComparison.Ordinal))
+            {
+                found = h;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    const string WPF_CLASS_PREFIX = "HwndWrapper[PackLeader";
+    const int SW_SHOW = 5;
+    const int SW_RESTORE = 9;
+    const uint WM_PL_ACTIVATE = 0x8000 + 0x51;   // 自定义消息，界面里 RegisterWindowMessage 同名
+    static readonly IntPtr HWND_BROADCAST = new IntPtr(0xffff);
+
+    delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int max);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hWnd, int cmd);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
 
     // ---------------- 性能日志 ----------------
     // 启动链每一段记一条（exe → splash → node → PS → 主窗口），落

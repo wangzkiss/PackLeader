@@ -70,6 +70,42 @@ namespace PL {
     // 隐藏的窗口任务栏自己会清掉，不额外调 ITaskbarList）
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string title);
+    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern uint RegisterWindowMessage(string name);
+
+    /// <summary>「第二个实例把第一个叫出来」用的自定义消息名（launcher.cs 里同名）</summary>
+    public const string ActivateMessage = "PackLeaderActivate";
+
+    /// <summary>
+    /// 已经有 PackLeader 在跑时，把它的窗口叫到前台：先按窗口类前缀找（WPF 的类名是
+    /// HwndWrapper[PackLeader.xxx;;guid]，标题会变、类名前缀不会），再按标题兜底。
+    /// 找不到也广播一次激活消息——窗口收在托盘里（Hidden）时由界面自己 Show 出来。
+    /// 返回是否找到了窗口。
+    /// </summary>
+    public static bool ActivateExisting() {
+      IntPtr h = IntPtr.Zero;
+      try {
+        EnumWindows(delegate(IntPtr w, IntPtr l) {
+          StringBuilder sb = new StringBuilder(512);
+          if (GetClassName(w, sb, sb.Capacity) > 0 && sb.ToString().StartsWith("HwndWrapper[PackLeader", StringComparison.Ordinal)) { h = w; return false; }
+          return true;
+        }, IntPtr.Zero);
+      } catch { }
+      if (h == IntPtr.Zero) { try { h = FindWindow(null, "PackLeader"); } catch { } }
+      bool found = h != IntPtr.Zero;
+      if (found) {
+        if (IsIconic(h)) ShowWindow(h, 9); else ShowWindow(h, 5);
+        SetForegroundWindow(h);
+      }
+      try { PostMessage(new IntPtr(0xffff), RegisterWindowMessage(ActivateMessage), IntPtr.Zero, IntPtr.Zero); } catch { }
+      return found;
+    }
+
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int max);
   }
 
   /// <summary>
@@ -118,6 +154,10 @@ namespace PL {
 }
 '@
   }
+} catch {
+  throw "编译 Windows 窗口辅助类型失败，PackLeader 无法启动：$($_.Exception.Message)"
+}
+try {
   $script:aumidHr = [PL.ShellNative]::SetCurrentProcessExplicitAppUserModelID($script:appUserModelId)
 } catch {
   # 设不上就退回旧行为（任务栏会显示 PowerShell 的图标），但不能因此打断启动
@@ -279,6 +319,19 @@ $script:boot = {
 & $script:boot ("boot ps=$($PSVersionTable.PSVersion) aumid=$($script:appUserModelId) hr=$($script:aumidHr) psStart=$([Diagnostics.Process]::GetCurrentProcess().StartTime.ToString('HH:mm:ss.fff'))")
 function Log([string]$m) { & $script:boot $m }
 trap { if ($script:boot) { & $script:boot ("异常: " + ($_ | Out-String)) } else { try { [System.IO.File]::AppendAllText((Join-Path $env:TEMP 'packleader-ui.log'), ("early: " + ($_ | Out-String)), (New-Object System.Text.UTF8Encoding $false)) } catch { } }; throw }
+
+# 直接起 powershell ui/PackLeader.ps1（绕过启动器）时也要单实例：已经有窗口就把
+# 那个窗口叫出来，然后自己退出。启动器那边有互斥锁兜最外层，这里只按「找得到别人的
+# 窗口」判断——不用再抢一把锁，免得和启动器那把互相打架。
+# 注意位置：必须在上面 Add-Type 编译出 [PL.IconNative] 之后才能调用。
+if (-not $env:PL_GUI_MULTI) {
+  try {
+    if ([PL.IconNative]::ActivateExisting()) {
+      Log '已有实例在运行：已唤醒窗口，本进程退出'
+      exit 0
+    }
+  } catch { Log ('单实例检查失败（忽略）: ' + ($_ | Out-String)) }
+}
 
 if (-not $Cwd) { $Cwd = (Get-Location).Path }
 if (-not $Mode) { $Mode = 'guarded' }
@@ -7845,6 +7898,27 @@ $window.Add_Loaded({
   try { $window.Dispatcher.Invoke([action]{ Update-SideFit }, [System.Windows.Threading.DispatcherPriority]::Background) } catch { }
   # 性能监测从这里开始：帧率 / 心跳 / 卡顿（窗口已可见，之前的不算数）
   Start-PerfWatch
+  # 第二个实例（双击图标）会广播这个自定义消息：收到就把窗口叫出来。
+  # 必须在 Loaded 之后挂，那时才有真句柄；窗口 Hidden 时也能靠它复活。
+  try {
+    $script:activateMsg = [PL.IconNative]::RegisterWindowMessage([PL.IconNative]::ActivateMessage)
+    # 注意两条：HwndSourceHook 带 ref bool，在 PowerShell 里要写 $handled.Value；
+    # 钩子委托必须存进脚本作用域，否则脚本块被回收后消息就没人接了。
+    $script:activateHook = [System.Windows.Interop.HwndSourceHook] {
+      param($hwnd, $msg, $wParam, $lParam, $handled)
+      if ($script:activateMsg -and $msg -eq $script:activateMsg) {
+        Log '收到激活消息：把窗口叫出来'
+        Show-MainWindow
+        $handled.Value = $true
+      }
+      return [IntPtr]::Zero
+    }
+    $src = [System.Windows.Interop.HwndSource]::FromHwnd($h)
+    if ($src) {
+      $src.AddHook($script:activateHook)
+      Log '已挂激活消息钩子'
+    } else { Log '挂激活钩子失败：拿不到 HwndSource' }
+  } catch { Log ('挂激活钩子失败: ' + ($_ | Out-String)) }
   Perf 'point' 'ui-ready'
   $timer.Start()
   if ($TrayStart) {

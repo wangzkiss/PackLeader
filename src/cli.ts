@@ -41,7 +41,7 @@ import { CliRenderer, bold, cyan, dim, gray, green, red, yellow } from './tui/re
 
 const VERSION = '0.1.0'
 const BOOL_FLAGS = new Set([
-  'yes', 'deny', 'json', 'continue', 'no-color', 'force', 'cost', 'help', 'version', 'show-reasoning', 'repl',
+  'yes', 'deny', 'json', 'continue', 'no-color', 'force', 'cost', 'help', 'version', 'show-reasoning', 'repl', 'tray',
 ])
 
 interface Parsed {
@@ -172,7 +172,8 @@ ${bold('用法')}
   pl undo [--turn N]         撤销某一轮的所有文件改动
   pl sessions                列出历史会话
   pl doctor                  自检（node / shell / 数据目录 / 端点 / 模型）
-  pl gui                     打开桌面窗口（里面可以填端点/Key）
+  pl gui                     打开桌面窗口（里面可以填端点/Key；关窗收进托盘，右键托盘退出）
+  pl gui --tray              只进托盘，不弹窗口（开机自启用它）
   pl perf [--runs N]         启动 / 卡顿 / 慢工具的性能报告（默认看最近 3 次启动）
 
 ${bold('选项')}
@@ -253,13 +254,15 @@ async function cmdGui(cfg: Config, flags: Record<string, string | boolean>): Pro
       PL_GUI_API_KEY: cfg.apiKey,
       PL_GUI_MODEL: cfg.model,
       PL_GUI_SESSION: typeof flags.resume === 'string' ? flags.resume : '',
+      // 只进托盘不弹窗：开机自启的快捷方式带 --tray 就这么一路传下去
+      PL_GUI_TRAY: flags.tray ? '1' : '',
     },
     stdio: 'inherit',
     // 从启动器 exe（无控制台进程）拉起时会新开一个黑窗，这里压掉
     windowsHide: true,
   })
   perf.span('ps-spawn', Date.now() - spawnT0, { pid: child.pid ?? 0 })
-  process.stdout.write(`${dim('已打开窗口；关闭窗口即退出。')}\n`)
+  process.stdout.write(`${dim('已打开窗口；关闭窗口后收进托盘，右键托盘图标可以退出。')}\n`)
   await new Promise<void>((r) => child.on('close', () => r()))
   perf.span('ui-lifetime', Date.now() - spawnT0)
   await perf.close()

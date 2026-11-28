@@ -1,6 +1,7 @@
 ﻿// PackLeader 安装包（自解压 + 注册卸载项）。
 // 负载以 payload.bin 资源形式嵌进 exe，编译时用 /resource:payload.bin,payload.bin 传进来。
 // 单文件、无第三方依赖、用 in-box 的 csc.exe 编译，产物几百 KB。
+// 界面（SetupForm / UninstallForm / 主题与自绘控件）在 build/installer-ui.cs，两个文件一起编译。
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -11,30 +12,15 @@ using System.Text;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-// 深色标题栏：WinForms 的 chrome 也是白色的，和深色窗体贴不上，只能找 DWM。
-// DWMWA_USE_IMMERSIVE_DARK_MODE = 20（Win10 2004+），更早的版本用 19。
-static class DarkChrome
-{
-    [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
-    static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
-
-    public static void Apply(IntPtr hwnd)
-    {
-        try
-        {
-            int on = 1;
-            DwmSetWindowAttribute(hwnd, 20, ref on, 4);
-            DwmSetWindowAttribute(hwnd, 19, ref on, 4);
-        }
-        catch { }
-    }
-}
 
 static class Installer
 {
     public const string AppName = "PackLeader";
     public const string Version = "0.1.0";
     const string UninstallKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\PackLeader";
+    /// <summary>开机自启：HKCU 的 Run 项，默认勾上（启动时只进托盘，不弹窗口）</summary>
+    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    const string RunName = "PackLeader";
 
     public static string TargetDir
     {
@@ -122,9 +108,19 @@ static class Installer
     // ---------------------------------------------------------------- 安装
     public static bool Run(bool desktop, Action<int, string> report)
     {
+        return Run(desktop, false, report);
+    }
+
+    /// <summary>
+    /// autostart = 勾了「开机自启」：写 HKCU\...\Run 一个 --tray 的启动项。
+    /// 为什么 --tray：开机时用户正在干别的，弹一个窗口出来是打扰；只进托盘，
+    /// 点托盘图标立刻就能用（窗口早已建好，只是藏着）。
+    /// </summary>
+    public static bool Run(bool desktop, bool autostart, Action<int, string> report)
+    {
         try
         {
-            Log("开始安装 -> " + TargetDir + " desktop=" + desktop);
+            Log("开始安装 -> " + TargetDir + " desktop=" + desktop + " autostart=" + autostart);
             report(2, "准备目录…");
             List<Entry> payload = LoadPayload();
             Log("负载条目: " + payload.Count);
@@ -160,6 +156,9 @@ static class Installer
 
             report(92, "注册卸载项…");
             WriteUninstallEntry(exe, uninst, payload);
+
+            report(96, autostart ? "设置开机自启…" : "清理开机自启项…");
+            SetAutostart(autostart, exe);
 
             report(100, "完成");
             Log("安装完成");
@@ -247,6 +246,33 @@ static class Installer
         }
     }
 
+    /// <summary>
+    /// 写/删 HKCU 的开机自启项。命令里必须带 --tray：开机时只进托盘不弹窗。
+    /// 删除时只在值确实指向本程序时才删，别把同名的别人的项清掉。
+    /// </summary>
+    static void SetAutostart(bool enable, string exe)
+    {
+        try
+        {
+            using (RegistryKey k = Registry.CurrentUser.CreateSubKey(RunKey))
+            {
+                if (k == null) return;
+                if (enable)
+                {
+                    k.SetValue(RunName, "\"" + exe + "\" --tray");
+                    Log("已设置开机自启（--tray）");
+                }
+                else
+                {
+                    string cur = k.GetValue(RunName) as string;
+                    if (cur != null && cur.IndexOf(exe, StringComparison.OrdinalIgnoreCase) >= 0) k.DeleteValue(RunName, false);
+                    Log("已清理开机自启项");
+                }
+            }
+        }
+        catch (Exception ex) { Log("设置开机自启失败: " + ex.Message); }
+    }
+
     static void CreateShortcut(string lnkPath, string target, string workDir, string icon)
     {
         try
@@ -277,6 +303,8 @@ static class Installer
         try { if (File.Exists(StartMenuLnk)) File.Delete(StartMenuLnk); } catch { }
         try { if (File.Exists(DesktopLnk)) File.Delete(DesktopLnk); } catch { }
         try { Registry.CurrentUser.DeleteSubKeyTree(UninstallKey, false); } catch { }
+        // 卸载要清掉开机自启项：否则下次开机还会去拉一个已经不存在的 exe（弹一条系统错误）
+        SetAutostart(false, Path.Combine(TargetDir, "PackLeader.exe"));
 
         // 除了"正在运行的自己"，其余文件同步删干净。
         // 为什么不用 `rd /s /q` 延迟整目录：如果用户在几秒内重装，那条延迟命令会
@@ -356,258 +384,5 @@ static class Installer
         {
             try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
         }
-    }
-}
-
-// -------------------------------------------------------------------- 安装界面
-class SetupForm : Form
-{
-    Label _path = new Label();
-    Label _status = new Label();
-    ProgressBar _bar = new ProgressBar();
-    CheckBox _desktop = new CheckBox();
-    Button _go = new Button();
-    Button _close = new Button();
-
-    public SetupForm()
-    {
-        Text = "PackLeader 安装程序";
-        ClientSize = new Size(560, 268);
-        FormBorderStyle = FormBorderStyle.FixedDialog;
-        MaximizeBox = false;
-        StartPosition = FormStartPosition.CenterScreen;
-        BackColor = Color.FromArgb(15, 17, 21);
-        ForeColor = Color.FromArgb(249, 250, 251);
-        Font = new Font("Segoe UI", 9f);
-
-        Label title = new Label();
-        title.Text = "PackLeader";
-        title.Font = new Font("Segoe UI", 17f, FontStyle.Bold);
-        title.ForeColor = Color.FromArgb(249, 250, 251);
-        title.SetBounds(24, 18, 400, 34);
-        Controls.Add(title);
-
-        Label sub = new Label();
-        sub.Text = "单机 Agent · 零依赖 · 会审批、会审计、能撤销";
-        sub.ForeColor = Color.FromArgb(124, 131, 142);
-        sub.SetBounds(26, 52, 480, 20);
-        Controls.Add(sub);
-
-        Label to = new Label();
-        to.Text = "安装到";
-        to.ForeColor = Color.FromArgb(173, 178, 184);
-        to.SetBounds(26, 92, 60, 20);
-        Controls.Add(to);
-
-        _path.Text = Installer.TargetDir;
-        _path.ForeColor = Color.FromArgb(207, 211, 214);
-        _path.SetBounds(88, 92, 440, 20);
-        Controls.Add(_path);
-
-        _desktop.Text = "同时创建桌面快捷方式";
-        _desktop.Checked = true;
-        _desktop.ForeColor = Color.FromArgb(207, 211, 214);
-        _desktop.SetBounds(26, 120, 300, 22);
-        Controls.Add(_desktop);
-
-        _bar.SetBounds(26, 156, 508, 8);
-        _bar.Style = ProgressBarStyle.Continuous;
-        Controls.Add(_bar);
-
-        _status.Text = "需要系统已安装 Node.js 22.18 或更新版本（安装包不含运行时）。";
-        _status.ForeColor = Color.FromArgb(124, 131, 142);
-        _status.SetBounds(26, 172, 508, 40);
-        Controls.Add(_status);
-
-        _go.Text = "安装";
-        _go.SetBounds(352, 222, 88, 30);
-        _go.BackColor = Color.FromArgb(43, 92, 255);
-        _go.ForeColor = Color.White;
-        _go.FlatStyle = FlatStyle.Flat;
-        _go.FlatAppearance.BorderSize = 0;
-        _go.Click += delegate { StartInstall(); };
-        Controls.Add(_go);
-
-        _close.Text = "关闭";
-        _close.SetBounds(446, 222, 88, 30);
-        _close.FlatStyle = FlatStyle.Flat;
-        _close.BackColor = Color.FromArgb(28, 31, 38);
-        _close.ForeColor = Color.FromArgb(207, 211, 214);
-        _close.FlatAppearance.BorderColor = Color.FromArgb(60, 64, 72);
-        _close.Click += delegate { Close(); };
-        Controls.Add(_close);
-    }
-
-    protected override void OnHandleCreated(EventArgs e)
-    {
-        base.OnHandleCreated(e);
-        DarkChrome.Apply(Handle);
-    }
-
-    void StartInstall()
-    {
-        _go.Enabled = false;
-        _desktop.Enabled = false;
-        bool desktop = _desktop.Checked;
-        System.Threading.ThreadPool.QueueUserWorkItem(delegate(object state)
-        {
-            bool ok = Installer.Run(desktop, delegate(int pct, string msg)
-            {
-                try
-                {
-                    BeginInvoke((MethodInvoker)delegate
-                    {
-                        if (pct >= 0 && pct <= 100) _bar.Value = pct;
-                        if (msg != null)
-                        {
-                            _status.ForeColor = Color.FromArgb(124, 131, 142);
-                            _status.Text = msg;
-                        }
-                    });
-                }
-                catch { }
-            });
-            BeginInvoke((MethodInvoker)delegate
-            {
-                _bar.Value = 100;
-                if (ok)
-                {
-                    _status.ForeColor = Color.FromArgb(74, 222, 128);
-                    _status.Text = "安装完成，开始菜单里已经有 PackLeader 了。";
-                    _go.Text = "完成";
-                    _go.Enabled = true;
-                    _go.Click += delegate { Close(); };
-                }
-                else
-                {
-                    _status.ForeColor = Color.FromArgb(248, 113, 113);
-                    _go.Enabled = true;
-                    _desktop.Enabled = true;
-                }
-            });
-        });
-    }
-}
-
-// -------------------------------------------------------------------- 卸载界面
-/// <summary>
-/// 双击 Uninstall.exe 时看到的就是这个。
-/// 以前没有它：同一个 exe 没参数就画安装界面，用户点「卸载」看到的却是「安装」。
-/// </summary>
-class UninstallForm : Form
-{
-    Label _status = new Label();
-    CheckBox _purge = new CheckBox();
-    Button _go = new Button();
-    Button _close = new Button();
-    bool _done;
-    bool _removed;
-
-    public UninstallForm()
-    {
-        Text = "PackLeader 卸载程序";
-        ClientSize = new Size(560, 250);
-        FormBorderStyle = FormBorderStyle.FixedDialog;
-        MaximizeBox = false;
-        StartPosition = FormStartPosition.CenterScreen;
-        BackColor = Color.FromArgb(15, 17, 21);
-        ForeColor = Color.FromArgb(249, 250, 251);
-        Font = new Font("Segoe UI", 9f);
-
-        Label title = new Label();
-        title.Text = "卸载 PackLeader";
-        title.Font = new Font("Segoe UI", 17f, FontStyle.Bold);
-        title.ForeColor = Color.FromArgb(249, 250, 251);
-        title.SetBounds(24, 18, 460, 34);
-        Controls.Add(title);
-
-        Label sub = new Label();
-        sub.Text = "会删除程序文件、开始菜单/桌面快捷方式和注册表卸载项。你的项目目录不受影响。";
-        sub.ForeColor = Color.FromArgb(124, 131, 142);
-        sub.SetBounds(26, 52, 508, 20);
-        Controls.Add(sub);
-
-        Label where = new Label();
-        where.Text = "安装位置";
-        where.ForeColor = Color.FromArgb(173, 178, 184);
-        where.SetBounds(26, 90, 60, 20);
-        Controls.Add(where);
-
-        Label path = new Label();
-        path.Text = Installer.TargetDir;
-        path.ForeColor = Color.FromArgb(207, 211, 214);
-        path.SetBounds(88, 90, 448, 20);
-        Controls.Add(path);
-
-        _purge.Text = "同时删除会话记录和配置（含 API Key，删了恢复不了）";
-        _purge.ForeColor = Color.FromArgb(207, 211, 214);
-        _purge.SetBounds(26, 118, 460, 22);
-        Controls.Add(_purge);
-
-        _status.Text = "会话数据默认留在 " + Installer.DataDirs()[1] + "，不勾选就不动它。";
-        _status.ForeColor = Color.FromArgb(124, 131, 142);
-        _status.SetBounds(26, 146, 508, 40);
-        Controls.Add(_status);
-
-        _go.Text = "卸载";
-        _go.SetBounds(352, 204, 88, 30);
-        _go.BackColor = Color.FromArgb(43, 92, 255);
-        _go.ForeColor = Color.White;
-        _go.FlatStyle = FlatStyle.Flat;
-        _go.FlatAppearance.BorderSize = 0;
-        _go.Click += delegate { StartUninstall(); };
-        Controls.Add(_go);
-
-        _close.Text = "关闭";
-        _close.SetBounds(446, 204, 88, 30);
-        _close.FlatStyle = FlatStyle.Flat;
-        _close.BackColor = Color.FromArgb(28, 31, 38);
-        _close.ForeColor = Color.FromArgb(207, 211, 214);
-        _close.FlatAppearance.BorderColor = Color.FromArgb(60, 64, 72);
-        _close.Click += delegate { Close(); };
-        Controls.Add(_close);
-
-        // 窗口关掉之后才轮到删自己（这时 exe 才真的没人占用）
-        FormClosed += delegate { if (_removed) Installer.ScheduleSelfDelete(); };
-    }
-
-    protected override void OnHandleCreated(EventArgs e)
-    {
-        base.OnHandleCreated(e);
-        DarkChrome.Apply(Handle);
-    }
-
-    void StartUninstall()
-    {
-        if (_done) { Close(); return; }
-        _go.Enabled = false;
-        _close.Enabled = false;
-        _purge.Enabled = false;
-        bool purgeData = _purge.Checked;
-        _status.ForeColor = Color.FromArgb(124, 131, 142);
-        _status.Text = "正在卸载…";
-        System.Threading.ThreadPool.QueueUserWorkItem(delegate(object state)
-        {
-            // silent=true：这一步的确认框就是窗口本身，别再弹一个
-            int removed = Installer.Uninstall(true, purgeData);
-            BeginInvoke((MethodInvoker)delegate
-            {
-                if (removed < 0)
-                {
-                    _status.Text = "已取消。";
-                    _go.Enabled = true;
-                    _close.Enabled = true;
-                    _purge.Enabled = true;
-                    return;
-                }
-                _done = true;
-                _removed = true;
-                _status.ForeColor = Color.FromArgb(74, 222, 128);
-                _status.Text = "已卸载（删除 " + removed + " 个文件" + (purgeData ? "，会话数据也已清除" : "") + "）。这个窗口关掉后，程序文件会自己删干净。";
-                _go.Text = "完成";
-                _go.Enabled = true;
-                _close.Enabled = true;
-            });
-        });
     }
 }

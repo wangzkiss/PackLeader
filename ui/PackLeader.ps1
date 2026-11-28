@@ -21,6 +21,11 @@ param(
   [string]$ApiKey = $env:PL_GUI_API_KEY,
   [string]$Model = $env:PL_GUI_MODEL,
   [string]$Session = $env:PL_GUI_SESSION,
+  # 只进托盘不弹窗：开机自启、安装完自动启动都走这个（窗口是先建好再藏起来，
+  # 这样托盘菜单「打开」是瞬间的，不用重开一个进程）
+  # 注意别把它叫成 $Tray：下面的 $script:tray 是 NotifyIcon，同一个脚本作用域里
+  # PowerShell 变量名不分大小写，两者会打架（赋值 NotifyIcon 时报「无法转换为 SwitchParameter」）
+  [switch]$TrayStart,
   # 演示模式：不连 host，只回放 scripts/timeline-demo.json（看多轮执行流的样子）
   [switch]$Demo
 )
@@ -61,6 +66,10 @@ namespace PL {
     [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
     [DllImport("user32.dll", EntryPoint = "SetClassLongPtr")] public static extern IntPtr SetClassLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hAfter, int x, int y, int cx, int cy, uint flags);
+    // 「关窗不退出、收进托盘」要靠这几个：ShowWindow(SW_HIDE) + 从任务栏摘掉（用 ShowWindow
+    // 隐藏的窗口任务栏自己会清掉，不额外调 ITaskbarList）
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
   }
 
   /// <summary>
@@ -273,6 +282,11 @@ trap { if ($script:boot) { & $script:boot ("异常: " + ($_ | Out-String)) } els
 
 if (-not $Cwd) { $Cwd = (Get-Location).Path }
 if (-not $Mode) { $Mode = 'guarded' }
+# 只进托盘（开机自启用）：环境变量给的是 1/true 也算
+if (-not $TrayStart -and $env:PL_GUI_TRAY) {
+  $t = [string]$env:PL_GUI_TRAY
+  if ($t -eq '1' -or $t -eq 'true' -or $t -eq 'yes') { $TrayStart = [switch]$true }
+}
 # 数据目录 / 端点 / 模型留空＝交给 host（默认数据目录 + config.json 里存的那家）。
 # 以前这里塞了内置默认（.pl-data、127.0.0.1:19790、deepseek-flash），而 --base-url / --model
 # 传下去就是「显式指定」，会压过 config.json：用户在设置里换的供应商，下次打开又被顶回内置端点。
@@ -7248,7 +7262,166 @@ $MaxBtn.Add_Click({
   if ($window.WindowState -eq 'Maximized') { $window.WindowState = 'Normal' }
   else { $window.WindowState = 'Maximized' }
 })
-$CloseBtn.Add_Click({ $window.Close() })
+# ---------------------------------------------------------------- 托盘常驻
+# 关掉窗口不是退出：程序收进托盘继续在后台跑（host 和正在执行的轮次都不受影响），
+# 托盘菜单里「打开主窗口」可以再把它叫回来，真退出在「退出 PackLeader」。
+# 为什么用 WinForms 的 NotifyIcon：WPF 自己没有托盘，而这个类就在系统自带的
+# System.Windows.Forms 里（脚本开头已经 Add-Type 过），零依赖这条底线不破。
+# 右键菜单自绘成深色：默认的 ContextMenuStrip 是系统浅色，和这套界面不像一家人。
+$script:tray = $null
+$script:trayMenu = $null
+$script:trayReady = $false
+$script:trayExiting = $false
+$script:trayBalloonShown = $false
+
+function New-TrayMenuType {
+  if ('PL.TrayMenu' -as [type]) { return }
+  # 坑：Add-Type 编译时不会自动带上 WinForms/Drawing，只写 using 的话报
+  # 「命名空间 System.Windows 中不存在 Forms」——必须显式 -ReferencedAssemblies
+  Add-Type -ReferencedAssemblies 'System.Windows.Forms', 'System.Drawing', 'System' -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Windows.Forms;
+
+namespace PL {
+  /// <summary>托盘菜单的深色调色板（和主界面同一套颜色：#16191F 底 / #E6E8EE 字）</summary>
+  sealed class TrayColorTable : ProfessionalColorTable {
+    static readonly Color Bg = Color.FromArgb(22, 25, 31);
+    static readonly Color Sel = Color.FromArgb(38, 43, 54);
+    static readonly Color Sep = Color.FromArgb(40, 45, 54);
+    public override Color ToolStripDropDownBackground { get { return Bg; } }
+    public override Color MenuItemSelected { get { return Sel; } }
+    public override Color MenuItemSelectedGradientBegin { get { return Sel; } }
+    public override Color MenuItemSelectedGradientEnd { get { return Sel; } }
+    public override Color MenuItemBorder { get { return Color.FromArgb(43, 92, 255); } }
+    public override Color MenuBorder { get { return Color.FromArgb(52, 57, 66); } }
+    public override Color ImageMarginGradientBegin { get { return Bg; } }
+    public override Color ImageMarginGradientMiddle { get { return Bg; } }
+    public override Color ImageMarginGradientEnd { get { return Bg; } }
+    public override Color SeparatorDark { get { return Sep; } }
+    public override Color SeparatorLight { get { return Sep; } }
+  }
+
+  public sealed class TrayMenu : ContextMenuStrip {
+    public TrayMenu() {
+      Renderer = new ToolStripProfessionalRenderer(new TrayColorTable());
+      BackColor = Color.FromArgb(22, 25, 31);
+      ForeColor = Color.FromArgb(230, 232, 238);
+      ShowImageMargin = false;
+      ShowCheckMargin = false;
+      Font = new Font("Microsoft YaHei UI", 9f);
+      Padding = new Padding(0, 5, 0, 5);
+    }
+  }
+}
+'@
+}
+
+# 托盘图标：优先用 ico 里那帧 32px（任务栏托盘要的是 16，系统会自己缩）；
+# 走绘制兜底时临时造一个句柄，并留着引用——句柄被回收图标就成白块了。
+function Get-TrayIcon {
+  try {
+    if ($script:iconObjects -and @($script:iconObjects).Count -gt 1) { return $script:iconObjects[1] }
+  } catch { }
+  try {
+    $h = New-HiconFromBitmap (New-LogoBitmap 32)
+    $script:trayIconHandle = $h
+    return [System.Drawing.Icon]::FromHandle($h)
+  } catch { }
+  return [System.Drawing.SystemIcons]::Application
+}
+
+function Init-Tray {
+  if ($script:tray) { return $true }
+  try {
+    New-TrayMenuType
+    $menu = New-Object PL.TrayMenu
+
+    $miOpen = New-Object System.Windows.Forms.ToolStripMenuItem '打开主窗口'
+    $miOpen.Add_Click({ Show-MainWindow })
+    [void]$menu.Items.Add($miOpen)
+
+    [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
+    $miExit = New-Object System.Windows.Forms.ToolStripMenuItem '退出 PackLeader'
+    $miExit.Add_Click({ Exit-App })
+    [void]$menu.Items.Add($miExit)
+
+    # 变量名不能用 $tray：脚本参数 [switch]$Tray 也叫这个名字（PowerShell 变量名不分大小写），
+    # 会把这行赋值当成写 switch 参数而报「无法转换为 SwitchParameter」。所以叫 $ni。
+    $ni = New-Object System.Windows.Forms.NotifyIcon
+    $ni.Icon = (Get-TrayIcon)
+    $ni.Text = 'PackLeader'
+    $ni.ContextMenuStrip = $menu
+    $ni.Visible = $true
+    # 双击托盘 = 打开窗口（和 Windows 上大多数常驻程序一致）
+    $ni.Add_MouseDoubleClick({ Show-MainWindow })
+
+    $script:tray = $ni
+    $script:trayMenu = $menu
+    $script:trayReady = $true
+    Log '托盘图标就绪'
+    return $true
+  } catch {
+    Log ('托盘图标创建失败: ' + ($_ | Out-String))
+    $script:trayReady = $false
+    return $false
+  }
+}
+
+function Show-MainWindow {
+  if (-not $window) { return }
+  try {
+    $window.ShowInTaskbar = $true
+    # 藏过的窗口先让 IsVisible 复位，再走系统那一路显式还原（Show() 对 Hide 过的窗口偶尔不恢复 Z 序）
+    if (-not $window.IsVisible) { $window.Show() }
+    if ($window.WindowState -eq 'Minimized') { $window.WindowState = 'Normal' }
+    $h = (New-Object System.Windows.Interop.WindowInteropHelper $window).Handle
+    if ($h -ne [IntPtr]::Zero) { [void][PL.IconNative]::ShowWindow($h, 5) }
+    $window.Activate() | Out-Null
+    # Activate 有时抢不过前台程序，再走一次 SetForegroundWindow 兜底
+    if ($h -ne [IntPtr]::Zero) { [void][PL.IconNative]::SetForegroundWindow($h) }
+    $InputBox.Focus() | Out-Null
+    Log '窗口已从托盘打开'
+  } catch { Log ('打开主窗口失败: ' + ($_ | Out-String)) }
+}
+
+function Hide-MainWindow([switch]$Quiet) {
+  if (-not $window) { return }
+  if ($script:trayExiting) { return }
+  if (-not $script:trayReady) {
+    # 托盘没建起来就别藏：藏了就再也找不回来，这时关窗只能按真退出处理
+    Log '托盘不可用，关窗按退出处理'
+    Exit-App
+    return
+  }
+  try {
+    $window.ShowInTaskbar = $false
+    $window.Hide()
+    Log '窗口已收进托盘'
+    # 只提示一次：第一次关窗时告诉用户「没退出」，以后别再烦他
+    if (-not $Quiet -and -not $script:trayBalloonShown) {
+      $script:trayBalloonShown = $true
+      try {
+        $script:tray.ShowBalloonTip(3000, 'PackLeader 还在后台运行', '点托盘图标可以重新打开，右键可以退出。', [System.Windows.Forms.ToolTipIcon]::None)
+      } catch { }
+    }
+  } catch { Log ('收进托盘失败: ' + ($_ | Out-String)) }
+}
+
+function Exit-App {
+  if ($script:trayExiting) { return }
+  $script:trayExiting = $true
+  Log '退出程序'
+  try { if ($script:tray) { $script:tray.Visible = $false; $script:tray.Dispose(); $script:tray = $null } } catch { }
+  try { $window.Close() } catch { }
+  # ShutdownMode 是 OnExplicitShutdown：窗口关掉不会自动结束 Application.Run，
+  # 这里必须显式关一次，否则脚本会挂在 Run 里不退出。
+  try { if ($script:app) { $script:app.Shutdown() } } catch { }
+}
+
+# × 按钮：收进托盘（真退出在托盘菜单里）
+$CloseBtn.Add_Click({ Hide-MainWindow })
 # 最大化后按钮要换成「还原」（E923），否则图标和实际行为对不上；
 # 用户从任务栏还原、双击标题栏、Aero Snap 拖回来也都会走这个事件。
 function Update-MaxBtnVisual {
@@ -7674,7 +7847,13 @@ $window.Add_Loaded({
   Start-PerfWatch
   Perf 'point' 'ui-ready'
   $timer.Start()
-  $InputBox.Focus() | Out-Null
+  if ($TrayStart) {
+    # 只进托盘：窗口全程不露头，也别抢焦点（开机自启时用户正在干别的）
+    Log 'Loaded：按 --tray 收进托盘'
+    Hide-MainWindow -Quiet
+  } else {
+    $InputBox.Focus() | Out-Null
+  }
   # 自测入口：设置 PL_GUI_TASK 会自动发第一条任务（也方便截图验证）
   if ($env:PL_GUI_TASK) { Start-Turn $env:PL_GUI_TASK }
 })
@@ -7696,9 +7875,20 @@ $window.Add_SizeChanged({
 })
 
 $window.Add_Closing({
+  # 坑：WPF 给事件回调传的是 (sender, args)，PowerShell 脚本块里必须显式 param 接住，
+  # 不然 $e 是 $null，写 $e.Cancel 直接抛「找不到属性 Cancel」，窗口照样关掉。
+  param($s, $e)
+  # 关窗 ≠ 退出：没有真正要退出时（点 ×、Alt+F4、任务栏右键关闭都算），
+  # 拦下来收进托盘，host 和正在跑的轮次继续。真退出只走托盘菜单的「退出」。
+  if (-not $script:trayExiting -and $script:trayReady) {
+    $e.Cancel = $true
+    Hide-MainWindow
+    return
+  }
   Log '窗口 Closing'
   Perf 'point' 'closing' @{ stalls = [int]$script:perfStalls; events = [int]$script:perfEvtCount }
   try { Save-SideWidth } catch { }
+  try { if ($script:tray) { $script:tray.Visible = $false; $script:tray.Dispose(); $script:tray = $null } } catch { }
 
   $timer.Stop()
   try { $proc.StandardInput.Close() } catch { }
@@ -7708,8 +7898,20 @@ $window.Add_Closing({
 
 Perf 'point' 'show-dialog'
 $script:perfShowT0 = [System.Diagnostics.Stopwatch]::StartNew()
-Log '准备 ShowDialog'
-$window.ShowDialog() | Out-Null
+# 托盘先建好：这样即使以 --tray 启动（窗口不露头），关窗那条路径也立刻可用
+Init-Tray | Out-Null
+if ($TrayStart) {
+  Log '以 --tray 启动：只进托盘'
+  $window.ShowInTaskbar = $false
+  $window.WindowState = 'Minimized'
+}
+Log '准备 Run'
+# 这里不能用 ShowDialog()：模态循环以「窗口不再可见」为结束条件，而收进托盘正是
+# Hide() —— ShowDialog 会立刻返回、脚本跑到结尾，整个程序跟着退出（托盘里一闪就没了）。
+# 换成 Application.Run(window)：消息循环只在窗口真正关闭（= 托盘菜单「退出」）时结束。
+$script:app = New-Object System.Windows.Application
+$script:app.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
+$script:app.Run($window) | Out-Null
 Log '窗口已关闭'
 # 退出汇总：一辈子一条，pl perf 报表直接读它最省事
 Perf 'summary' 'exit' @{ uptime_ms = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $script:perfT0); dropped = $(if ($script:perf) { $script:perf.Dropped } else { 0 }) }

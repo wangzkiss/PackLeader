@@ -82,8 +82,11 @@ try {
   $fsPayload.Close()
 
   # ---------- 5. 安装包 ----------
+  # 逻辑（installer.cs）+ 界面（installer-ui.cs，和主窗口一套配色与自绘控件）分开写，
+  # 免得一个文件六百多行又长又难改；编译时一起交给 csc。
   $setup = Join-Path $dist "PackLeader-Setup-$version.exe"
-  & $csc /nologo /target:winexe /codepage:65001 /optimize+ "/win32icon:$icon" "/resource:$payload,payload.bin" "/out:$setup" (Join-Path $root 'build\installer.cs')
+  & $csc /nologo /target:winexe /codepage:65001 /optimize+ "/win32icon:$icon" "/resource:$payload,payload.bin" "/out:$setup" `
+    (Join-Path $root 'build\installer.cs') (Join-Path $root 'build\installer-ui.cs')
   if ($LASTEXITCODE -ne 0) { throw '安装包编译失败' }
 
   # ---------- 6. 便携 zip ----------

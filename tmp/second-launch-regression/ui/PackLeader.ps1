@@ -1,0 +1,7992 @@
+﻿#Requires -Version 5.1
+<#
+  PackLeader 桌面窗口（WPF / PowerShell 5.1 / .NET Framework 4.8，都是 Windows 自带）
+
+  设计参考 DeepSeek Harness 的界面：深色中性底、左侧会话栏、无气泡消息流、
+  细描边（12% 白）卡片、等宽字体显示工具调用。配色取自 DSH 自己的 CSS 变量：
+    #0f1115 底色 / #f9fafb 主文字 / #cfd3d6 次文字 / #adb2b8 三级文字 / rgba(255,255,255,.12) 描边
+  字号取自它的主题插件：正文 14px，代码小 1px，行高 1.6。
+
+  往外只做一件事：把用户输入变成 NDJSON 写给 src/host.ts，把 host 的事件画出来。
+
+  启动：pl gui   （或 node src/cli.ts gui）
+  直接跑：powershell -NoProfile -STA -ExecutionPolicy Bypass -File ui\PackLeader.ps1
+#>
+
+param(
+  [string]$Cwd = $env:PL_GUI_CWD,
+  [string]$Mode = $env:PL_GUI_MODE,
+  [string]$DataDir = $env:PL_GUI_DATA,
+  [string]$BaseUrl = $env:PL_GUI_BASE_URL,
+  [string]$ApiKey = $env:PL_GUI_API_KEY,
+  [string]$Model = $env:PL_GUI_MODEL,
+  [string]$Session = $env:PL_GUI_SESSION,
+  # 只进托盘不弹窗：开机自启、安装完自动启动都走这个（窗口是先建好再藏起来，
+  # 这样托盘菜单「打开」是瞬间的，不用重开一个进程）
+  # 注意别把它叫成 $Tray：下面的 $script:tray 是 NotifyIcon，同一个脚本作用域里
+  # PowerShell 变量名不分大小写，两者会打架（赋值 NotifyIcon 时报「无法转换为 SwitchParameter」）
+  [switch]$TrayStart,
+  # 演示模式：不连 host，只回放 scripts/timeline-demo.json（看多轮执行流的样子）
+  [switch]$Demo
+)
+
+
+$ErrorActionPreference = 'Stop'
+# 没有控制台时会话里没有 stdout（启动器是 WinExe，spawn 后子进程无控制台）：
+# 在这里设 OutputEncoding 会抛 IOException，而 trap 那时还没生效，报错会变成"找不到 Log"，
+# 真正的错因被吃掉。所以这一句必须容错。
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+try { $OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+
+# 任务栏图标为什么必须设 AUMID：
+# 窗口是 powershell.exe 起的，进程没有自己的 AppUserModelID 时，任务栏把它并进
+# 「Windows PowerShell」那个分组，按钮图标取自 powershell.exe 的 exe 图标，
+# 窗口级图标（Window.Icon / WM_SETICON）全被忽略——任务栏上永远是 PowerShell 的白蓝图标。
+# 给进程一个独立的 AUMID，任务栏才会单独分组并按窗口图标绘制。
+# 必须在创建任何窗口之前调用；窗口建好后再设就不生效了。
+$script:appUserModelId = 'PackLeader.Desktop'
+try {
+  # 两处 P/Invoke 合成一次编译：Add-Type 每次都要现调一次 csc（实测约 70ms），
+  # 启动路径上少等一次。类型名不变，下面 [PL.ShellNative] / [PL.IconNative] 照旧能用。
+  if (-not ('PL.IconNative' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+namespace PL {
+  public static class ShellNative {
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern int SetCurrentProcessExplicitAppUserModelID(string id);
+  }
+  public static class IconNative {
+    [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr hIcon);
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+    [DllImport("user32.dll", EntryPoint = "SetClassLongPtr")] public static extern IntPtr SetClassLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hAfter, int x, int y, int cx, int cy, uint flags);
+    // 「关窗不退出、收进托盘」要靠这几个：ShowWindow(SW_HIDE) + 从任务栏摘掉（用 ShowWindow
+    // 隐藏的窗口任务栏自己会清掉，不额外调 ITaskbarList）
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string title);
+    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern uint RegisterWindowMessage(string name);
+
+    /// <summary>「第二个实例把第一个叫出来」用的自定义消息名（launcher.cs 里同名）</summary>
+    public const string ActivateMessage = "PackLeaderActivate";
+
+    /// <summary>
+    /// 已经有 PackLeader 在跑时，把它的窗口叫到前台：先按窗口类前缀找（WPF 的类名是
+    /// HwndWrapper[PackLeader.xxx;;guid]，标题会变、类名前缀不会），再按标题兜底。
+    /// 找不到也广播一次激活消息——窗口收在托盘里（Hidden）时由界面自己 Show 出来。
+    /// 返回是否找到了窗口。
+    /// </summary>
+    public static bool ActivateExisting() {
+      IntPtr h = IntPtr.Zero;
+      try {
+        EnumWindows(delegate(IntPtr w, IntPtr l) {
+          StringBuilder sb = new StringBuilder(512);
+          if (GetClassName(w, sb, sb.Capacity) > 0 && sb.ToString().StartsWith("HwndWrapper[PackLeader", StringComparison.Ordinal)) { h = w; return false; }
+          return true;
+        }, IntPtr.Zero);
+      } catch { }
+      if (h == IntPtr.Zero) { try { h = FindWindow(null, "PackLeader"); } catch { } }
+      bool found = h != IntPtr.Zero;
+      if (found) {
+        if (IsIconic(h)) ShowWindow(h, 9); else ShowWindow(h, 5);
+        SetForegroundWindow(h);
+      }
+      try { PostMessage(new IntPtr(0xffff), RegisterWindowMessage(ActivateMessage), IntPtr.Zero, IntPtr.Zero); } catch { }
+      return found;
+    }
+
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int max);
+  }
+
+  /// <summary>
+  /// 性能日志写入器：后台线程每 500ms 批量 append 一次。
+  /// 绝不在 UI 线程上同步写盘——那等于为了记日志反过来把界面卡住。
+  /// 队列封顶 5000 条，超了丢最旧的（宁可少记几条，也不能让内存一直涨）。
+  /// </summary>
+  public sealed class PerfWriter {
+    readonly Queue<string> q = new Queue<string>();
+    readonly object gate = new object();
+    readonly string path;
+    readonly Thread th;
+    volatile bool stopped;
+    public long Dropped;
+
+    public PerfWriter(string p) {
+      path = p;
+      th = new Thread(Loop);
+      th.IsBackground = true;
+      th.Start();
+    }
+
+    public void Write(string line) {
+      lock (gate) { if (q.Count >= 5000) { q.Dequeue(); Dropped++; } q.Enqueue(line); }
+    }
+
+    public void Flush() { Drain(); }
+
+    public void Stop() { stopped = true; Drain(); }
+
+    void Loop() {
+      while (!stopped) { Thread.Sleep(500); Drain(); }
+    }
+
+    void Drain() {
+      string[] batch;
+      lock (gate) { if (q.Count == 0) return; batch = q.ToArray(); q.Clear(); }
+      try {
+        using (FileStream fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+        using (StreamWriter sw = new StreamWriter(fs, new UTF8Encoding(false))) {
+          foreach (string s in batch) sw.WriteLine(s);
+        }
+      } catch { }
+    }
+  }
+}
+'@
+  }
+} catch {
+  throw "编译 Windows 窗口辅助类型失败，PackLeader 无法启动：$($_.Exception.Message)"
+}
+try {
+  $script:aumidHr = [PL.ShellNative]::SetCurrentProcessExplicitAppUserModelID($script:appUserModelId)
+} catch {
+  # 设不上就退回旧行为（任务栏会显示 PowerShell 的图标），但不能因此打断启动
+  $script:aumidHr = -1
+}
+
+# ---------------------------------------------------------------- 性能日志
+# 一次启动一个 run：启动器生成 run / t0 经环境变量传下来，三层（启动器 / 界面 / host）
+# 的日志靠这两个值对齐成一条时间轴。开关在 config.json 的 perf 字段（off / basic / full）。
+# 这一块自带容错：任何一步失败都只降级成「不记」，绝不挡着窗口起来。
+$script:perfMode = if ($env:PL_PERF) { [string]$env:PL_PERF } else { 'basic' }
+if (@('off', 'basic', 'full') -notcontains $script:perfMode) { $script:perfMode = 'basic' }
+$script:perfRun = [string]$env:PL_PERF_RUN
+$script:perfT0 = 0L
+if ($env:PL_PERF_T0) { [void][long]::TryParse([string]$env:PL_PERF_T0, [ref]$script:perfT0) }
+if ($script:perfT0 -le 0) { $script:perfT0 = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+$script:perf = $null
+$script:perfFile = ''
+$script:perfMark = [System.Diagnostics.Stopwatch]::StartNew()
+
+function Perf-JStr([string]$s) {
+  if ($null -eq $s) { return '""' }
+  return '"' + ($s -replace '\\', '\\\\' -replace '"', '\"' -replace "`r", '\r' -replace "`n", '\n') + '"'
+}
+
+# Perf <type> <name> [-dur <ms>] [-meta @{...}]  —— type 一般是 span / point
+function Perf([string]$type, [string]$name, $dur = $null, $meta = $null) {
+  if (-not $script:perf) { return }
+  try {
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $sb = New-Object System.Text.StringBuilder 192
+    [void]$sb.Append('{"v":1,"src":"ui","run":').Append((Perf-JStr $script:perfRun))
+    [void]$sb.Append(',"ts":').Append($now).Append(',"mono":').Append($now - $script:perfT0)
+    [void]$sb.Append(',"type":').Append((Perf-JStr $type)).Append(',"name":').Append((Perf-JStr $name))
+    if ($null -ne $dur) { [void]$sb.Append(',"dur_ms":').Append([long][Math]::Round([double]$dur)) }
+    if ($meta) {
+      foreach ($k in $meta.Keys) {
+        $v = $meta[$k]
+        [void]$sb.Append(',').Append((Perf-JStr ([string]$k))).Append(':')
+        if ($v -is [bool]) { [void]$sb.Append($(if ($v) { 'true' } else { 'false' })) }
+        elseif ($v -is [int] -or $v -is [long]) { [void]$sb.Append([string]$v) }
+        elseif ($v -is [double] -or $v -is [single] -or $v -is [decimal]) {
+          [void]$sb.Append(([double]$v).ToString('0.###', [System.Globalization.CultureInfo]::InvariantCulture))
+        } else { [void]$sb.Append((Perf-JStr ([string]$v))) }
+      }
+    }
+    [void]$sb.Append('}')
+    $script:perf.Write($sb.ToString())
+  } catch { }
+}
+
+# ---------------------------------------------------------------- 性能监测：帧率 / 心跳 / 卡顿
+# 界面「卡一下」有三种不同的原因，得分开记：
+#   心跳断档（stall）= 主线程被一段脚本占住了；
+#   帧率掉（fps）= 画得慢，但主线程是活的；
+#   队列变长（queue）= host 吐得快、界面消化不掉。
+$script:perfWatchOn = $false
+$script:perfFrames = 0
+$script:perfSec = 0L
+$script:perfFpsN = 0
+$script:perfFpsMin = 0
+$script:perfHeartLast = 0L
+$script:perfStalls = 0
+$script:perfEvtCount = 0
+$script:perfTurnT0 = $null
+# basic 档也一定要记的事件类型：一轮的开头结尾、工具调用、报错——一条就够定位一轮
+$script:perfKeyTypes = @('turn-start', 'turn-end', 'tool-start', 'tool-end', 'ready', 'error', 'question', 'approval')
+
+function Perf-Action([string]$name, $meta = $null) {
+  # 交互动作：按钮按下那一刻一条，和后面的 event / span 一对，就知道「点了多久才有反应」
+  if (-not $script:perf -or $script:perfMode -eq 'off') { return }
+  Perf 'action' $name $null $meta
+}
+
+function Perf-Stall([double]$gapMs) {
+  # 主线程断档：把当时在干什么一并记下，事后才知道是哪一段占住了
+  $script:perfStalls = ([int]$script:perfStalls) + 1
+  $meta = @{ busy = $false; q = 0; reason = 0; mode = [string]$script:perfMode }
+  try { $meta.busy = [bool]$script:busy } catch { }
+  try { if ($script:pumpOut) { $meta.q = [int]$script:pumpOut.Count } } catch { }
+  try { if ($script:reasonQueue) { $meta.reason = [int]$script:reasonQueue.Count } } catch { }
+  Perf 'stall' 'ui' $gapMs $meta
+}
+
+function Start-PerfWatch {
+  if (-not $script:perf -or $script:perfMode -eq 'off' -or $script:perfWatchOn) { return }
+  $script:perfWatchOn = $true
+  $script:perfHeartLast = [System.Diagnostics.Stopwatch]::GetTimestamp()
+  # 帧回调每帧都跑，所以它自己必须极轻：只加一个计数。重一点就先把帧率拉下来了
+  try {
+    [System.Windows.Media.CompositionTarget]::add_Rendering(
+      [System.EventHandler]{ param($s, $e) $script:perfFrames = ([int]$script:perfFrames) + 1 })
+  } catch { }
+}
+
+function Step-PerfWatch {
+  # 每个 tick（50ms）走一次：量心跳断档，顺带按秒统计帧率
+  if (-not $script:perfWatchOn) { return }
+  try {
+    $now = [System.Diagnostics.Stopwatch]::GetTimestamp()
+    $freq = [double][System.Diagnostics.Stopwatch]::Frequency
+    if ($script:perfHeartLast -gt 0) {
+      $gapMs = ($now - [long]$script:perfHeartLast) * 1000.0 / $freq
+      # tick 是 50ms 一跳；越过 200ms 说明主线程真被占住了（4 倍余量，避开误报）
+      if ($gapMs -ge 200) { Perf-Stall $gapMs }
+    }
+    $script:perfHeartLast = $now
+
+    $sec = [long][Math]::Floor($now / $freq)
+    if ($sec -ne $script:perfSec) {
+      $fps = [int]$script:perfFrames
+      if ($script:perfSec -gt 0) {
+        # 窗口不可见 / 最小化时帧率当然很低，那不是卡顿，不参与统计
+        $vis = $false
+        try { $vis = ($script:window.IsVisible -and $script:window.WindowState -ne 'Minimized') } catch { }
+        if ($vis) {
+          if ($fps -lt $script:perfFpsMin -or $script:perfFpsMin -le 0) { $script:perfFpsMin = $fps }
+          $script:perfFpsN = ([int]$script:perfFpsN) + 1
+          if ($script:perfMode -eq 'full') {
+            Perf 'fps' 'ui' $null @{ fps = $fps; stalls = [int]$script:perfStalls; n = 1 }
+          } elseif (($script:perfFpsN % 10) -eq 0) {
+            # basic 档每 10 秒一条：这一段里最低的那一秒 + 累计卡顿次数
+            Perf 'fps' 'ui' $null @{ fps = [int]$script:perfFpsMin; n = 10; stalls = [int]$script:perfStalls }
+            $script:perfFpsMin = 0
+          }
+        }
+      }
+      $script:perfSec = $sec
+      $script:perfFrames = 0
+    }
+  } catch { }
+}
+
+if ($script:perfMode -ne 'off') {
+  try {
+    $perfBase = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { $env:TEMP }
+    $perfDir = Join-Path (Join-Path $perfBase 'PackLeader') 'perf'
+    New-Item -ItemType Directory -Force -Path $perfDir | Out-Null
+    $script:perfFile = Join-Path $perfDir ('ui-' + (Get-Date -Format 'yyyyMMdd') + '.jsonl')
+    $script:perf = New-Object -TypeName PL.PerfWriter -ArgumentList $script:perfFile
+    # 脚本首行时 PowerShell 进程已经跑了多久：进程创建 → 跑起第一条脚本。这段在这之前没有任何埋点，
+    # 慢的时候 pl perf 只能显示「到窗口 4.47s」而各段加起来才 400ms
+    $psElapsed = 0L
+    try {
+      $psStartMs = ([DateTimeOffset]([Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime())).ToUnixTimeMilliseconds()
+      $psElapsed = [long]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $psStartMs)
+    } catch { $psElapsed = 0L }
+    Perf 'start' 'ui' $null @{ pid = $PID; mode = $script:perfMode; ps = $PSVersionTable.PSVersion.ToString(); ps_ms = [long]$psElapsed }
+  } catch { $script:perf = $null }
+}
+
+$script:guiLog = Join-Path $env:TEMP 'packleader-ui.log'
+# 启动早期就得能落盘：trap 里不能再依赖 Log（它自己可能就是没生效的那个）
+$script:boot = {
+  param([string]$m)
+  try { [System.IO.File]::AppendAllText($script:guiLog, ("{0:HH:mm:ss.fff} {1}`r`n" -f (Get-Date), $m), (New-Object System.Text.UTF8Encoding $false)) } catch { }
+}
+[System.IO.File]::WriteAllText($script:guiLog, "", (New-Object System.Text.UTF8Encoding $false))
+& $script:boot ("boot ps=$($PSVersionTable.PSVersion) aumid=$($script:appUserModelId) hr=$($script:aumidHr) psStart=$([Diagnostics.Process]::GetCurrentProcess().StartTime.ToString('HH:mm:ss.fff'))")
+function Log([string]$m) { & $script:boot $m }
+trap { if ($script:boot) { & $script:boot ("异常: " + ($_ | Out-String)) } else { try { [System.IO.File]::AppendAllText((Join-Path $env:TEMP 'packleader-ui.log'), ("early: " + ($_ | Out-String)), (New-Object System.Text.UTF8Encoding $false)) } catch { } }; throw }
+
+# 直接起 powershell ui/PackLeader.ps1（绕过启动器）时也要单实例：已经有窗口就把
+# 那个窗口叫出来，然后自己退出。启动器那边有互斥锁兜最外层，这里只按「找得到别人的
+# 窗口」判断——不用再抢一把锁，免得和启动器那把互相打架。
+# 注意位置：必须在上面 Add-Type 编译出 [PL.IconNative] 之后才能调用。
+if (-not $env:PL_GUI_MULTI) {
+  try {
+    if ([PL.IconNative]::ActivateExisting()) {
+      Log '已有实例在运行：已唤醒窗口，本进程退出'
+      exit 0
+    }
+  } catch { Log ('单实例检查失败（忽略）: ' + ($_ | Out-String)) }
+}
+
+if (-not $Cwd) { $Cwd = (Get-Location).Path }
+if (-not $Mode) { $Mode = 'guarded' }
+# 只进托盘（开机自启用）：环境变量给的是 1/true 也算
+if (-not $TrayStart -and $env:PL_GUI_TRAY) {
+  $t = [string]$env:PL_GUI_TRAY
+  if ($t -eq '1' -or $t -eq 'true' -or $t -eq 'yes') { $TrayStart = [switch]$true }
+}
+# 数据目录 / 端点 / 模型留空＝交给 host（默认数据目录 + config.json 里存的那家）。
+# 以前这里塞了内置默认（.pl-data、127.0.0.1:19790、deepseek-flash），而 --base-url / --model
+# 传下去就是「显式指定」，会压过 config.json：用户在设置里换的供应商，下次打开又被顶回内置端点。
+if (-not $ApiKey) { $ApiKey = $env:PL_API_KEY }
+
+$here = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = $env:PL_GUI_ROOT
+if (-not $root) { $root = Split-Path -Parent $here }
+$hostTs = Join-Path $root 'src\host.ts'
+
+Log '载 WPF 程序集'
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml, System.Windows.Forms
+Log '程序集就绪'
+Perf 'span' 'wpf-assemblies' $script:perfMark.ElapsedMilliseconds
+$script:perfMark.Restart()
+
+# ---------------------------------------------------------------- 界面
+$xaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
+        Title="PackLeader" Height="720" Width="1120" MinHeight="520" MinWidth="860"
+        WindowStartupLocation="CenterScreen"
+        WindowStyle="None" ResizeMode="CanResize"
+        Background="#0E1015" FontFamily="Segoe UI Variable Text, Microsoft YaHei UI, Segoe UI" FontSize="13"
+        UseLayoutRounding="True" SnapsToDevicePixels="True"
+        TextOptions.TextFormattingMode="Ideal">
+  <!-- 自绘标题栏：标题栏原来是系统画的（只有 PackLeader 名字和 - □ ×），
+       会话标题和设置只能另占一行。WindowStyle=None + WindowChrome 把非客户区收进客户区，
+       于是标题、设置、窗口按钮都能自己排；CaptionHeight=44 表示顶部 44px 仍由系统当
+       标题栏处理（拖动 / 双击最大化 / 右键系统菜单都不用手写）。
+       ResizeBorderThickness=6 留出四边的拉伸手柄。 -->
+  <shell:WindowChrome.WindowChrome>
+    <shell:WindowChrome CaptionHeight="44" ResizeBorderThickness="6" GlassFrameThickness="0"
+                        CornerRadius="16" UseAeroCaptionButtons="False"/>
+  </shell:WindowChrome.WindowChrome>
+  <Window.Resources>
+    <SolidColorBrush x:Key="WindowSurface" Color="#13151A"/>
+    <SolidColorBrush x:Key="TitleSurface" Color="#14171D"/>
+    <SolidColorBrush x:Key="SidebarSurface" Color="#161920"/>
+    <SolidColorBrush x:Key="RaisedSurface" Color="#1B1E27"/>
+    <SolidColorBrush x:Key="CardSurface" Color="#191C24"/>
+    <SolidColorBrush x:Key="StepSurface" Color="#20242E"/>
+    <LinearGradientBrush x:Key="BlueSurface" StartPoint="0,0" EndPoint="1,1">
+      <GradientStop Color="#3B82F6" Offset="0"/>
+      <GradientStop Color="#2B6CB0" Offset="1"/>
+    </LinearGradientBrush>
+    <!-- 默认焦点虚线框在深色底上很跳，去掉 -->
+    <Style TargetType="Button">
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    </Style>
+    <Style TargetType="TextBox">
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    </Style>
+    <!-- 滚动条：系统默认那条带箭头的浅色槽在深色底上太跳，整个重画（宽 10、无箭头、圆角滑块） -->
+    <Style x:Key="ThinThumb" TargetType="Thumb">
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Thumb">
+            <Border x:Name="bd" Background="#344056" CornerRadius="4" Margin="2"/>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bd" Property="Background" Value="#4B5563"/>
+              </Trigger>
+              <Trigger Property="IsDragging" Value="True">
+                <Setter TargetName="bd" Property="Background" Value="#5B6675"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style TargetType="ScrollBar">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Width" Value="10"/>
+      <Setter Property="MinWidth" Value="10"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ScrollBar">
+            <Grid Background="Transparent">
+              <Track x:Name="PART_Track" IsDirectionReversed="True">
+                <Track.DecreaseRepeatButton>
+                  <RepeatButton Command="ScrollBar.PageUpCommand" Opacity="0" Focusable="False"/>
+                </Track.DecreaseRepeatButton>
+                <Track.Thumb>
+                  <Thumb Style="{StaticResource ThinThumb}"/>
+                </Track.Thumb>
+                <Track.IncreaseRepeatButton>
+                  <RepeatButton Command="ScrollBar.PageDownCommand" Opacity="0" Focusable="False"/>
+                </Track.IncreaseRepeatButton>
+              </Track>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="Orientation" Value="Horizontal">
+                <Setter Property="Width" Value="Auto"/>
+                <Setter Property="Height" Value="10"/>
+                <Setter TargetName="PART_Track" Property="IsDirectionReversed" Value="False"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+  <Grid x:Name="RootGrid">
+    <Grid.RowDefinitions>
+      <!-- 行 0 = 自绘标题栏（会话标题 / 设置 / 窗口按钮都在这条上）；行 1 = 原来的三列主界面 -->
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+    </Grid.RowDefinitions>
+    <Grid.ColumnDefinitions>
+      <!-- 列 0 = 左侧栏（宽度可拖）；列 1 = 分隔条；列 2 = 右侧对话区 -->
+      <!-- 起始宽度给到 MinWidth，真实宽度由 Loaded 里的 Restore-SideWidth 决定。
+           写死 Width="252" 时窗口一宽，拖到 252 附近就拖不动了（GridSplitter 不动 Auto/固定列） -->
+      <ColumnDefinition Width="180" MinWidth="180"/>
+      <ColumnDefinition Width="6"/>
+      <ColumnDefinition Width="*" MinWidth="420"/>
+    </Grid.ColumnDefinitions>
+
+    <Border Grid.RowSpan="2" Grid.ColumnSpan="3" Background="{StaticResource WindowSurface}"/>
+
+    <!-- ================= 标题栏（自绘） ================= -->
+    <!-- 三种角色挤在一条 40px 里：左边是原来系统画的那份（logo + 名字），中间会话标题，
+         右边设置齿轮 + 最小化/最大化/关闭。条上的控件必须写 IsHitTestVisibleInChrome，
+         否则点击会被系统当成拖标题栏。
+         标题 MaxWidth 之外还留了左右 Margin：窗口窄时它先收、不会顶到两边的按钮。 -->
+    <Border Grid.Row="0" Grid.ColumnSpan="3" Height="44" Background="{StaticResource TitleSurface}"
+            BorderBrush="#0BFFFFFF" BorderThickness="0,0,0,1">
+      <Grid>
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Center"
+                    Margin="14,0,0,0" IsHitTestVisible="False">
+          <Border Width="26" Height="26" Margin="0,0,9,0" CornerRadius="9"
+                  Background="{StaticResource BlueSurface}" BorderBrush="#407DBAFF" BorderThickness="1">
+            <Image x:Name="TitleLogo" Width="16" Height="16" HorizontalAlignment="Center" VerticalAlignment="Center"
+                   RenderOptions.BitmapScalingMode="HighQuality"/>
+          </Border>
+          <TextBlock Text="PackLeader" Foreground="#F1F5FF" FontSize="12.5" FontWeight="SemiBold" VerticalAlignment="Center"/>
+        </StackPanel>
+        <Border HorizontalAlignment="Center" VerticalAlignment="Center" CornerRadius="16" Padding="14,5"
+                Background="#0AFFFFFF" BorderBrush="#0AFFFFFF" BorderThickness="1" Margin="160,0">
+          <StackPanel Orientation="Horizontal">
+            <Ellipse Width="6" Height="6" Fill="#34D399" Margin="0,0,8,0" VerticalAlignment="Center"/>
+            <TextBlock x:Name="TitleText" Text="新对话" Foreground="#C9CDD6" FontSize="11.5"
+                       VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="380"/>
+          </StackPanel>
+        </Border>
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Stretch">
+          <Button x:Name="SettingsBtn" shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                  Content="&#xE713;" Width="32" Height="24" Padding="0" Margin="0,0,8,0" Cursor="Hand"
+                  FontSize="12.5" FontFamily="Segoe MDL2 Assets" VerticalAlignment="Center"
+                  Background="Transparent" Foreground="#8A9099" BorderThickness="0"
+                  ToolTip="设置（模型端点 / API Key / 外观）"/>
+          <Button x:Name="MinBtn" shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                  Content="&#xE921;" Width="44" Padding="0" Cursor="Hand"
+                  FontSize="10" FontFamily="Segoe MDL2 Assets"
+                  Background="Transparent" Foreground="#C9CDD4" BorderThickness="0"
+                  ToolTip="最小化"/>
+          <Button x:Name="MaxBtn" shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                  Content="&#xE922;" Width="44" Padding="0" Cursor="Hand"
+                  FontSize="10" FontFamily="Segoe MDL2 Assets"
+                  Background="Transparent" Foreground="#C9CDD4" BorderThickness="0"
+                  ToolTip="最大化（双击标题栏也行）"/>
+          <Button x:Name="CloseBtn" shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                  Content="&#xE8BB;" Width="46" Padding="0" Cursor="Hand"
+                  FontSize="10" FontFamily="Segoe MDL2 Assets"
+                  Background="Transparent" Foreground="#C9CDD4" BorderThickness="0"
+                  ToolTip="关闭"/>
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <!-- ================= 左侧栏 ================= -->
+    <Border Grid.Row="1" Grid.Column="0" Background="{StaticResource SidebarSurface}" BorderBrush="#0BFFFFFF" BorderThickness="0,0,1,0">
+      <Grid>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="*"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- 新对话 -->
+        <Button Grid.Row="1" x:Name="NewChatBtn" Margin="12,16,12,10" Height="36" Cursor="Hand"
+                HorizontalContentAlignment="Left" Padding="10,0"
+                Background="#0BFFFFFF" Foreground="#D8DCE4" BorderBrush="#0AFFFFFF" BorderThickness="1">
+          <Button.Template>
+            <ControlTemplate TargetType="Button">
+              <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                      BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="18">
+                <ContentPresenter Margin="{TemplateBinding Padding}" VerticalAlignment="Center"/>
+              </Border>
+              <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                  <Setter TargetName="bd" Property="Background" Value="#16FFFFFF"/>
+                  <Setter TargetName="bd" Property="BorderBrush" Value="#14FFFFFF"/>
+                </Trigger>
+              </ControlTemplate.Triggers>
+            </ControlTemplate>
+          </Button.Template>
+          <StackPanel Orientation="Horizontal">
+            <TextBlock Text="＋" FontSize="14" Foreground="#A8B8D3" VerticalAlignment="Center"/>
+            <TextBlock Text="新对话" Margin="6,0,0,0" FontSize="12.5" VerticalAlignment="Center"/>
+          </StackPanel>
+        </Button>
+
+        <!-- 会话列表 -->
+        <ScrollViewer Grid.Row="2" x:Name="SideScroll" VerticalScrollBarVisibility="Auto" Padding="8,4,8,8">
+          <StackPanel>
+            <TextBlock Text="最近" Foreground="#747B88" FontSize="10.5" Margin="8,8,0,7"/>
+            <StackPanel x:Name="SessionList"/>
+          </StackPanel>
+        </ScrollViewer>
+
+      </Grid>
+    </Border>
+
+    <!-- ================= 右侧 ================= -->
+    <GridSplitter x:Name="SideSplitter" Grid.Row="1" Grid.Column="1" Width="6" HorizontalAlignment="Stretch"
+                  VerticalAlignment="Stretch" ResizeBehavior="PreviousAndNext" ResizeDirection="Columns"
+                  ShowsPreview="False" Background="Transparent" Cursor="SizeWE"
+                  ToolTip="拖动调整左右宽度（双击复位）">
+      <GridSplitter.Template>
+        <ControlTemplate TargetType="GridSplitter">
+          <Border Background="Transparent">
+            <Rectangle x:Name="ln" Width="1" HorizontalAlignment="Center" Fill="#12FFFFFF"/>
+          </Border>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsMouseOver" Value="True">
+              <Setter TargetName="ln" Property="Fill" Value="#4A8AB4FF"/>
+            </Trigger>
+            <Trigger Property="IsDragging" Value="True">
+              <Setter TargetName="ln" Property="Fill" Value="#8AB4FF"/>
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </GridSplitter.Template>
+    </GridSplitter>
+
+    <Grid Grid.Row="1" Grid.Column="2" Background="Transparent">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="*"/>
+        <!-- 读秒条：坐在输入框正上方、会话区之外（空闲时整行高度为 0） -->
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+      </Grid.RowDefinitions>
+
+      <!-- 读秒条：这一轮在跑时贴在输入框上方显示「思考中 · 用时 12 秒」，空闲时收起（整行高度归零） -->
+      <Border Grid.Row="1" x:Name="ThinkRow" Visibility="Collapsed" HorizontalAlignment="Left"
+              Margin="24,0,24,9" Background="#1B1F2B" BorderBrush="#0CFFFFFF" BorderThickness="1"
+              CornerRadius="18" Padding="13,6">
+        <StackPanel Orientation="Horizontal">
+          <TextBlock Text="✦" Foreground="#8FA6FF" FontSize="10.5" VerticalAlignment="Center" Margin="0,0,6,0"/>
+          <TextBlock x:Name="ThinkText" Text="思考中 · 用时 0 秒" Foreground="#8FA6FF" FontSize="11.5"
+                     FontFamily="Cascadia Mono, Consolas" VerticalAlignment="Center"/>
+        </StackPanel>
+      </Border>
+
+      <!-- 会话内容 + 提问缩略索引。索引独立于历史控件，未加载的提问也能直接跳转。 -->
+      <Grid Grid.Row="0">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="30"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <!-- 提问索引在左边（Kite 样式：一列短横线，悬停变长变亮、点击跳转） -->
+        <Border x:Name="QIndexHost" Grid.Column="0" Width="30" Margin="0,10,0,10"
+                Background="Transparent"
+                ToolTip="滚动刻度：悬停跟随预览，点击跳到对应位置">
+          <!-- Background 必须是透明色而不是不写：Canvas 默认 Background=null，空白处不参与命中测试，
+               整条悬停/点击就全都收不到鼠标事件（只剩那几根 IsHitTestVisible=false 的刻度）。 -->
+          <Canvas x:Name="QuestionIndexCanvas" ClipToBounds="True" Background="Transparent"
+                  AutomationProperties.AutomationId="ScrollTicks"/>
+        </Border>
+        <ScrollViewer Grid.Column="1" x:Name="Scroller" VerticalScrollBarVisibility="Auto" Padding="10,18,24,18">
+          <StackPanel x:Name="Transcript"/>
+        </ScrollViewer>
+      </Grid>
+
+      <!-- 输入区 -->
+      <Grid Grid.Row="2" Margin="24,0,24,14">
+        <Border Background="{StaticResource RaisedSurface}" BorderBrush="#10FFFFFF" BorderThickness="1" CornerRadius="26" Padding="14,13,12,11">
+          <Border.Effect><DropShadowEffect BlurRadius="22" ShadowDepth="5" Opacity="0.24" Color="Black"/></Border.Effect>
+          <StackPanel>
+            <WrapPanel x:Name="AttachList" Orientation="Horizontal" Margin="0,0,0,7" Visibility="Collapsed"/>
+          <Grid>
+            <TextBox x:Name="Input" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="44" MaxHeight="160"
+                     Background="Transparent" Foreground="#F9FAFB" BorderThickness="0"
+                     VerticalScrollBarVisibility="Auto" FontSize="13.5" FontFamily="Segoe UI"
+                     CaretBrush="#F9FAFB" SelectionBrush="#2B5CFF" Padding="0"/>
+            <!-- 占位提示：空输入时显示，和 Kite 一样把用法写在框里，省掉底下那条说明 -->
+            <TextBlock x:Name="InputPlaceholder" Text="说点什么…（Enter 发送 · Shift+Enter 换行）"
+                       Foreground="#5B626D" FontSize="13.5" FontFamily="Segoe UI"
+                       IsHitTestVisible="False" VerticalAlignment="Top" Margin="1,1,0,0"
+                       TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"/>
+          </Grid>
+            <DockPanel Margin="0,6,0,0">
+              <Button x:Name="AttachBtn" DockPanel.Dock="Left" Content="＋" Height="26" Width="26" Padding="0"
+                      Cursor="Hand" FontSize="15" Margin="0,0,8,0" VerticalAlignment="Center"
+                      Background="Transparent" Foreground="#8A9099" BorderBrush="#1FFFFFFF" BorderThickness="1"
+                      ToolTip="添加附件（也可 Ctrl+V 贴图 / 拖文件进来）"/>
+              <Button x:Name="PickFolderBtn" AutomationProperties.AutomationId="PickFolderBtn" DockPanel.Dock="Left" Content="目录" Height="26" Padding="9,0"
+                      Cursor="Hand" FontSize="11" Margin="0,0,10,0" MaxWidth="240" VerticalAlignment="Center"
+                      Background="Transparent" Foreground="#8A9099" BorderBrush="#1FFFFFFF" BorderThickness="1"
+                      ToolTip="切换工作目录"/>
+              <!-- 模型和权限都放在输入框下面这条：发消息时就在手边，不用再往左上角去找 -->
+              <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" HorizontalAlignment="Right">
+                <TextBlock x:Name="UsageText" Text="" Foreground="#5B626D" FontSize="10.5"
+                           VerticalAlignment="Center" Margin="0,0,8,0"/>
+                <Button x:Name="ModelPill" Content="模型" Height="26" Padding="9,0" Cursor="Hand" FontSize="11"
+                        FontFamily="Cascadia Mono, Consolas" Background="#0BFFFFFF" Foreground="#B8C0CE"
+                        BorderBrush="#0AFFFFFF" BorderThickness="1" ToolTip="切换模型" Margin="0,0,8,0"/>
+                <!-- 权限：一个胶囊 + 向上弹出的菜单（三档带图标、当前项打勾）。
+                     原来三个按钮平铺，档位名一长（工作区内修改）就横着挤满一条，
+                     而且看不出「当前是哪一档」以外还有哪些可选。 -->
+                <Button x:Name="ModePill" Height="26" Padding="8,0" Cursor="Hand" FontSize="11"
+                        Background="#0BFFFFFF" Foreground="#B8C0CE" BorderBrush="#0AFFFFFF"
+                        BorderThickness="1" ToolTip="点一下切换权限档位" Margin="0,0,10,0"/>
+                <!-- 停止键：暗红胶囊 + 小方块图标，和发送圆钮之间留 10px，
+                     否则两个按钮贴在一起看不出是两件事（原来只有一圈细红边，hover 还会变灰） -->
+                <Button x:Name="StopBtn" Content="停止" Height="28" Padding="11,0,12,0" Margin="0,0,10,0"
+                        Cursor="Hand" FontSize="11.5" VerticalAlignment="Center"
+                        Background="#2A1417" Foreground="#F87171" BorderBrush="#4DF87171" BorderThickness="1"
+                        IsEnabled="False" Visibility="Collapsed"
+                        ToolTip="中断这一轮（Esc）"/>
+                <!-- 发送键：圆形蓝底箭头（Segoe MDL2 的 E724），图标不随忙碌态改字，靠 ToolTip 区分发送/插话 -->
+                <Button x:Name="SendBtn" Content="&#xE724;" Height="28" Width="28" Padding="0" Cursor="Hand"
+                        FontSize="12" FontFamily="Segoe MDL2 Assets"
+                        Background="{StaticResource BlueSurface}" Foreground="White" BorderBrush="#287DBAFF" BorderThickness="1"
+                        ToolTip="发送（Enter）"/>
+              </StackPanel>
+              <!-- 用法提示已并进输入框占位符，这里留空占位（有人按名字找它） -->
+              <TextBlock x:Name="Hint" DockPanel.Dock="Left" Text="" Visibility="Collapsed"
+                         Foreground="#5B626D" FontSize="10.5" VerticalAlignment="Center"/>
+            </DockPanel>
+          </StackPanel>
+        </Border>
+      </Grid>
+    </Grid>
+
+    <!-- 设置面板：做成遮罩层而不是第二个窗口，省掉嵌套消息循环那堆坑 -->
+    <Grid x:Name="SettingsOverlay" Grid.Row="1" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#A80E1015">
+      <Border Width="452" Background="#16181D" BorderBrush="#26FFFFFF" BorderThickness="1" CornerRadius="12"
+              HorizontalAlignment="Center" VerticalAlignment="Stretch" Margin="0,20" Padding="22,18,22,16">
+        <Grid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+          <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <StackPanel Margin="0,0,8,0">
+          <TextBlock Text="模型设置" Foreground="#F9FAFB" FontSize="14.5" FontWeight="SemiBold"/>
+          <TextBlock Text="填 OpenAI 兼容的端点地址和 Key（端点不校验鉴权时 Key 可留空），保存后立刻生效，并写进数据目录的 config.json。"
+                     Foreground="#7C838E" FontSize="11" Margin="0,5,0,16" TextWrapping="Wrap"/>
+
+          <!-- 供应商列表：公司网关 / 本地 Ollama / 官方 API 各存一套端点和 Key，点一行就切过去。
+               下面那三个输入框永远在编辑「选中的这一行」。 -->
+          <DockPanel Margin="0,0,0,6">
+            <Button x:Name="CfgProviderDel" DockPanel.Dock="Right" Content="删除" Height="24" Padding="10,0"
+                    Cursor="Hand" FontSize="11" Margin="8,0,0,0" Background="Transparent" Foreground="#F87171"
+                    BorderBrush="#66F87171" BorderThickness="1"/>
+            <Button x:Name="CfgProviderAdd" DockPanel.Dock="Right" Content="＋ 新增" Height="24" Padding="10,0"
+                    Cursor="Hand" FontSize="11" Margin="8,0,0,0" Background="Transparent" Foreground="#8AB4FF"
+                    BorderBrush="#4D8AB4FF" BorderThickness="1"/>
+            <TextBlock Text="供应商" Foreground="#ADB2B8" FontSize="11" VerticalAlignment="Center"/>
+          </DockPanel>
+          <Border Background="#0F1115" BorderBrush="#1FFFFFFF" BorderThickness="1" CornerRadius="6" Padding="4">
+            <StackPanel x:Name="CfgProviderList"/>
+          </Border>
+          <TextBlock Text="点一行＝选中它编辑（改完点下面「保存」，每一家的端点/Key/模型都会记住）；行上的「● 当前」＝正在使用的那家，双击别家可直接设为当前。"
+                     Foreground="#5B626D" FontSize="10.5" Margin="0,5,0,0" TextWrapping="Wrap"/>
+
+          <TextBlock Text="名称（可选）" Foreground="#ADB2B8" FontSize="11" Margin="0,13,0,5"/>
+          <TextBox x:Name="CfgName" Height="30" Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF"
+                   BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center" FontSize="11.5"/>
+
+          <TextBlock Text="端点地址" Foreground="#ADB2B8" FontSize="11" Margin="0,13,0,5"/>
+          <TextBox x:Name="CfgUrl" Height="30" Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF"
+                   BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center" FontSize="11.5"
+                   FontFamily="Cascadia Mono, Consolas"/>
+
+          <TextBlock Text="API Key" Foreground="#ADB2B8" FontSize="11" Margin="0,13,0,5"/>
+          <TextBox x:Name="CfgKey" Height="30" Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF"
+                   BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center" FontSize="11.5"
+                   FontFamily="Cascadia Mono, Consolas"/>
+          <TextBlock x:Name="CfgKeyHint" Text="" Foreground="#5B626D" FontSize="10.5" Margin="0,5,0,0" TextWrapping="Wrap"/>
+
+          <TextBlock Text="模型名" Foreground="#ADB2B8" FontSize="11" Margin="0,13,0,5"/>
+          <DockPanel>
+            <Button x:Name="CfgFetch" DockPanel.Dock="Right" Content="拉取" Height="30" Padding="12,0" Cursor="Hand"
+                    FontSize="11.5" Margin="8,0,0,0" Background="Transparent" Foreground="#8AB4FF"
+                    BorderBrush="#4D8AB4FF" BorderThickness="1"/>
+            <TextBox x:Name="CfgModel" Height="30" Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF"
+                     BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center" FontSize="11.5"
+                     FontFamily="Cascadia Mono, Consolas"/>
+          </DockPanel>
+          <WrapPanel x:Name="ModelChips" Orientation="Horizontal" Margin="0,7,0,0" Visibility="Collapsed"/>
+          <TextBlock x:Name="ModelHint" Text="" Foreground="#5B626D" FontSize="10.5" Margin="0,6,0,0" TextWrapping="Wrap"/>
+
+          <CheckBox x:Name="CfgVision" Content="模型支持看图（图片会作为图片发过去，不是只给路径）"
+                    Foreground="#CFD3D6" FontSize="11" Margin="0,13,0,0"/>
+
+          <TextBlock Text="验证命令（可选）" Foreground="#ADB2B8" FontSize="11" Margin="0,13,0,5"/>
+          <TextBox x:Name="CfgVerify" Height="30" Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF"
+                   BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center" FontSize="11.5"
+                   FontFamily="Cascadia Mono, Consolas"/>
+          <TextBlock Text="改完文件后自动跑它，失败会把输出回灌给模型让它自己修。留空＝自动识别（npm test / cargo test / go test / pytest）。"
+                     Foreground="#5B626D" FontSize="10.5" Margin="0,5,0,0" TextWrapping="Wrap"/>
+
+          <!-- 工具调用日志：每次调用往这里追加一行，复杂任务卡在哪一步就看它 -->
+          <TextBlock Text="工具调用日志" Foreground="#ADB2B8" FontSize="11" Margin="0,13,0,5"/>
+          <DockPanel>
+            <Button x:Name="CfgOpenLogs" DockPanel.Dock="Right" Content="打开目录" Height="30" Padding="12,0" Cursor="Hand"
+                    FontSize="11.5" Margin="8,0,0,0" Background="Transparent" Foreground="#8AB4FF"
+                    BorderBrush="#4D8AB4FF" BorderThickness="1"/>
+            <TextBox x:Name="CfgLogsDir" IsReadOnly="True" Height="30" Background="#0F1115" Foreground="#ADB2B8"
+                     BorderBrush="#1FFFFFFF" BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center"
+                     FontSize="10.5" FontFamily="Cascadia Mono, Consolas" ToolTip="日志文件：tool-calls-YYYY-MM-DD.jsonl"/>
+          </DockPanel>
+          <TextBlock Text="每次调用工具追加一行 jsonl（轮次/步号/工具/参数/审批/成败/耗时），排查复杂任务卡在哪一步就看它。"
+                     Foreground="#5B626D" FontSize="10.5" Margin="0,5,0,0" TextWrapping="Wrap"/>
+
+              <TextBlock x:Name="CfgError" Text="" Foreground="#F87171" FontSize="11" Margin="0,10,0,0" TextWrapping="Wrap"/>
+            </StackPanel>
+          </ScrollViewer>
+
+          <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,8,0">
+            <Button x:Name="CfgCancel" Content="取消" Height="28" Padding="14,0" Cursor="Hand" FontSize="11.5"
+                    Background="Transparent" Foreground="#ADB2B8" BorderBrush="#1FFFFFFF" BorderThickness="1"
+                    Margin="0,0,8,0"/>
+            <Button x:Name="CfgSave" Content="保存" Height="28" Padding="18,0" Cursor="Hand" FontSize="11.5"
+                    FontWeight="SemiBold" Background="#2B5CFF" Foreground="White" BorderThickness="0"/>
+          </StackPanel>
+        </Grid>
+      </Border>
+    </Grid>
+
+    <!-- 删除类操作的确认框：用窗口内的深色浮层，不用系统 MessageBox
+         —— 后者是白底系统字，在这套深色界面里像从别的程序弹出来的 -->
+    <Grid x:Name="ConfirmOverlay" Grid.Row="1" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#B8000000">
+      <Border Width="420" Background="#16181D" BorderBrush="#26FFFFFF" BorderThickness="1" CornerRadius="12"
+              HorizontalAlignment="Center" VerticalAlignment="Center" Padding="22,20,22,18">
+        <StackPanel>
+          <TextBlock x:Name="ConfirmTitle" Text="" Foreground="#F9FAFB" FontSize="14" FontWeight="SemiBold"
+                     TextWrapping="Wrap"/>
+          <TextBlock x:Name="ConfirmText" Text="" Foreground="#ADB2B8" FontSize="11.5" Margin="0,8,0,0"
+                     TextWrapping="Wrap" LineHeight="18"/>
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+            <Button x:Name="ConfirmNo" Content="取消" Height="28" Padding="14,0" Cursor="Hand" FontSize="11.5"
+                    Background="Transparent" Foreground="#ADB2B8" BorderBrush="#1FFFFFFF" BorderThickness="1"
+                    Margin="0,0,8,0"/>
+            <Button x:Name="ConfirmYes" Content="删除" Height="28" Padding="18,0" Cursor="Hand" FontSize="11.5"
+                    FontWeight="SemiBold" Background="#F87171" Foreground="#1A0B0B" BorderThickness="0"/>
+          </StackPanel>
+        </StackPanel>
+      </Border>
+    </Grid>
+
+    <!-- 单行输入浮层：重命名会话、填分组名都用它（同样不用系统 InputBox，那是白底对话框） -->
+    <Grid x:Name="InputOverlay" Grid.Row="1" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#B8000000">
+      <Border Width="420" Background="#16181D" BorderBrush="#26FFFFFF" BorderThickness="1" CornerRadius="12"
+              HorizontalAlignment="Center" VerticalAlignment="Center" Padding="22,20,22,18">
+        <StackPanel>
+          <TextBlock x:Name="InputTitle" Text="" Foreground="#F9FAFB" FontSize="14" FontWeight="SemiBold"
+                     TextWrapping="Wrap"/>
+          <TextBlock x:Name="InputHint" Text="" Foreground="#6B7280" FontSize="10.5" Margin="0,7,0,0"
+                     TextWrapping="Wrap" LineHeight="16"/>
+          <!-- 已存的分组列在这里让人点，不用记名字；输入框里打名字仍然可以新建 -->
+          <Border x:Name="InputGroupBox" Visibility="Collapsed" Margin="0,12,0,0" Padding="8" CornerRadius="8"
+                  Background="#0F1115" BorderBrush="#1FFFFFFF" BorderThickness="1">
+            <ScrollViewer x:Name="InputGroupScroll" MaxHeight="148" VerticalScrollBarVisibility="Auto">
+              <StackPanel x:Name="InputGroupList" AutomationProperties.AutomationId="InputGroupList"/>
+            </ScrollViewer>
+          </Border>
+          <TextBox x:Name="InputField" AutomationProperties.AutomationId="InputField" Height="30"
+                   Margin="0,12,0,0" Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF"
+                   BorderThickness="1" Padding="9,0" VerticalContentAlignment="Center" FontSize="12"
+                   CaretBrush="#8AB4FF"/>
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+            <Button x:Name="InputNo" Content="取消" Height="28" Padding="14,0" Cursor="Hand" FontSize="11.5"
+                    Background="Transparent" Foreground="#ADB2B8" BorderBrush="#1FFFFFFF" BorderThickness="1"
+                    Margin="0,0,8,0"/>
+            <Button x:Name="InputYes" AutomationProperties.AutomationId="InputYes" Content="确定" Height="28"
+                    Padding="18,0" Cursor="Hand" FontSize="11.5" FontWeight="SemiBold" Background="#2B5CFF"
+                    Foreground="White" BorderThickness="0"/>
+          </StackPanel>
+        </StackPanel>
+      </Border>
+    </Grid>
+    <!-- 目录选择浮层：系统 FolderBrowserDialog 是白底 + 英文标题（Browse For Folder）、Win7 那种小列表，
+         和这套深色界面不像一家人，所以自己画一个：路径栏（可直接粘路径回车跳）+ 目录列表（点行进入）+ 底部确认 -->
+    <Grid x:Name="FolderOverlay" Grid.Row="1" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#B8000000">
+      <Border Width="568" Background="#16181D" BorderBrush="#26FFFFFF" BorderThickness="1" CornerRadius="12"
+              HorizontalAlignment="Center" VerticalAlignment="Center" Padding="22,18,22,16">
+        <Grid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+          <StackPanel Grid.Row="0">
+            <TextBlock Text="选择工作目录" Foreground="#F9FAFB" FontSize="14" FontWeight="SemiBold"/>
+            <TextBlock x:Name="FolderHint" Text="" Foreground="#7C838E" FontSize="11" Margin="0,5,0,0" TextWrapping="Wrap"/>
+          </StackPanel>
+          <DockPanel Grid.Row="1" Margin="0,14,0,10">
+            <Button x:Name="FolderUp" DockPanel.Dock="Left" Content="↑" Width="32" Height="30" Cursor="Hand"
+                    FontSize="13" Margin="0,0,8,0" Background="Transparent" Foreground="#ADB2B8"
+                    BorderBrush="#1FFFFFFF" BorderThickness="1" ToolTip="上一级"/>
+            <Button x:Name="FolderRoot" DockPanel.Dock="Right" Content="此电脑" Height="30" Padding="10,0" Cursor="Hand"
+                    FontSize="11.5" Margin="8,0,0,0" Background="Transparent" Foreground="#ADB2B8"
+                    BorderBrush="#1FFFFFFF" BorderThickness="1"/>
+            <TextBox x:Name="FolderPath" AutomationProperties.AutomationId="FolderPath" Height="30"
+                     Background="#0F1115" Foreground="#F9FAFB" BorderBrush="#1FFFFFFF" BorderThickness="1"
+                     Padding="9,0" VerticalContentAlignment="Center" FontSize="11.5" CaretBrush="#8AB4FF"
+                     FontFamily="Cascadia Mono, Consolas" ToolTip="可以直接粘路径，回车跳过去"/>
+          </DockPanel>
+          <Border Grid.Row="2" Background="#0F1115" BorderBrush="#1FFFFFFF" BorderThickness="1" CornerRadius="8" Padding="4">
+            <ScrollViewer x:Name="FolderScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
+                          MinHeight="180" MaxHeight="384">
+              <StackPanel x:Name="FolderList" AutomationProperties.AutomationId="FolderList"/>
+            </ScrollViewer>
+          </Border>
+          <TextBlock x:Name="FolderEmpty" Grid.Row="2" Text="" Foreground="#5B626D" FontSize="11.5"
+                     HorizontalAlignment="Center" VerticalAlignment="Center" TextAlignment="Center"
+                     MaxWidth="420" TextWrapping="Wrap" Visibility="Collapsed"/>
+          <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
+            <Button x:Name="FolderCancel" Content="取消" Height="28" Padding="14,0" Cursor="Hand" FontSize="11.5"
+                    Background="Transparent" Foreground="#ADB2B8" BorderBrush="#1FFFFFFF" BorderThickness="1"
+                    Margin="0,0,8,0"/>
+            <Button x:Name="FolderPick" AutomationProperties.AutomationId="FolderPick" Content="用这个目录" Height="28"
+                    Padding="18,0" Cursor="Hand" FontSize="11.5" FontWeight="SemiBold" Background="#2B5CFF"
+                    Foreground="White" BorderThickness="0"/>
+          </StackPanel>
+        </Grid>
+      </Border>
+    </Grid>
+
+    <!-- 图片预览：点缩略图弹大图，点背景 / × / Esc 都能关 -->
+    <Grid x:Name="ImagePreview" Grid.Row="1" Grid.ColumnSpan="3" Visibility="Collapsed" Background="#F2000000">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="*"/>
+      </Grid.RowDefinitions>
+      <DockPanel Grid.Row="0" Margin="20,14,20,0">
+        <Button x:Name="PreviewClose" DockPanel.Dock="Right" Content="×" Width="32" Height="32" Cursor="Hand"
+                FontSize="17" Background="Transparent" Foreground="#CFD3D6" BorderThickness="0"
+                ToolTip="关闭（Esc）"/>
+        <TextBlock x:Name="PreviewName" Text="" Foreground="#ADB2B8" FontSize="11.5" VerticalAlignment="Center"
+                   TextTrimming="CharacterEllipsis" TextWrapping="NoWrap" Margin="0,0,12,0"/>
+      </DockPanel>
+      <Border Grid.Row="1" Margin="20,8,20,20" Background="#0B0E12" BorderBrush="#6B7484" BorderThickness="1"
+              HorizontalAlignment="Center" VerticalAlignment="Center">
+        <Image x:Name="PreviewImage" Stretch="Uniform"/>
+      </Border>
+    </Grid>
+
+    <!-- 提问索引的悬停预览卡：挂在根 Grid 上做覆盖层。
+         Popup 在这台 125% DPI 的机器上会飘到窗口外看不见，改成窗口内浮层 -->
+    <Border x:Name="QPreviewCard" Grid.Row="1" Grid.ColumnSpan="3" HorizontalAlignment="Left" VerticalAlignment="Top" MaxWidth="380" MaxHeight="240"
+            Background="#1C1F26" BorderBrush="#2E3440" BorderThickness="1" CornerRadius="10" Padding="13,11,13,10"
+            Visibility="Collapsed" IsHitTestVisible="False" Panel.ZIndex="60">
+      <Border.Effect>
+        <DropShadowEffect BlurRadius="18" ShadowDepth="4" Opacity="0.55" Color="Black"/>
+      </Border.Effect>
+      <StackPanel>
+        <TextBlock x:Name="QPreviewTitle" FontSize="13" FontWeight="SemiBold" Foreground="#F3F4F6"
+                   TextWrapping="Wrap" MaxWidth="352"/>
+        <TextBlock x:Name="QPreviewBody" FontSize="12" Foreground="#9AA1AC" TextWrapping="Wrap" MaxWidth="352"
+                   MaxHeight="126" ClipToBounds="True" Margin="0,7,0,0" LineHeight="18"/>
+        <TextBlock x:Name="QPreviewFoot" FontSize="10.5" Foreground="#5B626D" Margin="0,8,0,0"/>
+      </StackPanel>
+    </Border>
+  </Grid>
+</Window>
+'@
+
+$window = [Windows.Markup.XamlReader]::Parse($xaml)
+Log 'XAML 解析成功'
+Perf 'span' 'xaml-parse' $script:perfMark.ElapsedMilliseconds
+$script:perfMark.Restart()
+# 图标：默认是 powershell.exe 的白蓝图标，换成左栏那个 P 徽标。
+# 坑：WPF 的 Window.Icon 只吃「一张图」，系统需要 16/20/24/32px 时自己去缩这张图，
+# 缩出来的 16px 就是一个白团——任务栏上看到的就是那团白。
+# 所以这里按系统实际要的每个尺寸各画一张（几何笔画，不用字体渲染），
+# 再用 WM_SETICON 把小图标（标题栏/任务栏）和大图标（Alt+Tab）分别交给窗口。
+$script:iconHandles = @()
+try {
+  # PL.IconNative 已在上面和 ShellNative 一次编译好，这里不再调 csc
+  # 画一张 $Size×$Size 的 P 徽标（和 scripts/make-icon.ps1 同一套比例）
+  function New-LogoBitmap([int]$Size) {
+    $visual = New-Object System.Windows.Media.DrawingVisual
+    $dc = $visual.RenderOpen()
+    try {
+      $pad = [math]::Max(1.0, $Size * 0.03)
+      $rad = [math]::Max(2.0, $Size * 0.22)
+      $rect = New-Object System.Windows.Rect $pad, $pad, ($Size - 2 * $pad), ($Size - 2 * $pad)
+      $brush = New-Object System.Windows.Media.LinearGradientBrush
+      $brush.StartPoint = New-Object System.Windows.Point 0, 0
+      $brush.EndPoint = New-Object System.Windows.Point 0, 1
+      $brush.GradientStops.Add((New-Object System.Windows.Media.GradientStop ([System.Windows.Media.Color]::FromRgb(43, 92, 255), 0)))
+      $brush.GradientStops.Add((New-Object System.Windows.Media.GradientStop ([System.Windows.Media.Color]::FromRgb(22, 48, 170), 1)))
+      $dc.DrawGeometry($brush, $null, (New-Object System.Windows.Media.RectangleGeometry $rect, $rad, $rad))
+
+      # 白 P：竖笔 + 右侧圆环（内圆偏右下，左边自然并进竖笔）
+      $white = [System.Windows.Media.Brushes]::White
+      $stroke = [math]::Max(1.0, $Size * 0.135)
+      $stemX = $Size * 0.28
+      $top = $Size * 0.20
+      $bottom = $Size * 0.80
+      $bowl = [math]::Max(4.0, $Size * 0.46)
+      $dc.DrawRectangle($white, $null, (New-Object System.Windows.Rect $stemX, $top, $stroke, ($bottom - $top)))
+      $inner = $bowl - 2 * $stroke
+      if ($inner -ge 1) {
+        $cx = $stemX + $bowl / 2
+        $cy = $top + $bowl / 2
+        $outerGeo = New-Object System.Windows.Media.EllipseGeometry (New-Object System.Windows.Point $cx, $cy), ($bowl / 2), ($bowl / 2)
+        $holeGeo = New-Object System.Windows.Media.EllipseGeometry (New-Object System.Windows.Point ($cx + $stroke / 2), ($cy + $stroke / 2)), ($inner / 2), ($inner / 2)
+        $ring = New-Object System.Windows.Media.CombinedGeometry ([System.Windows.Media.GeometryCombineMode]::Exclude), $outerGeo, $holeGeo
+        $dc.DrawGeometry($white, $null, $ring)
+      } else {
+        $dc.DrawEllipse($white, $null, (New-Object System.Windows.Point ($stemX + $bowl / 2), ($top + $bowl / 2)), ($bowl / 2), ($bowl / 2))
+      }
+    } finally { $dc.Close() }
+    $rtb = New-Object System.Windows.Media.Imaging.RenderTargetBitmap $Size, $Size, 96, 96, ([System.Windows.Media.PixelFormats]::Pbgra32)
+    $rtb.Render($visual)
+    return $rtb
+  }
+
+  # BitmapSource -> HICON（走一趟 PNG 内存流，System.Drawing 负责生成句柄）
+  function New-HiconFromBitmap($bitmapSource) {
+    $enc = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
+    $enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($bitmapSource))
+    $ms = New-Object System.IO.MemoryStream
+    try {
+      $enc.Save($ms)
+      $ms.Position = 0
+      $bmp = New-Object System.Drawing.Bitmap $ms
+      try { return $bmp.GetHicon() } finally { $bmp.Dispose() }
+    } finally { $ms.Dispose() }
+  }
+
+  $dpi = 1.0
+  try { $dpi = [System.Windows.Media.VisualTreeHelper]::GetDpi($window).DpiScaleX } catch { }
+  if ($dpi -le 0) { $dpi = 1.0 }
+  $smallPx = [int][math]::Round(16 * $dpi)
+  $bigPx = [int][math]::Round(32 * $dpi)
+
+  # 优先用仓库里那张 packleader.ico（多帧，含 16/32/256）；找不到才退回现画。
+  # 注意：cli.ts 会把本脚本复制到 %TEMP% 再跑，$PSScriptRoot 是临时目录，
+  # 图标真实位置要从 cli.ts 传的 PL_GUI_ROOT（仓库根）取。
+  $icoPath = ''
+  if ($env:PL_GUI_ROOT) { $icoPath = Join-Path $env:PL_GUI_ROOT 'ui\packleader.ico' }
+  if (-not $icoPath -or -not (Test-Path $icoPath)) { $icoPath = Join-Path $PSScriptRoot 'packleader.ico' }
+  if (-not (Test-Path $icoPath)) { $icoPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'packleader.ico' }
+  $script:iconKind = 'drawn'
+  if (Test-Path $icoPath) {
+    Add-Type -AssemblyName System.Drawing
+    $icoSmall = New-Object System.Drawing.Icon $icoPath, $smallPx, $smallPx
+    $icoBig = New-Object System.Drawing.Icon $icoPath, $bigPx, $bigPx
+    $icoHuge = New-Object System.Drawing.Icon $icoPath, 256, 256
+    # Icon 对象自己持有 HICON：交出去后不要再 DestroyIcon（Dispose 会自己收）
+    $script:iconObjects = @($icoSmall, $icoBig, $icoHuge)
+    $script:iconSmall = $icoSmall.Handle
+    $script:iconBig = $icoBig.Handle
+    $script:iconKind = 'ico'
+    # 坑：Int32Rect 的宽高必须与图标帧真实尺寸一致。这张 ico 里最大帧是 128，
+    # 硬写 256 会抛 "Value does not fall within the expected range"，整个图标设置就此被跳过。
+    # Int32Rect.Empty = 按实际帧尺寸取。
+    $window.Icon = [System.Windows.Interop.Imaging]::CreateBitmapSourceFromHIcon(
+      $icoHuge.Handle,
+      [System.Windows.Int32Rect]::Empty,
+      [System.Windows.Media.Imaging.BitmapSizeOptions]::FromEmptyOptions())
+  } else {
+    # Window.Icon 给最大的那张（Alt+Tab / 任务视图 / 资源管理器缩略图都用它）
+    $window.Icon = New-LogoBitmap 256
+    # 句柄先建好（Loaded 里只发消息，不再分配资源，重复触发也不会泄漏）
+    $smallIcon = New-HiconFromBitmap (New-LogoBitmap $smallPx)
+    $bigIcon = New-HiconFromBitmap (New-LogoBitmap $bigPx)
+    $script:iconHandles = @($smallIcon, $bigIcon)
+    $script:iconSmall = $smallIcon
+    $script:iconBig = $bigIcon
+  }
+
+  # 坑：只能用函数，不能用闭包。PS 5.1 里 add_Loaded({...}) 的回调执行时看不到脚本级变量，
+  # 原来写成 & $applyWindowIcons 的话句柄全是 $null，图标根本没设上去（任务栏还是 powershell 的白蓝图标）。
+  function Set-WindowIcons {
+    if (-not $window) { return }
+    # 坑：WPF 的 Window 没有 Handle 属性（$window.Handle 恒为 $null，传给 SendMessage 直接抛错），
+    # 真句柄只能走 WindowInteropHelper；而且窗口创建前拿到的就是 0，所以要在 Loaded 里再调一次。
+    $h = [IntPtr]::Zero
+    try { $h = (New-Object System.Windows.Interop.WindowInteropHelper $window).Handle } catch { }
+    if (-not $h -or $h -eq [IntPtr]::Zero) { return }
+    if (-not $script:iconSmall -or -not $script:iconBig) { return }
+    # ICON_SMALL=0（标题栏）、ICON_SMALL2=2（任务栏按钮）、ICON_BIG=1（Alt+Tab）
+    [void][PL.IconNative]::SendMessage($h, 0x0080, [IntPtr]0, $script:iconSmall)
+    [void][PL.IconNative]::SendMessage($h, 0x0080, [IntPtr]2, $script:iconSmall)
+    [void][PL.IconNative]::SendMessage($h, 0x0080, [IntPtr]1, $script:iconBig)
+    # 类图标也换掉：任务栏在没有窗口级图标时会回落到它
+    [void][PL.IconNative]::SetClassLongPtr($h, -14, $script:iconBig)
+    [void][PL.IconNative]::SetClassLongPtr($h, -34, $script:iconSmall)
+    # 通知系统刷新（不然任务栏会继续用缓存的旧图标）
+    [void][PL.IconNative]::SetWindowPos($h, [IntPtr]::Zero, 0, 0, 0, 0, 0x0027)
+  }
+  & Set-WindowIcons
+  $window.add_Loaded({ Set-WindowIcons })
+  if ($script:iconKind -eq 'ico') { Log "窗口图标用 $icoPath（small=${smallPx} big=${bigPx} 帧=$($icoBig.Width)/$($icoHuge.Width)）" }
+  else { Log "窗口图标按尺寸绘制（small=${smallPx}px big=${bigPx}px dpi=$dpi）" }
+} catch {
+  Log ('设置窗口图标失败: ' + $_.Exception.Message)
+}
+$window.Dispatcher.add_UnhandledException({
+  param($s, $e)
+  Log ("Dispatcher 未处理异常: " + $e.Exception.ToString())
+})
+
+$Transcript = $window.FindName('Transcript')
+# 回放旧历史时要往「临时面板」里画（画完一次性插到顶部），平时就是 Transcript
+$script:renderHost = $Transcript
+# 历史回放：单条正文超过 6000 字先只画前面一段，点「展开」再画剩下的。
+# 思考过程不折叠也不延迟渲染：打开旧会话就整段写好，点展开当场就看到全文，
+# 不会出现「点开之后内容才一段段长出来」的加载动作。
+$script:replayFoldChars = 6000
+# 一次 history-slice 的耗时统计（跟着 UI 日志走，方便以后看趋势）
+$script:historyT0 = $null
+$script:historyFetched = 0
+# 尾巴自动补段（tail 被字节切开时，后续 after 段画完要继续贴底）
+$script:historyTailFill = $false
+$Scroller = $window.FindName('Scroller')
+$QuestionIndexCanvas = $window.FindName('QuestionIndexCanvas')
+$rootGrid = $window.FindName('RootGrid')
+# 滑到顶就自动补一批更早的记录（点顶部那一行也一样）。
+# 补的内容插在上方、视口会往下跳，Load-OlderHistory 里会补回去。
+$Scroller.Add_ScrollChanged({
+  param($s, $e)
+  if ($script:historyLoading -or $script:historyBefore -le 0) { return }
+  if ($e.VerticalChange -ge -0.5) { return }
+  if ($e.VerticalOffset -gt 0.5) { return }
+  Load-OlderHistory
+})
+$Scroller.Add_PreviewMouseWheel({
+  param($s, $e)
+  if ($e.Delta -le 0 -or $s.VerticalOffset -gt 0.5 -or $script:historyLoading -or $script:historyBefore -le 0) { return }
+  Load-OlderHistory
+})
+$InputBox = $window.FindName('Input')
+$script:inputPlaceholder = $window.FindName('InputPlaceholder')
+# 输入框空着就显示占位提示（PS 5.1 事件里拿不到局部变量，用 $script: 传）
+$InputBox.Add_TextChanged({
+  param($s, $e)
+  $ph = $script:inputPlaceholder
+  if ($ph) { $ph.Visibility = $(if ($s.Text -and $s.Text.Trim()) { 'Collapsed' } else { 'Visible' }) }
+})
+$SendBtn = $window.FindName('SendBtn')
+$StopBtn = $window.FindName('StopBtn')
+$UsageText = $window.FindName('UsageText')
+$ThinkRow = $window.FindName('ThinkRow')
+$ThinkText = $window.FindName('ThinkText')
+$PickFolderBtn = $window.FindName('PickFolderBtn')
+$ModePill = $window.FindName('ModePill')
+$ModelPill = $window.FindName('ModelPill')
+$NewChatBtn = $window.FindName('NewChatBtn')
+$SessionList = $window.FindName('SessionList')
+$TitleText = $window.FindName('TitleText')
+# 顶栏不再有权限副标题：档位改由输入框下面的权限胶囊全权表达（中文名 + 图标）
+$SettingsBtn = $window.FindName('SettingsBtn')
+$SettingsOverlay = $window.FindName('SettingsOverlay')
+$CfgUrl = $window.FindName('CfgUrl')
+$CfgKey = $window.FindName('CfgKey')
+$CfgKeyHint = $window.FindName('CfgKeyHint')
+$CfgModel = $window.FindName('CfgModel')
+$CfgVerify = $window.FindName('CfgVerify')
+$CfgError = $window.FindName('CfgError')
+$CfgCancel = $window.FindName('CfgCancel')
+$CfgSave = $window.FindName('CfgSave')
+$CfgFetch = $window.FindName('CfgFetch')
+$CfgVision = $window.FindName('CfgVision')
+$CfgLogsDir = $window.FindName('CfgLogsDir')
+$CfgOpenLogs = $window.FindName('CfgOpenLogs')
+$CfgName = $window.FindName('CfgName')
+$CfgProviderList = $window.FindName('CfgProviderList')
+$CfgProviderAdd = $window.FindName('CfgProviderAdd')
+$CfgProviderDel = $window.FindName('CfgProviderDel')
+$ModelChips = $window.FindName('ModelChips')
+$ModelHint = $window.FindName('ModelHint')
+# 自绘标题栏上的控件（logo / 会话标题 / 设置齿轮 / 三个窗口按钮）
+$TitleLogo = $window.FindName('TitleLogo')
+$MinBtn = $window.FindName('MinBtn')
+$MaxBtn = $window.FindName('MaxBtn')
+$CloseBtn = $window.FindName('CloseBtn')
+$AttachBtn = $window.FindName('AttachBtn')
+
+$AttachList = $window.FindName('AttachList')
+$ImagePreview = $window.FindName('ImagePreview')
+$PreviewImage = $window.FindName('PreviewImage')
+$PreviewName = $window.FindName('PreviewName')
+$PreviewClose = $window.FindName('PreviewClose')
+$ConfirmOverlay = $window.FindName('ConfirmOverlay')
+$ConfirmTitle = $window.FindName('ConfirmTitle')
+$ConfirmText = $window.FindName('ConfirmText')
+$ConfirmYes = $window.FindName('ConfirmYes')
+$ConfirmNo = $window.FindName('ConfirmNo')
+$SideSplitter = $window.FindName('SideSplitter')
+$SideCol = $window.FindName('RootGrid').ColumnDefinitions[0]
+$SideScroll = $window.FindName('SideScroll')
+$InputOverlay = $window.FindName('InputOverlay')
+$InputTitle = $window.FindName('InputTitle')
+$InputHint = $window.FindName('InputHint')
+$InputField = $window.FindName('InputField')
+$InputYes = $window.FindName('InputYes')
+$InputNo = $window.FindName('InputNo')
+$InputGroupBox = $window.FindName('InputGroupBox')
+$InputGroupList = $window.FindName('InputGroupList')
+$FolderOverlay = $window.FindName('FolderOverlay')
+$FolderHint = $window.FindName('FolderHint')
+$FolderPath = $window.FindName('FolderPath')
+$FolderList = $window.FindName('FolderList')
+$FolderScroll = $window.FindName('FolderScroll')
+$FolderEmpty = $window.FindName('FolderEmpty')
+$FolderUp = $window.FindName('FolderUp')
+$FolderRoot = $window.FindName('FolderRoot')
+$FolderPick = $window.FindName('FolderPick')
+$FolderCancel = $window.FindName('FolderCancel')
+
+# ---------------------------------------------------------------- 画东西的小工具
+# Brush / FontFamily 缓存：回放长会话要建几千个，每次都解析颜色字符串、每次新建 FontFamily 太浪费
+$script:brushCache = @{}
+$script:fontCache = @{}
+
+function Brush([string]$hex) {
+  # 缓存：回放一个长会话要建几千个 Brush，每建一个都 ColorConverter.ConvertFromString 太贵。
+  # SolidColorBrush 是 Freezable，只读共享给多个元素是安全的（本文件里没有改 Brush.Color 的地方）。
+  $b = $script:brushCache[$hex]
+  if ($b) { return $b }
+  $b = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.ColorConverter]::ConvertFromString($hex))
+  $script:brushCache[$hex] = $b
+  return $b
+}
+
+function New-Font([string]$name) {
+  # FontFamily 也缓存：回放时每个 TextBlock / Run 都要一个，重复建同样是浪费
+  $f = $script:fontCache[$name]
+  if ($f) { return $f }
+  $f = New-Object System.Windows.Media.FontFamily($name)
+  $script:fontCache[$name] = $f
+  return $f
+}
+
+function New-Text {
+  param([string]$text = '', [double]$size = 13.5, [string]$color = '#F9FAFB',
+        [string]$weight = 'Normal', [string]$font = 'Segoe UI', [double]$mb = 0)
+  $tb = New-Object System.Windows.Controls.TextBlock
+  $tb.Text = $text
+  $tb.FontSize = $size
+  $tb.Foreground = (Brush $color)
+  $tb.FontFamily = (New-Font $font)
+  $tb.TextWrapping = 'Wrap'
+  $tb.Margin = "0,0,0,$mb"
+  if ($weight -eq 'SemiBold') { $tb.FontWeight = [System.Windows.FontWeights]::SemiBold }
+  elseif ($weight -eq 'Bold') { $tb.FontWeight = [System.Windows.FontWeights]::Bold }
+  return $tb
+}
+
+function Add-Container([double]$mb = 14) {
+  $sp = New-Object System.Windows.Controls.StackPanel
+  $sp.Margin = "0,0,0,$mb"
+  $script:renderHost.Children.Add($sp) | Out-Null
+  return $sp
+}
+
+# ---------------------------------------------------------------- 复制
+# WPF 的 TextBlock 不能拖蓝选中，所以每块内容挂右键菜单：复制本段 / 复制整段对话。
+# 待复制的文本放在哈希表里，由调用方随时更新（流式时内容一直在变），
+# 回调从 Tag 上取那份引用——PS 5.1 下事件里的 GetNewClosure 拿不到外部变量。
+$script:copyLog = New-Object System.Text.StringBuilder
+
+function Append-CopyLog([string]$t) {
+  if (-not $t) { return }
+  $script:copyLog.Append($t) | Out-Null
+  if (-not $t.EndsWith("`n")) { $script:copyLog.Append("`n") | Out-Null }
+}
+
+function Copy-Text([object]$t) {
+  $s = [string]$t
+  if (-not $s) { return }
+  try { [System.Windows.Clipboard]::SetText($s) } catch { Log ('复制失败: ' + ($_ | Out-String)) }
+}
+
+# 右键菜单的深色模板：系统默认的 ContextMenu / MenuItem 是浅灰底，和深色界面不搭
+$script:ctxTpl = $null
+$script:miTpl = $null
+
+function New-CtxTemplate {
+  if ($script:ctxTpl) { return $script:ctxTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="ContextMenu">
+  <Border Background="#14171D" BorderBrush="#2A2F39" BorderThickness="1" CornerRadius="6" Padding="4">
+    <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Cycle"/>
+  </Border>
+</ControlTemplate>
+'@
+  $script:ctxTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:ctxTpl
+}
+
+function New-MenuItemTemplate {
+  if ($script:miTpl) { return $script:miTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="MenuItem">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" Padding="14,6" CornerRadius="4">
+    <ContentPresenter ContentSource="Header" VerticalAlignment="Center" TextBlock.Foreground="{TemplateBinding Foreground}" TextBlock.FontSize="12"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsHighlighted" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#252933"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:miTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:miTpl
+}
+
+function New-CopyMenu([object]$box) {
+  $cm = New-Object System.Windows.Controls.ContextMenu
+  $cm.Background = (Brush '#14171D')
+  $cm.Foreground = (Brush '#E6E8EE')
+  $cm.BorderBrush = (Brush '#2A2F39')
+  $cm.BorderThickness = '1'
+  $cm.Template = (New-CtxTemplate)
+  $mi = New-Object System.Windows.Controls.MenuItem
+  $mi.Foreground = (Brush '#E6E8EE')
+  $mi.Background = [System.Windows.Media.Brushes]::Transparent
+  $mi.Padding = '0'
+  $mi.Template = (New-MenuItemTemplate)
+  $mi.Header = '复制'
+  $mi.Tag = $box
+  $mi.Add_Click({ param($s, $e) Copy-Text ([string]$s.Tag.text) })
+  $cm.Items.Add($mi) | Out-Null
+  $ma = New-Object System.Windows.Controls.MenuItem
+  $ma.Header = '复制整段对话'
+  $ma.Foreground = (Brush '#E6E8EE')
+  $ma.Background = [System.Windows.Media.Brushes]::Transparent
+  $ma.Padding = '0'
+  $ma.Template = (New-MenuItemTemplate)
+  $ma.Add_Click({ param($s, $e) Copy-Text $script:copyLog.ToString() })
+  $cm.Items.Add($ma) | Out-Null
+  return $cm
+}
+
+# 右键菜单改成「按需建」：回放一个长会话要上千个 ContextMenu（每个还带两个 MenuItem，
+# 还各自套自定义模板），全预建比消息内容本身还贵。这里只记下要复制的文本，
+# 右键那一刻现做一个——用户感觉不到，回放少一大截开销。
+$script:copyBoxOf = @{}
+function Set-CopyMenu([object]$el, [object]$box) {
+  $script:copyBoxOf[$el] = $box
+  $el.Add_MouseRightButtonUp({ param($s, $ev) Show-CopyMenu $s })
+}
+
+function Show-CopyMenu([object]$el) {
+  $box = $script:copyBoxOf[$el]
+  if (-not $box) { return }
+  $cm = New-CopyMenu $box
+  $cm.PlacementTarget = $el
+  $cm.Placement = [System.Windows.Controls.Primitives.PlacementMode]::MousePoint
+  $cm.IsOpen = $true
+}
+function Add-UserMessage([string]$text, [object]$files = $null) {
+  $sp = Add-Container 20
+  # Kite 风：自己说的话是右侧一块蓝底圆角气泡，和助手的正文一眼分得开
+  $sp.HorizontalAlignment = 'Right'
+  $bubble = New-Object System.Windows.Controls.Border
+  $bubble.Background = (Brush '#3B82F6')
+  $bubble.BorderBrush = (Brush '#332B6CB0')
+  $bubble.BorderThickness = '1'
+  $bubble.CornerRadius = '22,22,6,22'
+  $bubble.Padding = '16,12,16,12'
+  $bubble.HorizontalAlignment = 'Right'
+  $bubble.MaxWidth = 680
+  $bubble.Effect = New-Object System.Windows.Media.Effects.DropShadowEffect -Property @{ BlurRadius = 18; ShadowDepth = 4; Opacity = 0.24; Color = [System.Windows.Media.Color]::FromRgb(37, 99, 235) }
+  $inner = New-Object System.Windows.Controls.StackPanel
+  if ($text.Trim()) {
+    $body = New-Text $text 13.5 '#FFFFFF' 'Normal' 'Segoe UI' 0
+    $body.LineHeight = 22
+    $body.LineStackingStrategy = 'BlockLineHeight'
+    $inner.Children.Add($body) | Out-Null
+  }
+  # 附件：只显示名字和大小，不显示数据目录里那一长串路径
+  # 老会话的 user/message 可能没有 files 字段（$null）：@($null) 会得到一个元素，
+  # 会多画一个空附件框，先过滤掉
+  $list = @(@($files) | Where-Object { $null -ne $_ })
+  if ($list.Count -gt 0) {
+    $wrap = New-Object System.Windows.Controls.WrapPanel
+    $wrap.Orientation = 'Horizontal'
+    $wrap.Margin = '0,6,0,0'
+    foreach ($f in $list) {
+      $nm = if ($f.name) { [string]$f.name } else { [System.IO.Path]::GetFileName([string]$f) }
+      $fp = [string]$f.path
+      $sz = if ($null -ne $f.bytes) { Format-FileSize ([double]$f.bytes) } else { '' }
+      $b = New-Object System.Windows.Controls.Border
+      $b.Background = (Brush '#1F242C')
+      $b.BorderBrush = (Brush '#1FFFFFFF')
+      $b.BorderThickness = '1'
+      $b.CornerRadius = '6'
+      $b.Padding = '6,4,8,4'
+      $b.Margin = '0,0,6,6'
+      # 发出去的图片也留个缩略图（用数据目录里那份拷贝，原文件删了也还在）
+      if ($fp -and (Test-ImagePath $fp)) {
+        $box = New-Object System.Windows.Controls.StackPanel
+        $box.Orientation = 'Horizontal'
+        $thumb = New-ImageThumb $fp 56
+        if ($thumb) { $box.Children.Add($thumb) | Out-Null }
+        $meta = New-Object System.Windows.Controls.StackPanel
+        $meta.VerticalAlignment = 'Center'
+        $nTb = New-Text $nm 10.5 '#9AA1AC' 'Normal' 'Segoe UI' 0
+        $nTb.MaxWidth = 200
+        $nTb.TextTrimming = 'CharacterEllipsis'
+        $nTb.TextWrapping = 'NoWrap'
+        $meta.Children.Add($nTb) | Out-Null
+        if ($sz) { $meta.Children.Add((New-Text $sz 9.5 '#6B7280' 'Normal' 'Segoe UI' 1)) | Out-Null }
+        $box.Children.Add($meta) | Out-Null
+        $b.Child = $box
+      } else {
+        $b.Child = (New-Text $(if ($sz) { "$nm · $sz" } else { $nm }) 10.5 '#9AA1AC')
+      }
+      $wrap.Children.Add($b) | Out-Null
+    }
+    $inner.Children.Add($wrap) | Out-Null
+  }
+  $bubble.Child = $inner
+  $sp.Children.Add($bubble) | Out-Null
+  Set-CopyMenu $sp @{ text = "你：$text" }
+  Append-CopyLog "你：$text"
+  $script:lastUserElement = $sp
+  if ($null -ne $script:renderEventIndex -and $script:renderEventIndex -ge 0) {
+    $script:userElements[[int]$script:renderEventIndex] = $sp
+  }
+  $script:currentAssistant = $null
+}
+
+# ---------------------------------------------------------------- 记忆卡片
+# 一轮结束后模型写了记忆就在这里显出来，并给一个「撤销」——
+# 不想要那条记忆时不用去翻数据目录里的 jsonl
+$script:memoryCards = New-Object System.Collections.ArrayList
+
+function Set-MemoryUndone($ids) {
+  $drop = @{}
+  foreach ($i in @($ids)) { $drop[[string]$i] = $true }
+  foreach ($c in @($script:memoryCards)) {
+    $all = @($c.ids)
+    $left = @($all | Where-Object { -not $drop.ContainsKey([string]$_) })
+    if ($left.Count -eq $all.Count) { continue }
+    $c.ids = $left
+    if ($left.Count -eq 0) {
+      $c.state.Text = '已撤销'
+      $c.state.Foreground = (Brush '#6B7280')
+      $c.btn.Visibility = 'Collapsed'
+      foreach ($row in @($c.rows)) { $row.Foreground = (Brush '#5B626D') }
+    }
+  }
+}
+
+function Add-MemoryCard([object]$items) {
+  $list = @(@($items) | Where-Object { $_ -and [string]$_.text })
+  if ($list.Count -eq 0) { return }
+  $sp = Add-Container 16
+  $outer = New-Object System.Windows.Controls.Border
+  $outer.Background = (Brush '#12141A')
+  $outer.BorderBrush = (Brush '#12FFFFFF')
+  $outer.BorderThickness = '1'
+  $outer.CornerRadius = '8'
+  $outer.Padding = '10,8'
+  $inner = New-Object System.Windows.Controls.StackPanel
+  $outer.Child = $inner
+
+  $head = New-Object System.Windows.Controls.DockPanel
+  $state = New-Text '' 10.5 '#5B626D' 'Normal' 'Segoe UI' 0
+  $state.VerticalAlignment = 'Center'
+  [System.Windows.Controls.DockPanel]::SetDock($state, 'Right')
+  $head.Children.Add($state) | Out-Null
+
+  $undo = New-Object System.Windows.Controls.Button
+  $undo.Content = '撤销'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($undo, 'MemoryUndo')
+  $undo.FontSize = 10.5
+  $undo.Padding = '8,2'
+  $undo.Cursor = 'Hand'
+  $undo.Background = [System.Windows.Media.Brushes]::Transparent
+  $undo.Foreground = (Brush '#8AB4FF')
+  $undo.BorderThickness = '0'
+  $undo.ToolTip = '把这轮记下的记忆删掉'
+  [System.Windows.Controls.DockPanel]::SetDock($undo, 'Right')
+  $undo.Add_MouseEnter({ param($s, $e) $s.Foreground = (Brush '#B9CDFF') })
+  $undo.Add_MouseLeave({ param($s, $e) $s.Foreground = (Brush '#8AB4FF') })
+  $head.Children.Add($undo) | Out-Null
+
+  $title = New-Text ("记住了 " + $list.Count + " 条") 11 '#9BA3B4' 'SemiBold' 'Segoe UI' 0
+  $title.VerticalAlignment = 'Center'
+  $head.Children.Add($title) | Out-Null
+  $inner.Children.Add($head) | Out-Null
+
+  $rows = New-Object System.Collections.ArrayList
+  foreach ($m in $list) {
+    $line = New-Text ('· ' + [string]$m.text) 11 '#7C838E' 'Normal' 'Segoe UI' 0
+    $line.TextWrapping = 'Wrap'
+    $line.LineHeight = 18
+    $line.LineStackingStrategy = 'BlockLineHeight'
+    $line.Margin = '0,5,0,0'
+    $inner.Children.Add($line) | Out-Null
+    [void]$rows.Add($line)
+  }
+
+  $card = @{ ids = @($list | ForEach-Object { [string]$_.id }); state = $state; btn = $undo; rows = $rows }
+  $undo.Tag = $card
+  $undo.Add_Click({ param($s, $e) Send-Host @{ cmd = 'undo-memory'; ids = @($s.Tag.ids) } })
+  [void]$script:memoryCards.Add($card)
+
+  $sp.Children.Add($outer) | Out-Null
+  $Scroller.ScrollToEnd()
+}
+
+function Add-AssistantMessage {
+  # 正文挂当前这一步：一段思考、几次调用、结论要按步挨在一起
+  $sp = New-Object System.Windows.Controls.StackPanel
+  $sp.Margin = "0,0,0,10"
+  # 标记成结论块：轮尾的 Close-TurnProc 会把最后一块留在 Final 区（不随轮头折叠）
+  $sp.Tag = 'assistant'
+  (Get-ProcPanel 'text').Children.Add($sp) | Out-Null
+  # 头行只留模型名：收/放由所在步骤卡的卡头统一管（一步一个折叠点，
+  # 不再让每段正文各带一颗箭头——多步任务里那就是一排排小三角）
+  $hd = New-Object System.Windows.Controls.DockPanel
+  $sp.Children.Add($hd) | Out-Null
+  $snip = New-Text '' 11 '#6F7684' 'Normal' 'Segoe UI' 0
+  $snip.VerticalAlignment = 'Center'
+  $snip.TextTrimming = 'CharacterEllipsis'
+  $snip.TextWrapping = 'NoWrap'
+  $snip.Visibility = 'Collapsed'
+  $hd.Children.Add($snip) | Out-Null
+  $head = New-Text $script:modelName 10.5 '#7C838E' 'Normal' 'Segoe UI' 4
+  $hd.Children.Add($head) | Out-Null
+  # 正文宿主：流式时里面只有一个 TextBlock，回答结束时整体重绘成
+  # 「段落 + 代码块卡片」的结构，所以 流式和最终渲染要分开
+  $body = New-Object System.Windows.Controls.StackPanel
+  $sp.Children.Add($body) | Out-Null
+  $tb = New-Text '' 14 '#E6E8EE' 'Normal' 'Segoe UI' 0
+  $tb.LineHeight = 23
+  $tb.LineStackingStrategy = 'BlockLineHeight'
+  $body.Children.Add($tb) | Out-Null
+  $script:assistantBody = $body
+  $script:assistantBox = @{ text = '' }
+  Set-CopyMenu $sp $script:assistantBox
+  $script:assistantFold = @{ Body = $body; Open = $true; Snip = $snip; Box = $script:assistantBox }
+  return $tb
+}
+
+# 收 / 放一段结论：正文整块收起，收起后这一行挂一句摘要。
+# 收起这一步的正文归步骤卡头管（Set-StepConclusion / Toggle-StepBlock），
+# 这里只留给「没有步骤卡」的兜底路径（正文直接挂在轮过程区或聊天区时）。
+function Set-AssistantFold($st, [bool]$open) {
+  if (-not $st) { return }
+  $st.Open = $open
+  $st.Body.Visibility = $(if ($open) { 'Visible' } else { 'Collapsed' })
+  if ($st.Snip) {
+    if ($open) {
+      $st.Snip.Visibility = 'Collapsed'
+    } else {
+      # 摘要取正文第一段有字的行：多步任务收起后还能看出这段讲了什么
+      $txt = $(if ($st.Box) { [string]$st.Box.text } else { '' })
+      $line = ($txt -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+      if ($null -eq $line) { $line = '' }
+      $line = ($line -replace '^\s*[#>\-*]+\s*', '').Trim()
+      $max = Get-RowChars 190 6.2
+      if ($line.Length -gt $max) { $line = $line.Substring(0, $max) + '…' }
+      $st.Snip.Text = $line
+      $st.Snip.Visibility = $(if ($line) { 'Visible' } else { 'Collapsed' })
+    }
+  }
+}
+
+# 工具行：平时收在「N 次工具调用」聚合卡里，展开后一行一条。
+# 左边状态图标（运行中转圈 / 成功绿勾 / 失败红叉），中间工具名与目标摘要，
+# 右边耗时；点这一行展开看这次调用的入参和返回结果。
+$script:spinFrames = @('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
+$script:spinIndex = 0
+
+function Add-ToolRow([string]$name, [string]$summary, [string]$argsText = '', [object]$parent = $null) {
+  $outer = New-Object System.Windows.Controls.Border
+  $outer.Background = (Brush '#12141A')
+  $outer.BorderBrush = (Brush '#0FFFFFFF')
+  $outer.BorderThickness = '1'
+  $outer.CornerRadius = '6'
+  $outer.Padding = '0'
+  $outer.Margin = '0,0,0,4'
+  $outer.HorizontalAlignment = 'Stretch'
+
+  $sp = New-Object System.Windows.Controls.StackPanel
+
+  $head = New-Object System.Windows.Controls.Button
+  $head.Background = [System.Windows.Media.Brushes]::Transparent
+  $head.BorderThickness = '0'
+  $head.Padding = '9,5'
+  $head.Cursor = 'Hand'
+  $head.HorizontalContentAlignment = 'Stretch'
+  $head.Template = (New-FlatTemplate)
+  $head.ToolTip = '点一下看这次调用的入参和结果'
+
+  $dp = New-Object System.Windows.Controls.DockPanel
+  # 右边：耗时（跑完才填）
+  $status = New-Text '' 10 '#5B626D' 'Normal' 'Cascadia Mono, Consolas' 0
+  $status.VerticalAlignment = 'Center'
+  [System.Windows.Controls.DockPanel]::SetDock($status, 'Right')
+  $dp.Children.Add($status) | Out-Null
+
+  # 左边：状态图标。运行中是转圈帧，跑完换成绿勾 / 红叉
+  $icon = New-Text $script:spinFrames[0] 11 '#7C838E' 'Normal' 'Segoe UI' 0
+  $icon.VerticalAlignment = 'Center'
+  $icon.Width = 14
+  $icon.TextAlignment = 'Center'
+  $icon.Margin = '0,0,6,0'
+  [System.Windows.Controls.DockPanel]::SetDock($icon, 'Left')
+  $dp.Children.Add($icon) | Out-Null
+
+  $nameTb = New-Text $name 11 '#8FA6FF' 'Normal' 'Cascadia Mono, Consolas' 0
+  $nameTb.VerticalAlignment = 'Center'
+  $nameTb.Margin = '0,0,9,0'
+  [System.Windows.Controls.DockPanel]::SetDock($nameTb, 'Left')
+  $dp.Children.Add($nameTb) | Out-Null
+
+  # 剩下的一格：目标（路径 / 搜索词 / 命令），长了省略
+  $sumTb = New-Text $summary 11 '#9BA3B4' 'Normal' 'Cascadia Mono, Consolas' 0
+  $sumTb.TextTrimming = 'CharacterEllipsis'
+  $sumTb.TextWrapping = 'NoWrap'
+  $sumTb.VerticalAlignment = 'Center'
+  $dp.Children.Add($sumTb) | Out-Null
+  $head.Content = $dp
+  $sp.Children.Add($head) | Out-Null
+
+  # 展开区：入参和结果各限高可滚（结果动辄几千字，不能把整轮撑爆）
+  $detail = New-Object System.Windows.Controls.StackPanel
+  $detail.Margin = '9,0,9,6'
+  $detail.Visibility = 'Collapsed'
+
+  $detail.Children.Add((New-Text '参数' 9.5 '#5B626D' 'SemiBold' 'Segoe UI' 2)) | Out-Null
+  $argsTb = New-Text '' 10.5 '#9BA3B4' 'Normal' 'Cascadia Mono, Consolas' 0
+  $argsTb.TextWrapping = 'Wrap'
+  $argsSv = New-Object System.Windows.Controls.ScrollViewer
+  $argsSv.MaxHeight = 110
+  $argsSv.VerticalScrollBarVisibility = 'Auto'
+  $argsSv.Content = $argsTb
+  $detail.Children.Add($argsSv) | Out-Null
+
+  $resHead = New-Text '结果' 9.5 '#5B626D' 'SemiBold' 'Segoe UI' 2
+  $resHead.Margin = '0,7,0,2'
+  $detail.Children.Add($resHead) | Out-Null
+  $resTb = New-Text '' 10.5 '#C7CBD2' 'Normal' 'Cascadia Mono, Consolas' 0
+  $resTb.TextWrapping = 'Wrap'
+  $resSv = New-Object System.Windows.Controls.ScrollViewer
+  $resSv.MaxHeight = 150
+  $resSv.VerticalScrollBarVisibility = 'Auto'
+  $resSv.Content = $resTb
+  $detail.Children.Add($resSv) | Out-Null
+  # 截图缩略图：直接常显在行内（不用展开就看得到），没有图的调用一直是 Collapsed
+  $thumbs = New-Object System.Windows.Controls.WrapPanel
+  $thumbs.Margin = '9,0,9,7'
+  $thumbs.Visibility = 'Collapsed'
+  $sp.Children.Add($thumbs) | Out-Null
+  $sp.Children.Add($detail) | Out-Null
+
+  $outer.Child = $sp
+  $box = @{ text = "$name  $summary" }
+  # 右键可复制这一行的「工具名 + 参数 + 结果」；文本随着状态变，放在 $box 里跟着更新
+  Set-CopyMenu $outer $box
+  if ($parent) { $parent.Children.Add($outer) | Out-Null }
+  else { (Get-ProcPanel 'tool').Children.Add($outer) | Out-Null }
+
+  $row = New-Object PSObject -Property @{
+    Border = $outer; Button = $head; Icon = $icon; Name = $nameTb; Sum = $sumTb; Status = $status
+    Detail = $detail; ArgsTb = $argsTb; ResTb = $resTb; Thumbs = $thumbs
+    Open = $false; State = 'running'; Group = $null; Box = $box
+  }
+  if ($argsText) { $row.ArgsTb.Text = $argsText }
+  $head.Tag = $row
+  $head.Add_Click({ param($s, $e) Toggle-ToolRow $s.Tag })
+  return $row
+}
+
+# 一行展开 / 收起：平时时间线是紧凑的，点开才看这一次的入参和返回
+function Toggle-ToolRow($row) {
+  if (-not $row) { return }
+  $row.Open = -not $row.Open
+  $row.Detail.Visibility = $(if ($row.Open) { 'Visible' } else { 'Collapsed' })
+}
+
+# 运行中的行每 100ms 转一格（一圈一秒），跑完的行不再动
+function Step-ToolRows {
+  if ($script:toolRows.Count -eq 0) { return }
+  $script:spinIndex = ($script:spinIndex + 1) % $script:spinFrames.Count
+  $glyph = $script:spinFrames[$script:spinIndex]
+  foreach ($k in @($script:toolRows.Keys)) {
+    $row = $script:toolRows[$k]
+    if ($row -and $row.State -eq 'running') { $row.Icon.Text = $glyph }
+  }
+}
+
+# ---------------------------------------------------------------- 轮次时间线
+# 一轮的「思考过程 + 工具调用」画成一条时间线（跟 Kite 那种组件一样）：
+#   顶部状态行   ● 思考中… 1:30
+#   思考摘要卡   [花形图标] 思考  <最新一段思考，单行省略>                 ▸
+#   工具聚合卡   ▸ 21 次工具调用 · 共 8.4s         fs.read ×9 · fs.grep ×7
+# 点摘要卡看整段思考，点聚合卡展开每一行，点某一行看这次的入参和结果。
+# 正文回答不进这条时间线——那是要一直看见的东西：
+# 中间各步的结论跟着「过程」一起被轮头收起，最后一段结论在轮尾时搬到 Final 区，
+# 折叠轮头也只收过程，最后结论永远留在屏幕上。
+$script:turnProc = $null
+# 当前这一「步」：同一张步骤卡里的思考 / 工具 / 结论三块（下一步再开新卡）
+$script:stepBox = $null
+$script:stepNode = $null
+
+# 过程元素往哪挂：
+#   有当前步骤卡 → 按 kind 挂这一步的「思考区 / 工具区 / 结论区」（三段顺序固定，
+#     不管事件是「先出正文再调工具」还是反过来，展开看到的永远是 思考 → 工具 → 结论）；
+#   本轮有卡 → 挂轮的过程区；都没有（历史外的事件、系统行）→ 挂聊天区。
+function Get-ProcPanel([string]$kind = '') {
+  if ($script:stepNode) {
+    if ($kind -eq 'reason') { return $script:stepNode.ThinkHost }
+    if ($kind -eq 'tool') { return $script:stepNode.ToolHost }
+    if ($kind -eq 'text') { return $script:stepNode.TextHost }
+    return $script:stepNode.Body
+  }
+  if ($script:turnProc -and -not $script:turnProc.Done) { return $script:turnProc.Body }
+  return $script:renderHost
+}
+
+# 状态行那颗计时器：「1:30」；超过一小时「1:02:03」
+function Format-Clock([double]$secs) {
+  $total = [int][math]::Floor([math]::Max(0, $secs))
+  $s = $total % 60
+  $m = [int][math]::Floor($total / 60) % 60
+  $h = [int][math]::Floor($total / 3600)
+  $head = $(if ($h -gt 0) { [string]$h + ':' + ('{0:00}' -f $m) } else { [string]$m })
+  return $head + ':' + ('{0:00}' -f $s)
+}
+
+# 思考条前面那个图标：两个圆角方框交叉 + 中心一个小方块（跟设计稿一样的花形轮廓）。
+# 用 XAML 画而不是字体符号：Segoe UI 里没有形状一致的字符，换台机器就会变成豆腐块。
+# UIElement 没有 Clone()，每次现 Parse 一份（只在建思考条时调一次）。
+$script:thinkIconXaml = @'
+<Canvas xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Width="18" Height="18">
+  <Rectangle Canvas.Left="3" Canvas.Top="3" Width="12" Height="12" RadiusX="2.4" RadiusY="2.4"
+             Stroke="#A8B0BE" StrokeThickness="1.25" RenderTransformOrigin="0.5,0.5">
+    <Rectangle.RenderTransform>
+      <RotateTransform Angle="45" />
+    </Rectangle.RenderTransform>
+  </Rectangle>
+  <Rectangle Canvas.Left="3" Canvas.Top="3" Width="12" Height="12" RadiusX="2.4" RadiusY="2.4"
+             Stroke="#A8B0BE" StrokeThickness="1.25" />
+  <Rectangle Canvas.Left="7.6" Canvas.Top="7.6" Width="2.8" Height="2.8" RadiusX="0.7" RadiusY="0.7"
+             Fill="#A8B0BE" />
+</Canvas>
+'@
+function New-ThinkIcon([string]$color = '#A8B0BE') {
+  $c = [Windows.Markup.XamlReader]::Parse($script:thinkIconXaml)
+  if ($color -ne '#A8B0BE') {
+    $br = Brush $color
+    foreach ($ch in $c.Children) {
+      if ($ch -is [System.Windows.Shapes.Shape]) {
+        if ($ch.Fill) { $ch.Fill = $br } else { $ch.Stroke = $br }
+      }
+    }
+  }
+  return $c
+}
+
+# 收起状态下「正在处理」的实时提示：优先正在吐的那句思考的尾巴，其次当前阶段词
+# （思考中 / 执行 fs.read / 回答中）。步骤卡头的摘要和轮头右边都用它——
+# 只要还在跑就一直变，一眼看得出没卡住。
+function Get-LiveHintText {
+  $rn = $script:pumpTarget
+  if (-not $rn) { $rn = $script:reasonNode }
+  if ($rn -and $rn.Body) {
+    $q = [string]$rn.Body.Text
+    if ($q) {
+      $q = ($q -replace '\s+', ' ').Trim()
+      if ($q.Length -gt 0) {
+        if ($q.Length -gt 42) { $q = '…' + $q.Substring($q.Length - 40) }
+        return $q
+      }
+    }
+  }
+  $verb = [string]$script:thinkVerb
+  if ($verb) { return $verb }
+  return '正在处理…'
+}
+
+# 刷新状态行：阶段词 + 计时；结束了就把绿点熄掉、词换成「已完成」
+function Update-TurnProc($t) {
+  if (-not $t) { return }
+  $verb = $(if ($t.Done -or (-not $t.Live)) { '已完成' } else { $script:thinkVerb })
+  if (-not $verb) { $verb = '思考中' }
+  # 历史里读回来的轮次（Live=$false）已经定局：进度词只报「已完成」，不再显示阶段词。
+  # 不这么改的话，一张历史回放的轮卡在收到第一个 assistant/message 之前那几十毫秒里，
+  # 状态行还是 New-TurnProc 建的「思考中…」，切到旧会话会闪一下「思考中」。
+  $historical = (-not $t.Live)
+  # 跑着的阶段词句尾点一下；「执行 fs.read」这种不再加点
+  $tail = $(if ($t.Done -or $historical) { '' } elseif ($verb -eq '思考中' -or $verb -eq '回答中' -or $verb -eq '验证中') { '…' } else { '' })
+  $t.Verb.Text = $verb + $tail
+  if ($historical) { $t.Verb.Foreground = (Brush '#6B7280') }
+  else { $t.Verb.Foreground = $(if ($t.Done) { Brush '#6B7280' } else { Brush '#C7CBD2' }) }
+  $secs = $(if ($t.Done -or $historical) { [double]$t.Ms / 1000.0 } else { ((Get-Date) - $t.T0).TotalSeconds })
+  # 历史回放没有墙钟：这一轮走了多久按事件时间戳之差算
+  if ($t.At0 -gt 0 -and $t.AtLast -ge $t.At0) { $secs = ([double]$t.AtLast - $t.At0) / 1000.0 }
+  $t.Clock.Text = (Format-Clock $secs)
+  # 历史轮：耗时与呼吸灯都按定局处理（数据齐了就是事件时间戳之差）
+  if ($t.Done -or $historical) {
+    # 呼吸灯停不下来就是还在跑：结束这一轮时熄掉
+    $t.Dot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+    $t.Dot.Opacity = 1
+    $t.Dot.Background = (Brush '#3F4650')
+  }
+  # 轮头第二行：这一轮一共调了几次工具、各几次，耗时合计多少
+  $arrow = $(if ($t.Open) { '▾' } else { '▸' })
+  $parts = @()
+  if ([int]$t.Tools -gt 0) { $parts += ("$($t.Tools) 次工具调用") }
+  if ([double]$t.ToolMs -gt 0) { $parts += ('共 ' + (Format-ToolSecs ([double]$t.ToolMs))) }
+  if ([int]$t.Steps -gt 0) { $parts += ("$($t.Steps) 步") }
+  if ($parts.Count -eq 0) { $parts += '开始' }
+  $t.SumLeft.Text = "$arrow  " + ($parts -join ' · ')
+  # 右边各工具的调用次数：整轮汇总，不在每步里各报一份
+  $cs = @()
+  if ($t.Order) { foreach ($k in $t.Order) { $cs += ("$k ×" + $t.Counts[$k]) } }
+  $s = ($cs -join ' · ')
+  if ([int]$t.Failed -gt 0) { $s = $(if ($s) { "$s · $($t.Failed) 失败" } else { "$($t.Failed) 失败" }) }
+  $maxChars = Get-RowChars 230 6.6
+  if ($s.Length -gt $maxChars) { $s = $s.Substring(0, $maxChars) + '…' }
+  $t.SumRight.Text = $s
+  $t.SumRight.Foreground = $(if ([int]$t.Failed -gt 0) { Brush '#F87171' } else { Brush '#6B7280' })
+  # 第一行右边：还在跑就在这里不停刷「最新在干什么」（思考尾巴 / 当前工具名）。
+  # 收起态下这一行就是全部动静，收尾后藏起来。
+  $hint = ''
+  if (-not ($t.Done -or $historical)) { $hint = Get-LiveHintText }
+  if ($t.LiveHint) {
+    $t.LiveHint.Text = $hint
+    $t.LiveHint.Visibility = $(if ($hint) { 'Visible' } else { 'Collapsed' })
+  }
+}
+
+function New-TurnProc {
+  $box = New-Object System.Windows.Controls.StackPanel
+  $box.Margin = '0,2,0,9'
+  $box.HorizontalAlignment = 'Stretch'
+  $script:stepNode = $null
+  $script:reasonNode = $null
+  $script:toolGroup = $null
+
+  # 轮头：一整块可点。上面一行是状态（● 思考中… 1:30），
+  # 下面一行是这一轮的工具汇总（▾ 14 次工具调用 · 共 8.3s · 6 步   read×6 · shell×3）；
+  # 点一下把这一轮的过程整块收起，只剩这两行，再点一下放回来。
+  # 收的只是「过程」：最后一段结论在 Final 区，折叠时它不动。
+  $head = New-Object System.Windows.Controls.Button
+  $head.Background = [System.Windows.Media.Brushes]::Transparent
+  $head.BorderThickness = '0'
+  $head.Padding = '0,2,0,3'
+  $head.Cursor = 'Hand'
+  $head.HorizontalContentAlignment = 'Stretch'
+  $head.Template = (New-FlatTemplate)
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($head, 'TurnHead')
+  $hs = New-Object System.Windows.Controls.StackPanel
+
+  # 状态行：● 思考中… 1:30
+  $row = New-Object System.Windows.Controls.DockPanel
+  $row.Margin = '2,0,2,0'
+  # 关掉 LastChildFill：右边那行实时提示要按 Dock 贴右，别被撑满整行
+  $row.LastChildFill = $false
+
+  $left = New-Object System.Windows.Controls.StackPanel
+  $left.Orientation = 'Horizontal'
+  # 呼吸绿灯：透明度 1 → 0.32 → 1 无限循环；这一轮结束（Update-TurnProc 的 Done）就熄
+  $dot = New-Object System.Windows.Controls.Border
+  $dot.Width = 8
+  $dot.Height = 8
+  $dot.CornerRadius = '4'
+  $dot.Background = (Brush '#3DDC84')
+  $dot.VerticalAlignment = 'Center'
+  $dot.Margin = '0,0,7,0'
+  $breath = New-Object System.Windows.Media.Animation.DoubleAnimation
+  $breath.From = 1.0
+  $breath.To = 0.32
+  $breath.Duration = [System.Windows.Duration]::new([TimeSpan]::FromMilliseconds(900))
+  $breath.AutoReverse = $true
+  $breath.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+  $dot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $breath)
+  $left.Children.Add($dot) | Out-Null
+  $verb = New-Text '思考中…' 11.5 '#C7CBD2' 'Normal' 'Segoe UI' 0
+  $verb.VerticalAlignment = 'Center'
+  $left.Children.Add($verb) | Out-Null
+  $clock = New-Text '0:00' 11 '#5B626D' 'Normal' 'Cascadia Mono, Consolas' 0
+  $clock.VerticalAlignment = 'Center'
+  $clock.Margin = '9,0,0,0'
+  $left.Children.Add($clock) | Out-Null
+  $row.Children.Add($left) | Out-Null
+
+  # 第一行右边：收起态下唯一在动的东西——最新一句思考 / 正在跑的工具，跑完就收起来
+  $live = New-Text '' 10.5 '#7C8595' 'Normal' 'Cascadia Mono, Consolas' 0
+  $live.VerticalAlignment = 'Center'
+  $live.TextTrimming = 'CharacterEllipsis'
+  $live.TextWrapping = 'NoWrap'
+  $live.MaxWidth = 460
+  $live.Margin = '12,0,2,0'
+  $live.Visibility = 'Collapsed'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($live, 'TurnLive')
+  [System.Windows.Controls.DockPanel]::SetDock($live, 'Right')
+  $row.Children.Add($live) | Out-Null
+  $hs.Children.Add($row) | Out-Null
+
+  # 汇总行：左边「N 次工具调用 · 共 X · M 步」，右边各工具计数
+  $sumRow = New-Object System.Windows.Controls.DockPanel
+  $sumRow.Margin = '2,0,2,2'
+  $sumRight = New-Text '' 10.5 '#6B7280' 'Normal' 'Cascadia Mono, Consolas' 0
+  $sumRight.VerticalAlignment = 'Center'
+  $sumRight.TextTrimming = 'CharacterEllipsis'
+  $sumRight.TextWrapping = 'NoWrap'
+  [System.Windows.Controls.DockPanel]::SetDock($sumRight, 'Right')
+  $sumRow.Children.Add($sumRight) | Out-Null
+  $sumLeft = New-Text '▾  开始' 11 '#8A93A2' 'SemiBold' 'Segoe UI' 0
+  $sumLeft.VerticalAlignment = 'Center'
+  $sumLeft.TextWrapping = 'NoWrap'
+  [System.Windows.Controls.DockPanel]::SetDock($sumLeft, 'Left')
+  $sumRow.Children.Add($sumLeft) | Out-Null
+  $hs.Children.Add($sumRow) | Out-Null
+
+  $head.Content = $hs
+  $box.Children.Add($head) | Out-Null
+
+  # 这一轮的过程（各步的思考 / 工具 / 中间结论）都挂在 body 里，折叠时整块收起
+  $body = New-Object System.Windows.Controls.StackPanel
+  $body.Margin = '0,4,0,0'
+  $box.Children.Add($body) | Out-Null
+
+  # 最后一轮的结论挂在 final 里：不属于「过程」，折叠轮头时它不动
+  $final = New-Object System.Windows.Controls.StackPanel
+  $final.Margin = '0,2,0,0'
+  $box.Children.Add($final) | Out-Null
+
+  $script:renderHost.Children.Add($box) | Out-Null
+
+  $node = New-Object PSObject -Property @{
+    Box = $box; Body = $body; Final = $final; Head = $head; SumLeft = $sumLeft; SumRight = $sumRight
+    Dot = $dot; Verb = $verb; Clock = $clock; LiveHint = $live
+    Thought = $null; LastStep = $null
+    Open = $true; Done = $false; Tools = 0; Steps = 0; Replay = $false
+    StepNodes = (New-Object System.Collections.ArrayList)
+    # Closed：这一轮是否已经收过尾（收尾动作只跑一次；不复用 Done，
+    # 因为回放的步骤卡建出来就带 Done，用 Done 当早退条件会把收尾整段跳过）
+    Closed = $false
+    # Live：这张轮卡是不是「正在跑的这一轮」的。历史回放里读回来的轮次一律 Live=$false，
+    # 状态行直接定格「已完成」，不显示任何进行中的阶段词（任务已经结束了）。
+    Live = $true
+    ToolMs = 0.0; Failed = 0; Counts = @{}; Order = (New-Object System.Collections.ArrayList)
+    T0 = (Get-Date); Ms = 0; At0 = 0; AtLast = 0
+  }
+  # 点轮头收/放：拿 Tag 传节点（PS 5.1 的事件里直接引用 $node 会拿到 null）
+  $head.Tag = $node
+  $head.Add_Click({ param($s, $e) Toggle-TurnProc $s.Tag })
+  $script:turnProc = $node
+  $script:stepBox = $null
+  Update-TurnProc $node
+  return $node
+}
+
+function Get-TurnProc {
+  if (-not $script:turnProc -or $script:turnProc.Done) { New-TurnProc | Out-Null }
+  return $script:turnProc
+}
+
+# 点轮头：把这一轮的过程整块收起或展开；收起时只剩状态行和工具汇总行。
+# 最后结论在 Final 区（Body 之外），折叠轮头不动它——结论要一直看得见。
+function Toggle-TurnProc($t) {
+  if (-not $t) { return }
+  $t.Open = -not $t.Open
+  if ($t.Body) { $t.Body.Visibility = $(if ($t.Open) { 'Visible' } else { 'Collapsed' }) }
+  # 展开这一轮时，里面的步骤卡一律保持「一行一张」的收起态：
+  # 一轮展开先看到的是「第 1 步… 第 2 步…」的目录，想看哪一步再点哪一步，
+  # 不然一轮十几步会把每一段的思考链和工具行全铺开，翻半天也看不到别的步。
+  if ($t.Open) {
+    foreach ($node in @($t.StepNodes)) {
+      if (-not $node) { continue }
+      if (-not $node.Open) { continue }
+      $node.Open = $false
+      if ($node.Body) { $node.Body.Visibility = 'Collapsed' }
+      Update-StepHead $node
+    }
+  }
+  Update-TurnProc $t
+}
+
+# 回放的一轮从建成起就是收起态：过程区（思考链 / 工具卡 / 中间结论）先不占地方，
+# 也避免「先展开渲染一遍、收尾再收起」——长历史里那一步会看到内容闪一下。
+function Set-TurnProcCollapsed($t) {
+  if (-not $t -or $t.Done) { return }
+  if (-not $t.Open) { return }
+  $t.Open = $false
+  if ($t.Body) { $t.Body.Visibility = 'Collapsed' }
+  Update-TurnProc $t
+}
+
+# 轮卡标成「历史轮」：状态行只报「已完成」（Update-TurnProc 看 Live），过程区从建成起收起。
+# 注意这里不能顺手置 Done——Done 的含义是「这张卡已经收尾、不能再往里画」，
+# 而回放要接着往同一张卡里填思考 / 工具 / 正文；置了 Done 的话下一次 Get-TurnProc
+# 会另建一张轮卡，一轮就会裂成好几张。
+function Set-TurnHistorical($t) {
+  if (-not $t) { return }
+  $t.Live = $false
+  $t.Replay = $true
+  Set-TurnProcCollapsed $t
+  Update-TurnProc $t
+}
+
+# 开新的一步：一张可折叠的步骤卡。
+#   卡头     ▸ 第 3 步 · 结论摘要……        2 次调用 · 思考 4s   ← 收起时就一行
+#   卡身     [这段思考] → [这几次调用] → [这一步给出的结论]
+# 一步一张，展开一步只看到这一步的思考过程和工具调用，不会跟别的步混在一起。
+# 整轮共用一张思考条 / 一张工具聚合卡会让「哪段思考配哪几次调用」糊成一片。
+function New-StepBlock {
+  $tp = Get-TurnProc
+  if ($script:reasonNode -and -not $script:reasonNode.Done) { Complete-Reasoning }
+  # 这一轮是从历史里读回来的（Live=$false）：这一步早就做完了，
+  # 卡头不该是「正在做…」，等正文到了再用 Set-StepConclusion 填真实结论
+  $finished = (-not $tp.Live)
+  # 上一步没拿到结论（只有思考 / 工具、没有正文）就把这一步并进去，不另起一张卡：
+  # 目录里不该出现「第 4 步（这一步没有结论）」这种占位行，它的内容归到下一张
+  # 有结论的卡里一起看。全部步骤都没结论时就会并成一张，这比一串空卡好读。
+  # 判据只看有没有结论（Snip），不看 Done——历史回放的卡一建出来就 Done，
+  # 拿 Done 当判据会导致回放里一次也合并不上。
+  $prev = $script:stepNode
+  if ($prev -and [string]::IsNullOrWhiteSpace($prev.Snip) -and $prev.Card.Parent -eq $tp.Body) {
+    # 并进去：这张卡重新变成「可以继续画」的状态，新一段思考从自己的条目开始
+    $prev.Done = $false
+    $script:reasonNode = $null
+    $script:toolGroup = $null
+    Update-StepHead $prev
+    return $prev
+  }
+
+  $card = New-Object System.Windows.Controls.Border
+  $card.Background = (Brush '#20242E')
+  $card.BorderBrush = (Brush '#08FFFFFF')
+  $card.BorderThickness = '1'
+  $card.CornerRadius = '14'
+  $card.Padding = '0'
+  $card.Margin = '0,0,0,6'
+  $card.HorizontalAlignment = 'Stretch'
+  $card.Tag = 'step'
+  $tp.Body.Children.Add($card) | Out-Null
+
+  $sp = New-Object System.Windows.Controls.StackPanel
+  $sp.Tag = 'stepstack'
+
+  # 卡头：一整块可点。左边步骤号，中间这一条的结论摘要（没有结论时先说「正在做…」），
+  # 右边这一步的调用次数和思考耗时。
+  $head = New-Object System.Windows.Controls.Button
+  $head.Background = [System.Windows.Media.Brushes]::Transparent
+  $head.BorderThickness = '0'
+  $head.Padding = '9,5'
+  $head.Cursor = 'Hand'
+  $head.HorizontalContentAlignment = 'Stretch'
+  $head.Template = (New-FlatTemplate)
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($head, 'StepHead')
+  $head.ToolTip = '点一下展开 / 收起这一段的思考过程和工具调用'
+
+  $dp = New-Object System.Windows.Controls.DockPanel
+  # 右边：这一步调了几次、想了多久（都很轻，最后才亮）
+  $meta = New-Text '' 10 '#5B626D' 'Normal' 'Cascadia Mono, Consolas' 0
+  $meta.VerticalAlignment = 'Center'
+  [System.Windows.Controls.DockPanel]::SetDock($meta, 'Right')
+  $dp.Children.Add($meta) | Out-Null
+
+  $no = New-Text '' 10.5 '#6B7280' 'SemiBold' 'Cascadia Mono, Consolas' 0
+  $no.VerticalAlignment = 'Center'
+  $no.Margin = '0,0,7,0'
+  [System.Windows.Controls.DockPanel]::SetDock($no, 'Left')
+  $dp.Children.Add($no) | Out-Null
+
+  $title = New-Text $(if ($finished) { '▸  已完成' } else { '▸  正在做…' }) 11.5 $(if ($finished) { '#9BA3B4' } else { '#C7CBD2' }) 'SemiBold' 'Segoe UI' 0
+  $title.VerticalAlignment = 'Center'
+  $title.TextTrimming = 'CharacterEllipsis'
+  $title.TextWrapping = 'NoWrap'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($title, 'StepTitle')
+  $dp.Children.Add($title) | Out-Null
+  $head.Content = $dp
+  $sp.Children.Add($head) | Out-Null
+
+  # 卡身：这一步的思考 / 工具 / 结论都落在这里，收起时整块不占地方
+  $body = New-Object System.Windows.Controls.StackPanel
+  $body.Margin = '9,0,9,7'
+  $sp.Children.Add($body) | Out-Null
+
+  $card.Child = $sp
+
+  # 卡身里的三段固定区域：思考在上、工具居中、结论在下。
+  # 这样展开一张卡永远是「怎么想的 → 做了什么 → 得到什么」，跟事件到达顺序无关。
+  $thinkHost = New-Object System.Windows.Controls.StackPanel
+  $body.Children.Add($thinkHost) | Out-Null
+  $toolHost = New-Object System.Windows.Controls.StackPanel
+  $body.Children.Add($toolHost) | Out-Null
+  $textHost = New-Object System.Windows.Controls.StackPanel
+  $body.Children.Add($textHost) | Out-Null
+
+  $node = New-Object PSObject -Property @{
+    Card = $card; Head = $head; Body = $body; Title = $title; No = $no; Meta = $meta
+    ThinkHost = $thinkHost; ToolHost = $toolHost; TextHost = $textHost
+    # 历史里的步骤卡一建出来就是 Done：不会再显示「正在做…」
+    Open = $true; Done = $finished
+    Tools = 0; ReasonSecs = 0.0; Snip = ''
+    # 历史回放出来的步骤卡：卡头不显示「思考 Ns」这种读秒。
+    # 不能用 $finished 判断——建卡那一刻轮卡还是 Live（Set-TurnHistorical 之后才翻），
+    # 回放期间 renderEventIndex 才是准的信号；实时跑出来的卡照旧带读秒。
+    Historical = [bool]$finished -or ($null -ne $script:renderEventIndex -and $script:renderEventIndex -ge 0)
+  }
+  $head.Tag = $node
+  $head.Add_Click({ param($s, $e) Toggle-StepBlock $s.Tag })
+
+  $script:stepBox = $body
+  $script:stepNode = $node
+  # 卡上挂回自己的节点：回放时要按卡片父级从 Body 里收集步卡（Border 是 .NET 对象，直接 $card.NodeRef = ... 会报「找不到属性」，得走 Add-Member）
+  $card | Add-Member -NotePropertyName NodeRef -NotePropertyValue $node -Force
+  # 记进这一轮的名册：展开轮卡时要按这份名册把各步收起来
+  if ($tp.StepNodes -and -not $tp.StepNodes.Contains($node)) { $tp.StepNodes.Add($node) | Out-Null }
+  $tp.LastStep = $node
+  $tp.Steps = [int]$tp.Steps + 1
+  $node.No.Text = '第 ' + $tp.Steps + ' 步'
+  Update-StepHead $node
+  # 步骤卡一律默认收起，只留卡头一行：还在跑的时候这一行会不停刷最新思考 / 工具（见
+  # Step-ReasonTyping），看得出在处理；想看过程自己点开。历史回放同理，轮卡展开先看到
+  # 「第 1 步… 第 2 步…」这样一行一条的目录。
+  $node.Open = $false
+  $body.Visibility = 'Collapsed'
+  # 思考和工具组都按步新建：下一段思考、下一次调用落进新块
+  $script:toolGroup = $null
+  $script:reasonNode = $null
+  $tp.Thought = $null
+  # 轮头那行「N 步」按实际开了几块算：host 的 step 编号含收尾步，跟块数对不上
+  Update-TurnProc $tp
+  return $node
+}
+
+# 刷新步骤卡头：箭头 + 结论摘要（没结论时按阶段说在做什么）+ 这一步的规模。
+# 摘要取「这一步的结论」第一行；还在跑的时候取最新那段思考的开头。
+function Update-StepHead($n) {
+  if (-not $n) { return }
+  $arrow = $(if ($n.Open) { '▾' } else { '▸' })
+  $snip = [string]$n.Snip
+  if (-not $snip) {
+    if ($n.Done) { $snip = '（这一步没有结论）' }
+    # 还在跑：这行一直刷「最新在干什么」（思考尾巴 / 当前工具），收起态靠它看动静
+    else { $snip = (Get-LiveHintText) }
+  }
+  $max = Get-RowChars 330 6.6
+  if ($snip.Length -gt $max) { $snip = $snip.Substring(0, $max) + '…' }
+  $n.Title.Text = "$arrow  $snip"
+  $n.Title.Foreground = $(if ($n.Done) { Brush '#9BA3B4' } else { Brush '#C7CBD2' })
+  $parts = @()
+  if ([int]$n.Tools -gt 0) { $parts += ("$($n.Tools) 次调用") }
+  # 思考耗时只对「正在跑的那一轮」有意义：历史回放里它是个定局数字，
+  # 摆出来就像还在读秒，所以历史步骤卡不显示。
+  if (-not $n.Historical -and [double]$n.ReasonSecs -gt 0.05) { $parts += ('思考 ' + (Format-ReasonSecs $n.ReasonSecs)) }
+  $n.Meta.Text = ($parts -join ' · ')
+}
+
+# 这一步的结论出来了：卡头换成它的第一句正文（收起态看这一句就够了）
+# 标题行（## 结论 之类）本身不说明信息，去掉标记后太短就往下找一句完整的
+function Set-StepConclusion($n, [string]$text) {
+  if (-not $n) { return }
+  $pick = $null
+  foreach ($raw in (([string]$text) -split "`r?`n")) {
+    if (-not $raw.Trim()) { continue }
+    # 去掉标题/列表/引用标记和行内代码反引号，留下能读的字
+    $line = ($raw -replace '^\s*[#>\-*\+\d\.\s]+', '').Replace('`', '').Trim()
+    if (-not $line) { continue }
+    # 代码块围栏行直接跳过
+    if ($raw.Trim() -match '^(```|~~~)') { continue }
+    if ($line.Length -ge 8) { $pick = $line; break }
+    if (-not $pick) { $pick = $line }
+  }
+  if (-not $pick) { return }
+  $n.Snip = $pick
+  $n.Done = $true
+  Update-StepHead $n
+}
+
+# 把「没有结论」的步骤并进它后面第一张有结论的卡里（整轮画完后扫一遍）。
+# 判据看「卡里有没有正文」（Tag='assistant' 的正文块），不看 Snip：
+# 回放里 Snip 可能还没回填，真正能说明这步有没有结论的是它的正文。
+# 没有后继卡的（末尾那几张）就保留——它们至少还挂着工具行。
+function Merge-EmptySteps($t) {
+  if (-not $t) { return }
+  # 只处理还挂在这一轮里的步骤卡（已经被并掉的要从名册里认出来跳过）
+  $nodes = @()
+  foreach ($n in @($t.StepNodes)) {
+    if ($n -and $n.Card -and $n.Card.Parent -eq $t.Body) { $nodes += $n }
+  }
+  # 名册可能挂在先前那个轮卡对象上（回放中轮卡会被替换），那就按卡片父级从 Body 直接收集
+  if ($nodes.Count -lt 2 -and $t.Body) {
+    $nodes = @()
+    foreach ($c in @($t.Body.Children)) {
+      if ($c.Tag -eq 'step' -and $c.NodeRef) { $nodes += $c.NodeRef }
+    }
+  }
+  if ($nodes.Count -lt 2) { return }
+
+  $dropped = @()
+  for ($i = $nodes.Count - 2; $i -ge 0; $i--) {
+    $node = $nodes[$i]
+    if (Test-StepHasText $node) { continue }
+    $host = $null
+    for ($j = $i + 1; $j -lt $nodes.Count; $j++) {
+      if ($dropped -contains $nodes[$j]) { continue }
+      if (Test-StepHasText $nodes[$j]) { $host = $nodes[$j]; break }
+    }
+    if (-not $host) { continue }
+    Move-StepContent $node $host
+    $t.Body.Children.Remove($node.Card) | Out-Null
+    $dropped += $node
+  }
+  foreach ($node in $dropped) {
+    [void]$t.StepNodes.Remove($node)
+  }
+
+  # 并完之后重排卡头编号，别留下「第 3 步、第 5 步」这种断号
+  $no = 0
+  foreach ($node in @($t.StepNodes)) {
+    if (-not $node -or $node.Card.Parent -ne $t.Body) { continue }
+    $no++
+    if ($node.No) { $node.No.Text = "第 $no 步" }
+  }
+}
+
+# 这一步有没有结论：正文里得有真正的文字。
+# 只看 TextHost.Children.Count 不行——正文容器往往是空的也先建好了，
+# 那样每张卡都会被判成「有结论」，合并一次也不会触发。
+function Test-StepHasText($node) {
+  if (-not $node) { return $false }
+  if ($node.Snip -and ([string]$node.Snip).Trim()) { return $true }
+  if (-not $node.TextHost) { return $false }
+  foreach ($k in @($node.TextHost.Children)) {
+    $txt = ''
+    if ($k -is [System.Windows.Controls.TextBlock]) { $txt = $k.Text }
+    elseif ($k.Text) { $txt = $k.Text }
+    if (-not $txt -and $k.Inlines -and $k.Inlines.Count -gt 0) {
+      foreach ($il in $k.Inlines) { if ($il.Text) { $txt += $il.Text } }
+    }
+    if ($txt -and $txt.Trim()) { return $true }
+  }
+  return $false
+}
+
+# 把一张步骤卡的思考区 / 工具区整体搬到另一张卡上（结论区不搬）
+function Move-StepContent($from, $to) {
+  if (-not $from -or -not $to) { return }
+  foreach ($pair in @(
+      @($from.ThinkHost, $to.ThinkHost),
+      @($from.ToolHost, $to.ToolHost))) {
+    $src = $pair[0]; $dst = $pair[1]
+    if (-not $src -or -not $dst) { continue }
+    foreach ($k in @($src.Children)) {
+      $src.Children.Remove($k) | Out-Null
+      $dst.Children.Insert(0, $k) | Out-Null
+    }
+  }
+  # 原来的结论区（空的正文层）整块丢掉：留着就是一个孤零零的空白行，
+  # 界面上看起来像有个 ×/空框挂在卡中间
+  if ($from.TextHost) { $from.TextHost.Children.Clear() }
+  $to.Tools += $from.Tools
+  # 思考时间也带上，卡头「思考 Xs」才不是白丢
+  $to.ReasonSecs += $from.ReasonSecs
+  Update-StepHead $to
+}
+
+# 点步骤卡头：展开 / 收起这一步的思考与工具
+function Toggle-StepBlock($n) {
+  if (-not $n) { return }
+  $n.Open = -not $n.Open
+  $n.Body.Visibility = $(if ($n.Open) { 'Visible' } else { 'Collapsed' })
+  Update-StepHead $n
+}
+
+# 一轮收尾：算出总耗时，状态行定格「已完成 1:30」，绿点熄掉，
+# 并把最后一步整组（思考 + 工具 + 结论）搬到 Final 区——折叠轮头收的是前面的过程，
+# 最后一步的结论要一直看得见，而且它跟自己那几步的思考、调用仍然是一组。
+# 历史回放（Replay）额外做一件事：整轮过程默认收起，打开旧会话先看到结论。
+function Close-TurnProc {
+  $t = $script:turnProc
+  if (-not $t) { return }
+  # 注意：这里不能因为 $t.Done 就早退。历史回放的每一步卡建出来就标了 Done
+  # （那表示「这一步已经画完，可以往里填最后一次正文」），轮卡自己在回放时也被
+  # Set-TurnHistorical 打过 Replay 标记；早退会让下面的合卡、搬结论整段都不执行。
+  if ($t.Closed) { return }
+  $t.Closed = $true
+  $t.Done = $true
+  # 历史回放没有墙钟可用（拉起来才几十毫秒），按事件时间戳之差算这一轮的真实耗时
+  if ($t.Ms -le 0 -and $t.At0 -gt 0 -and $t.AtLast -ge $t.At0) { $t.Ms = [int]($t.AtLast - $t.At0) }
+  if ($t.Ms -le 0) { $t.Ms = [int]((Get-Date) - $t.T0).TotalMilliseconds }
+  # 这一轮的思考条和工具卡都留在原地（点开还能看），下一轮重新建
+  if ($t.Thought -and -not $t.Thought.Done) { Complete-Reasoning }
+  # 最后一段结论从过程区搬到 Final：中间各步的结论留在过程里，跟着轮头一起收。
+  # 从后往前找第一张带结论的步骤卡（历史回放里最后一「步」可能只有工具、没有正文），
+  # 搬的是整张卡——它的思考区和工具区跟着走，展开仍能看到「怎么想到这个结论的」。
+  if ($t.Body -and $t.Final) {
+    # 兜底：正文直接挂在过程区上（没有步骤卡），先把它挑出来
+    foreach ($k in @($t.Body.Children)) {
+      if ($k.Tag -eq 'assistant') {
+        $t.Body.Children.Remove($k) | Out-Null
+        $t.Final.Children.Add($k) | Out-Null
+      }
+    }
+    # 最后一段结论：从后往前找第一张带正文的步骤卡，把它的正文块搬到 Final，
+    # 卡片本身（思考 + 调用）留在过程区。
+    # 早先写的是「把整张卡搬过去」，可正文在卡身第三层（TextHost）里，只往下扫两层
+    # 一次也扫不到——这条搬运其实从来没生效过，结论就一直跟着步骤卡被折起来，
+    # 得点开最后一步才看得见。
+    # 就算扫到了也不该搬整张卡：卡头能折叠，点轮头展开时还会把各步卡收成一行。
+    $cards = @($t.Body.Children)
+    for ($i = $cards.Count - 1; $i -ge 0; $i--) {
+      $card = $cards[$i]
+      if (-not $card.PSObject.Properties['NodeRef']) { continue }
+      $sn = $card.NodeRef
+      if (-not $sn -or -not $sn.TextHost) { continue }
+      $moved = $false
+      foreach ($k in @($sn.TextHost.Children)) {
+        if ($k.Tag -eq 'assistant') {
+          $sn.TextHost.Children.Remove($k) | Out-Null
+          $t.Final.Children.Add($k) | Out-Null
+          $moved = $true
+        }
+      }
+      if ($moved) { break }
+    }
+  }
+  # 收尾补救：把「没有结论」的步骤并进它后面第一张有结论的卡。
+  # 逐条事件合并（New-StepBlock 里那次）挡不住全部情况——历史回放里一条 assistant/message
+  # 可能是空的，卡建出来时就已经 Done、正文又是空的，等下一段正文到达时早就另起了新卡。
+  # 所以在整轮画完之后按顺序再扫一遍：卡里没正文的，把内容整体搬到下一张有正文的卡上。
+  Merge-EmptySteps $t
+  # 历史回放（切到旧会话也是这条路）：这一轮的过程默认整块收起，
+  # 只留轮头两行和最后的结论——打开旧会话先看到结论，不用先翻一屏思考链和工具卡；
+  # 想看过程点轮头就放回来（Body 里的思考条 / 工具卡本身仍是各自的收起态）。
+  if ($t.Replay -and $t.Open) {
+    $t.Open = $false
+    if ($t.Body) { $t.Body.Visibility = 'Collapsed' }
+  }
+  $script:reasonNode = $null
+  $script:toolGroup = $null
+  $script:stepNode = $null
+  Update-TurnProc $t
+  $script:turnProc = $null
+  $script:stepBox = $null
+  # 这一轮定格了：底部胶囊跟着收起来（常驻模式下它也挂在消息流最下面）
+  Update-BottomPill
+}
+
+# ---------------------------------------------------------------- 工具调用分组
+# 一整轮的所有工具调用收成同一个可折叠的块，收起时就是一行
+# 「▸  12 次工具调用 · 共 8.4s            fs.read ×3 · fs.edit ×2」，点一下展开看每一行。
+# 早先是「每次思考后各起一块」，十步的一轮就是十块工具组往下平铺；现在整轮共用一块，
+# 中间夹进来的思考块只把块往上挤，Add-ToolLine 会把它挪回末尾。
+$script:toolGroup = $null
+
+# 工具耗时合计：不足一秒报毫秒，一分钟内报一位小数秒（「共 8.4s」比「8 秒」信息多）
+function Format-ToolSecs([double]$ms) {
+  if ($ms -lt 1) { return '<1ms' }
+  if ($ms -lt 1000) { return ([string][int][math]::Round($ms)) + 'ms' }
+  $s = $ms / 1000.0
+  if ($s -lt 60) { return ([string][math]::Round($s, 1)) + 's' }
+  return (Format-Elapsed $s)
+}
+
+function Update-ToolGroup($g) {
+  if (-not $g) { return }
+  $arrow = $(if ($g.Open) { '▾' } else { '▸' })
+  # 左侧固定成「N 次工具调用 · 共 8.4s」：合计只算已经回来的调用，
+  # 还在跑的那件由右边的红字和底部胶囊报，这串数字才不会每 100ms 自己往上跳
+  $done = $g.Count - $g.Running
+  $total = $(if ($done -gt 0) { ' · 共 ' + (Format-ToolSecs $g.TotalMs) } else { '' })
+  # 一整组只有一次调用时不套这层壳：卡头会写「read」、里面再一行 read，等于同一件事写两遍。
+  # 把壳去掉、行直接露出来（行本身可点，展开就是这次调用的入参和结果），
+  # 轮廓 / 背景 / 边距一起收，看起来就是普通的一行工具调用。
+  $wasSingle = [bool]$g.Single
+  $g.Single = ($g.Count -le 1)
+  if ($g.Single) {
+    # 整行组头都收起来（连右侧计数一起）：这一行现在只留下面那条工具行本身
+    if ($g.HeadBtn) { $g.HeadBtn.Visibility = 'Collapsed' }
+    $g.Head.Visibility = 'Collapsed'
+    $g.Items.Visibility = 'Visible'
+    $g.Items.Margin = '0'
+    $g.Border.Background = [System.Windows.Media.Brushes]::Transparent
+    $g.Border.BorderThickness = '0'
+    $g.Border.Padding = '0'
+    $g.Border.Margin = '0'
+  } else {
+    # 同一步里又来了第二件工具：壳重新出现，并且直接展开（否则新行会被折起来看不见）
+    if ($wasSingle) { $g.Open = $true }
+    # 壳重新出现：整行组头和标题都放回来
+    if ($g.HeadBtn) { $g.HeadBtn.Visibility = 'Visible' }
+    $g.Head.Visibility = 'Visible'
+    $g.Items.Visibility = $(if ($g.Open) { 'Visible' } else { 'Collapsed' })
+    $g.Items.Margin = '8,0,8,7'
+    $g.Border.Background = (Brush '#0E1116')
+    $g.Border.BorderThickness = '1'
+    $g.Border.Margin = '0,0,0,6'
+  }
+  if ($g.Count -eq 1 -and $g.Order.Count -eq 1) {
+    $g.Head.Text = "$arrow  $($g.Order[0])"
+  } else {
+    $g.Head.Text = "$arrow  $($g.Count) 次工具调用$total"
+  }
+  # 右侧：有调用在跑就先亮红字「运行中... · 」，后面才是各工具计数
+  if ($g.Running -gt 0) {
+    $g.Run.Text = '运行中... · '
+    $g.Run.Visibility = 'Visible'
+  } else {
+    $g.Run.Visibility = 'Collapsed'
+  }
+  $parts = @()
+  foreach ($k in $g.Order) { $parts += ("$k ×" + $g.Counts[$k]) }
+  $sum = ($parts -join ' · ')
+  if ($g.Failed -gt 0) { $sum = $(if ($sum) { "$sum · $($g.Failed) 失败" } else { "$($g.Failed) 失败" }) }
+  # 窄窗口下别铺出去：右侧统计按实际宽度截（左边标题占 200 出头）
+  $maxChars = Get-RowChars 210 6.6
+  if ($sum.Length -gt $maxChars) { $sum = $sum.Substring(0, $maxChars) + '…' }
+  $g.Sum.Text = $sum
+  $g.Sum.Foreground = $(if ($g.Failed -gt 0) { Brush '#F87171' } else { Brush '#6B7280' })
+}
+
+function New-ToolGroupAt([object]$where = $null) {
+  $outer = New-Object System.Windows.Controls.Border
+  $outer.Background = (Brush '#191C24')
+  $outer.BorderBrush = (Brush '#0BFFFFFF')
+  $outer.BorderThickness = '1'
+  $outer.CornerRadius = '16'
+  $outer.Margin = '0,0,0,6'
+  $outer.HorizontalAlignment = 'Stretch'
+
+  $sp = New-Object System.Windows.Controls.StackPanel
+
+  $head = New-Object System.Windows.Controls.Button
+  $head.Background = [System.Windows.Media.Brushes]::Transparent
+  $head.BorderThickness = '0'
+  $head.Padding = '10,7'
+  $head.Cursor = 'Hand'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($head, 'ToolGroupHead')
+  $head.HorizontalContentAlignment = 'Stretch'
+  $head.Template = (New-FlatTemplate)
+  $dp = New-Object System.Windows.Controls.DockPanel
+  # 右边两块：DockPanel 从右往左排，所以先加计数（最右），再加红字前缀（在它左边）
+  $sum = New-Text '' 10.5 '#6B7280' 'Normal' 'Cascadia Mono, Consolas' 0
+  $sum.VerticalAlignment = 'Center'
+  $sum.TextTrimming = 'CharacterEllipsis'
+  $sum.TextWrapping = 'NoWrap'
+  [System.Windows.Controls.DockPanel]::SetDock($sum, 'Right')
+  $dp.Children.Add($sum) | Out-Null
+  $run = New-Text '运行中... · ' 10.5 '#F87171' 'SemiBold' 'Cascadia Mono, Consolas' 0
+  $run.VerticalAlignment = 'Center'
+  $run.TextWrapping = 'NoWrap'
+  $run.Visibility = 'Collapsed'
+  [System.Windows.Controls.DockPanel]::SetDock($run, 'Right')
+  $dp.Children.Add($run) | Out-Null
+  $title = New-Text '▸  0 次工具调用' 11.5 '#C7CBD2' 'SemiBold' 'Segoe UI' 0
+  $title.VerticalAlignment = 'Center'
+  [System.Windows.Controls.DockPanel]::SetDock($title, 'Left')
+  $dp.Children.Add($title) | Out-Null
+  $head.Content = $dp
+  $sp.Children.Add($head) | Out-Null
+
+  $items = New-Object System.Windows.Controls.StackPanel
+  $items.Margin = '8,0,8,8'
+  $items.Visibility = 'Collapsed'
+  $sp.Children.Add($items) | Out-Null
+
+  $outer.Child = $sp
+  $box = $(if ($where) { $where } else { (Get-ProcPanel 'tool') })
+  $box.Children.Add($outer) | Out-Null
+
+  $g = New-Object PSObject -Property @{
+    # Head 是组头左边那串标题文字，HeadBtn 是整行按钮——单工具时得把整行收掉：
+    # 只藏标题的话，按钮自己的内边距和右边的「read ×1」还会占出一条空白行
+    Head = $title; HeadBtn = $head; Sum = $sum; Run = $run; Items = $items; Border = $outer
+    Count = 0; Counts = @{}; Order = (New-Object System.Collections.ArrayList)
+    Running = 0; Failed = 0; Open = $false; TotalMs = 0; Single = $false
+  }
+  # 同样拿 Tag 传节点：事件里直接引用 $g 会拿到 null
+  $head.Tag = $g
+  $head.Add_Click({ param($s, $e) Toggle-ToolGroup $s.Tag })
+  return $g
+}
+
+# 兼容旧调用：不给落点就是整轮那张（过程区 tools 段）
+function New-ToolGroup {
+  return (New-ToolGroupAt $null)
+}
+
+function Toggle-ToolGroup($g) {
+  if (-not $g) { return }
+  $g.Open = -not $g.Open
+  $g.Items.Visibility = $(if ($g.Open) { 'Visible' } else { 'Collapsed' })
+  Update-ToolGroup $g
+}
+
+# 拿「当前这一组」：一整轮只在第一件工具调用时建一块，之后所有调用都往这一块里加
+function Get-ToolGroup {
+  if ($script:toolGroup) { return $script:toolGroup }
+  $script:toolGroup = New-ToolGroup
+  return $script:toolGroup
+}
+
+# 切阶段（出正文 / 验证 / 审批…）只是把汇总行刷新一遍，块本身留着继续累加；
+# 早先这里是清空重建，一轮十步就变成十块往下平铺
+function Close-ToolGroup {
+  if ($script:toolGroup) { Update-ToolGroup $script:toolGroup }
+}
+
+# 新的一轮开始：上一轮那块到此为止
+function Reset-ToolGroup {
+  Close-ToolGroup
+  $script:toolGroup = $null
+  $script:stepBox = $null
+  $script:stepNode = $null
+}
+
+# ---------------------------------------------------------------- 底部实时状态胶囊
+# 消息流最下面那颗「✦ 执行 shell · 用时 27分37秒…」：现在还在跑的那件活儿。
+# 只要还有调用没回来就贴着最底部（有新内容追加就把它挪回来），全回来就撤掉。
+$script:bottomPill = $null
+$script:liveCalls = @{}
+$script:liveSeq = 0
+
+# 一行能放多少字：按聊天区实际宽度估（中英混排约 7px 一个字），
+# 留给左边标题/箭头多少由调用方给。窄窗口下摘要和工具统计靠它截断，
+# 不然 TextBlock 会按内容宽度钺出去，被 ScrollViewer 硬裁掉（连省略号都没）。
+function Get-RowChars([double]$reservePx = 200, [double]$perChar = 7) {
+  $w = 0
+  if ($Scroller) { $w = $Scroller.ActualWidth }
+  if ($w -le 0) { $w = 900 }
+  return [int][math]::Max(16, [math]::Floor(($w - $reservePx) / $perChar))
+}
+
+
+# 工具开始跑：登记一条（并行时胶囊报跑得最久的那件）
+function Set-LiveCall([string]$id, [string]$name) {
+  $script:liveSeq = [int]$script:liveSeq + 1
+  $script:liveCalls[$id] = @{ Name = $name; T0 = (Get-Date); Seq = $script:liveSeq }
+  Update-BottomPill
+}
+
+# 工具回来了：摘掉一条；没有在跑的就把胶囊收起来
+function Clear-LiveCall([string]$id) {
+  if ($script:liveCalls.ContainsKey($id)) { $script:liveCalls.Remove($id) }
+  Update-BottomPill
+}
+
+function Reset-LiveCalls {
+  $script:liveCalls = @{}
+  Update-BottomPill
+}
+
+
+function Update-BottomPill {
+  # 同一个状态只留一处：输入框上方那行（Update-ThinkRow）已经在报「思考中 / 执行 xxx · 用时 …」，
+  # 消息流最下面再挂一颗胶囊就是把同一句话画两遍，这里只把已经建过的胶囊收起来，不再新建。
+  if ($script:bottomPill) { $script:bottomPill.Border.Visibility = 'Collapsed' }
+}
+
+function Add-ToolLine([string]$name, [string]$summary, [string]$argsText = '') {
+  $g = Get-ToolGroup
+  # 同一步里的调用都落进这张步骤卡的工具区；块本身的位置不再靠挪动，
+  # 区域容器已经固定成「思考 → 工具 → 结论」的顺序
+  $st = Add-ToolRow $name $summary $argsText $g.Items
+  $g.Count++
+  # 步骤卡头：这一步调了几次
+  $sn = $script:stepNode
+  if ($sn) {
+    $sn.Tools = [int]$sn.Tools + 1
+    Update-StepHead $sn
+  }
+  # 轮头汇总：这一轮一共调了几次、各调了几次（耗时等结果回来后补）
+  $tp = $script:turnProc
+  if ($tp -and -not $tp.Done) {
+    $tp.Tools = [int]$tp.Tools + 1
+    if (-not $tp.Counts.ContainsKey($name)) {
+      $tp.Counts[$name] = 0
+      [void]$tp.Order.Add($name)
+    }
+    $tp.Counts[$name] = [int]$tp.Counts[$name] + 1
+    Update-TurnProc $tp
+  }
+  if (-not $g.Counts.ContainsKey($name)) {
+    $g.Counts[$name] = 0
+    [void]$g.Order.Add($name)
+  }
+  $g.Counts[$name] = $g.Counts[$name] + 1
+  $g.Running++
+  # 组引挂在行上：组关闭后回来的结果也能把计数器减回去
+  $st.Group = $g
+  Update-ToolGroup $g
+  return $st
+}
+
+function Set-ToolLineDone([string]$id, [string]$text, [bool]$ok, [int]$ms = 0, [string]$preview = '') {
+  $row = $script:toolRows[$id]
+  if (-not $row) { return }
+  # 行首图标三态：运行中转圈 → 成功绿勾 / 失败红叉；右边报这次耗时
+  $row.State = $(if ($ok) { 'done' } else { 'failed' })
+  $row.Icon.Text = $(if ($ok) { '✔' } else { '✖' })
+  $row.Icon.Foreground = $(if ($ok) { Brush '#4ADE80' } else { Brush '#F87171' })
+  $row.Status.Text = $(if ($ms -gt 0) { Format-ToolSecs ([double]$ms) } else { '' })
+  $row.Status.Foreground = $(if ($ok) { Brush '#5B626D' } else { Brush '#F87171' })
+  # 展开区里的结果：有就给一段开头，没有就说明一下
+  if ($preview) { $row.ResTb.Text = $preview }
+  elseif (-not $ok) { $row.ResTb.Text = '(失败，没有输出)' }
+  else { $row.ResTb.Text = '(没有输出)' }
+  $row.ResTb.Foreground = $(if ($ok) { Brush '#C7CBD2' } else { Brush '#F0A0A0' })
+  if ($row.Box) { $row.Box.text = $row.Box.text + " -> $text" }
+  $g = $row.Group
+  if (-not $g) { return }
+  $g.Running = [math]::Max(0, $g.Running - 1)
+  if (-not $ok) { $g.Failed++ }
+  if ($ms -gt 0) { $g.TotalMs = $g.TotalMs + $ms }
+  Update-ToolGroup $g
+  # 轮头汇总：这次耗时分到这一轮头上，失败的记一笔
+  $tp = $script:turnProc
+  if ($tp -and -not $tp.Done) {
+    if ($ms -gt 0) { $tp.ToolMs = [double]$tp.ToolMs + [double]$ms }
+    if (-not $ok) { $tp.Failed = [int]$tp.Failed + 1 }
+    Update-TurnProc $tp
+  }
+}
+
+# ---------------------------------------------------------------- 思考链
+# Kite 那样的样式：收起时就是一行「⋯ 思考了4s  <开头一句>            ▸」，
+# 点一下展开看全文。流式时展开，出正文 / 调工具后自动收起。
+$script:reasonNode = $null
+# 逐字泵的目标节点：与 reasonNode 分开，布局逻辑置空 reasonNode 时泵照旧往原节点吐字
+$script:pumpTarget = $null
+# 思考流式的待吐队列：模型一次给一大段（或一帧里攒了好几条 delta）时先存这里，按帧追上去
+$script:reasonQueue = New-Object System.Text.StringBuilder
+$script:reasonTypingTimer = $null
+$script:reasonTypingTick = 0
+
+# 收起时的标题直接报耗时：「思考了4s」。
+# 不足一秒也写 1s（写 0s 像是没想过）；超过一分钟改用「1分30秒」，几秒的数字太长了
+function Format-ReasonSecs([double]$secs) {
+  $s = [int][math]::Round($secs)
+  if ($s -lt 1) { $s = 1 }
+  if ($s -lt 60) { return "${s}s" }
+  return (Format-Elapsed $secs)
+}
+
+# 这条思考的完整文本（实时和回放都直接在 TextBlock 里，没有挂起态）
+# 超长思考的 Body 里只放了前一段，复制/日志要用 FullText 才不丢字
+function Get-ReasonFullText($n) {
+  if (-not $n) { return '' }
+  if ($n.PSObject.Properties['FullText'] -and $n.FullText) { return [string]$n.FullText }
+  return [string]$n.Body.Text
+}
+
+# 这一段思考的纯文本（整轮只有一张条，只取当前这一段）
+function Get-ReasonSegText($n) {
+  $t = Get-ReasonFullText $n
+  $seg = $t
+  if ($n.SegStart -gt 0 -and $n.SegStart -lt $t.Length) { $seg = $t.Substring($n.SegStart) }
+  return ($seg -replace "\s+", ' ').Trim()
+}
+
+function Update-ReasoningHeader($n) {
+  if (-not $n) { return }
+  if ($n.Done) {
+    # 秒数收进 tooltip，标题只留「思考」两个字（跟设计稿一致）
+    $n.Title.Text = '思考'
+    $n.Title.Foreground = (Brush '#9BA3B4')
+    if ($n.Head) { $n.Head.ToolTip = '思考了 ' + (Format-ReasonSecs $n.Secs) + '，点一下展开全文' }
+  } else {
+    $n.Title.Text = '思考中…'
+    $n.Title.Foreground = (Brush '#C7CBD2')
+  }
+  # 右边这一格只留展开/收起箭头：耗时已经进状态行和 tooltip 了
+  $n.Time.Text = $(if ($n.Open) { '▾' } else { '▸' })
+  # 收起时右边只挂一行摘要：想完了取这一段的开头，还在想就取最新那一小段（单行、超长截断）
+  $s = Get-ReasonSegText $n
+  # 截多少字看窗口实际宽度（窄窗口下 110 字会铺到窗口外被硬裁）
+  $maxChars = Get-RowChars 230 7
+  if ($s.Length -gt $maxChars) {
+    if ($n.Done) { $s = $s.Substring(0, $maxChars) + '…' } else { $s = '…' + $s.Substring($s.Length - $maxChars) }
+  }
+  $n.Sum.Text = $s
+  $n.Sum.Visibility = $(if ($n.Open) { 'Collapsed' } else { 'Visible' })
+  $n.Body.Visibility = $(if ($n.Open) { 'Visible' } else { 'Collapsed' })
+  # 「继续展开全文」那一行跟着正文一起收放：收起态只留标题和摘要
+  if ($n.PSObject.Properties['ChainHost'] -and $n.ChainHost) {
+    $n.ChainHost.Visibility = $(if ($n.Open) { 'Visible' } else { 'Collapsed' })
+  }
+}
+
+# 读秒时每 0.25s 都要刷一次头部：只动时间那一格，
+# 不重算摘要（正文一直在长，每 250ms 压一遍整个思考链太浪费）
+function Update-ReasoningTime($n) {
+  if (-not $n -or $n.Done) { return }
+  # 秒数已经不上屏了（耗时在状态行和 tooltip），这里只把时长记准确
+  $n.Secs = ((Get-Date) - $n.T0).TotalSeconds
+}
+
+# 思考条正文很长时（历史回放里几万字也常见）：收起时反正不占地方，所以从一开始就整段写好，
+# 点「展开」当场看到全文，不会再有一次「内容才一段段长出来」的加载动作。
+# 只有长到雷达不动的（两万字以上）才分两截，先在正文里放前一段 + 一行「展开全文」。
+$script:reasonLongChars = 20000
+function Add-ReasonChainMore($n) {
+  $b = New-Object System.Windows.Controls.Button
+  $b.Content = '… 继续展开全文'
+  $b.HorizontalAlignment = 'Left'
+  $b.Height = 26
+  $b.Padding = '12,0'
+  $b.Margin = '0,4,0,0'
+  $b.FontSize = 11
+  $b.Cursor = 'Hand'
+  $b.Focusable = $false
+  $b.Background = (Brush '#12141A')
+  $b.Foreground = (Brush '#9BA3B4')
+  $b.BorderBrush = (Brush '#1FFFFFFF')
+  $b.BorderThickness = '1'
+  $b.Template = (New-FlatTemplate)
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($b, 'ReasonMore')
+  # PS 5.1 里闭包拿不到局部变量，靠 Tag 把要写的东西递过去
+  $b.Tag = $n
+  $b.Add_Click({
+    param($s, $e)
+    $node = $s.Tag
+    $s.Visibility = 'Collapsed'
+    $node.Body.Text = [string]$node.FullText
+    $node.RestShown = $true
+  })
+  $n.ChainHost.Children.Add($b) | Out-Null
+}
+
+function Set-ReasoningFull($n, [string]$text, [switch]$Append) {
+  if (-not $n) { return }
+  $full = $text
+  # 同一轮里第二段、第三段思考接着往后写（段间空一行），不是覆盖前面那段
+  if ($Append -and $n.FullText) { $full = [string]$n.FullText + "`r`n`r`n" + $text }
+  $n.FullText = $full
+  if ($full.Length -gt $script:reasonLongChars) {
+    $n.Body.Text = $full.Substring(0, $script:reasonLongChars)
+    $n.RestShown = $false
+    if ($n.ChainHost.Children.Count -eq 0) { Add-ReasonChainMore $n }
+  } else {
+    $n.Body.Text = $full
+    $n.RestShown = $true
+  }
+}
+
+function Toggle-Reasoning($n) {
+  if (-not $n) { return }
+  $n.Open = -not $n.Open
+  Update-ReasoningHeader $n
+}
+
+function Add-ReasoningBlock {
+  # 一整轮只有一张思考条：后面几段思考接着往同一张里写（段间空一行），
+  # 不会每想一段就多出一张卡往下平铺
+  $tp = Get-TurnProc
+  if ($tp.Thought) {
+    $n = $tp.Thought
+    $n.Done = $false
+    $n.Open = $false
+    $n.T0 = (Get-Date)
+    $n.Secs = 0
+    $n.PendingEnd = $false
+    if ($n.Body.Text) { $n.Body.Text = $n.Body.Text + "`r`n`r`n" }
+    # 段起点按整段全文长度算（超长思考的 Body 只放了前一段，用它的长度会把段起点算偏）；
+    # 实时流没维护 FullText，那时 Body.Text 就是全文，直接用它的长度
+    $n.SegStart = $(if ($n.FullText) { ([string]$n.FullText).Length + 4 } else { $n.Body.Text.Length })
+    if ($n.Caret) { $n.Caret.Visibility = 'Visible' }
+    $script:reasonNode = $n
+    # 泵自己的目标：布局逻辑（New-StepBlock / Close-TurnProc）会随时把 reasonNode 置空，
+    # 泵不能跟着丢目标，否则队列里还没吐完的字会被 Step-ReasonTyping 清掉
+    $script:pumpTarget = $n
+    Update-ReasoningHeader $n
+    return $n
+  }
+  $outer = New-Object System.Windows.Controls.Border
+  $outer.Background = (Brush '#191C24')
+  $outer.BorderBrush = (Brush '#0BFFFFFF')
+  $outer.BorderThickness = '1'
+  $outer.CornerRadius = '22'
+  $outer.Padding = '14,12'
+  $outer.Margin = '0,0,0,8'
+  $outer.HorizontalAlignment = 'Stretch'
+
+  $stack = New-Object System.Windows.Controls.StackPanel
+
+  $head = New-Object System.Windows.Controls.Button
+  $head.Background = [System.Windows.Media.Brushes]::Transparent
+  $head.BorderThickness = '0'
+  $head.Padding = '0'
+  $head.Cursor = 'Hand'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($head, 'ReasonHead')
+  $head.HorizontalContentAlignment = 'Stretch'
+  $head.Template = (New-FlatTemplate)
+  $head.ToolTip = '点一下收起 / 展开思考过程'
+  $dp = New-Object System.Windows.Controls.DockPanel
+  $time = New-Text '' 10.5 '#5B626D' 'Normal' 'Cascadia Mono, Consolas' 0
+  $time.VerticalAlignment = 'Center'
+  [System.Windows.Controls.DockPanel]::SetDock($time, 'Right')
+  $dp.Children.Add($time) | Out-Null
+  # 左侧图标：设计稿给的「两个圆角方交叉 + 中心一点」，画成矢量，不用字体符号
+  $iconHost = New-Object System.Windows.Controls.Viewbox
+  $iconHost.Width = 18
+  $iconHost.Height = 18
+  $iconHost.VerticalAlignment = 'Center'
+  $iconHost.Margin = '1,0,9,0'
+  $iconHost.Child = (New-ThinkIcon '#A8B0BE')
+  [System.Windows.Controls.DockPanel]::SetDock($iconHost, 'Left')
+  $dp.Children.Add($iconHost) | Out-Null
+  $title = New-Text '思考中…' 11.5 '#C7CBD2' 'SemiBold' 'Segoe UI' 0
+  $title.VerticalAlignment = 'Center'
+  $title.Margin = '0,0,10,0'
+  [System.Windows.Controls.DockPanel]::SetDock($title, 'Left')
+  $dp.Children.Add($title) | Out-Null
+  $sum = New-Text '' 11.5 '#6F7684' 'Normal' 'Segoe UI' 0
+  $sum.VerticalAlignment = 'Center'
+  $sum.TextTrimming = 'CharacterEllipsis'
+  $sum.TextWrapping = 'NoWrap'
+  $dp.Children.Add($sum) | Out-Null
+  $head.Content = $dp
+  $stack.Children.Add($head) | Out-Null
+
+  $body = New-Text '' 12 '#878F9C' 'Normal' 'Segoe UI' 0
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($body, 'ReasonBody')
+  $body.TextWrapping = 'Wrap'
+  $body.LineHeight = 19
+  $body.LineStackingStrategy = 'BlockLineHeight'
+  $body.Margin = '0,5,0,0'
+  # 正文太长时「继续展开全文」按钮挂在这个容器末尾（写在正文下面一行）
+  $chainHost = New-Object System.Windows.Controls.StackPanel
+  $chainHost.Margin = '0,0,0,0'
+  $stack.Children.Add($body) | Out-Null
+  $stack.Children.Add($chainHost) | Out-Null
+
+  # 流式时正文末尾那个一闪一闪的小光标（Kite 的思考就是边想边流出来的样子）
+  $caret = New-Object System.Windows.Controls.Border
+  $caret.Width = 2
+  $caret.Height = 12
+  $caret.CornerRadius = '1'
+  $caret.Background = (Brush '#8FA6FF')
+  $caret.HorizontalAlignment = 'Left'
+  $caret.Margin = '1,3,0,0'
+  $caret.Visibility = 'Collapsed'
+  $caretBlink = New-Object System.Windows.Media.Animation.DoubleAnimation
+  $caretBlink.From = 1.0
+  $caretBlink.To = 0.12
+  $caretBlink.Duration = [System.Windows.Duration]::new([TimeSpan]::FromMilliseconds(560))
+  $caretBlink.AutoReverse = $true
+  $caretBlink.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+  $caret.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $caretBlink)
+  $stack.Children.Add($caret) | Out-Null
+
+  $outer.Child = $stack
+  $box = @{ text = '' }
+  Set-CopyMenu $outer $box
+  (Get-ProcPanel 'reason').Children.Add($outer) | Out-Null
+
+  # 默认收起：标题一行「思考」+ 一行摘要，点开才铺全文
+  $node = New-Object PSObject -Property @{
+    Head = $head; Title = $title; Time = $time; Sum = $sum; Body = $body; Caret = $caret
+    ChainHost = $chainHost
+    Border = $outer; Box = $box
+    # FullText / RestShown：打开历史时整段思考已经写进 Body（超过 reasonLongChars 才先放一段）
+    # PendingEnd：「这段思考已经结束，但队列里的字还没吐完」——泵吐空了才真正定格
+    T0 = (Get-Date); Open = $false; Done = $false; Secs = 0; SegStart = 0; PendingEnd = $false
+    FullText = ''; RestShown = $true
+    # 这段思考属于哪张步骤卡：收尾时按 Owner 累加耗时，不按「当前」步骤——
+    # 思考常常在下一步的 step 事件之后才被 onText/onToolStart 关掉，按当前算会串到隔壁
+    Owner = $script:stepNode
+  }
+  # 节点挂在标题自己的 Tag 上：PS 5.1 下这个事件里的 GetNewClosure 拿不到 $node，点了会抛异常
+  $head.Tag = $node
+  $head.Add_Click({ param($s, $e) Toggle-Reasoning $s.Tag })
+  $tp.Thought = $node
+  $script:reasonNode = $node
+  $script:pumpTarget = $node
+  Update-ReasoningHeader $node
+  return $node
+}
+
+# 思考内容逐字流出：一帧里攒了好几条 delta（或者模型一次给一大段）时，
+# 直接整块塞进文本框看着就是“啪”地出现一整段；这里先攒进队列，按帧追上去，
+# 观感跟 Kite 一样是一行行写出来的。积压多时一帧多吐些，不至于越落越远。
+function Start-ReasonTyping {
+  if (-not $script:reasonTypingTimer) {
+    $timer = New-Object System.Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromMilliseconds(16)
+    $timer.Add_Tick({ Step-ReasonTyping })
+    $script:reasonTypingTimer = $timer
+  }
+  if (-not $script:reasonTypingTimer.IsEnabled) { $script:reasonTypingTimer.Start() }
+}
+
+function Step-ReasonTyping {
+  $rn = $script:pumpTarget
+  $timer = $script:reasonTypingTimer
+  if (-not $rn -or $rn.Done) {
+    if ($timer) { $timer.Stop() }
+    $script:reasonQueue.Clear() | Out-Null
+    return
+  }
+  $pending = $script:reasonQueue.Length
+  if ($pending -le 0) {
+    if ($timer) { $timer.Stop() }
+    # 字吐干净了：如果后面还有事件压着（说明这段思考确实完了），先定格再放它们上屏
+    $waiting = ($script:deferredLines -and $script:deferredLines.Count -gt 0 -and -not $script:deferReplay)
+    if (($rn.PendingEnd -or $waiting) -and -not $rn.Done) { Finish-Reasoning $rn }
+    if ($waiting) { Resume-DeferredEvents }
+    return
+  }
+  # 实时思考默认收着（只留一行会动的摘要），正文看不见，所以按「收起」配速：快速滚过去。
+  # 用户手动展开看的时候才放慢，一个字一个字看得清。
+  # 上游（19790 代理）会把整段 SSE 缓冲完一次性下发，不能按积压量暴涨到一帧几百字。
+  # 只有真看得见才算「展开」：父级步骤卡收起时子元素自身的 Visibility 仍是 Visible，
+  # 光看 Body.Visibility 会把收起态误当成展开、按慢速吐字
+  $shown = ($rn.Body -and $rn.Body.Visibility -eq 'Visible' -and $rn.Owner -and $rn.Owner.Open)
+  if ($shown) {
+    $take = 1
+    if ($pending -gt 600) { $take = 4 }
+    elseif ($pending -gt 240) { $take = 3 }
+    elseif ($pending -gt 60) { $take = 2 }
+  } else {
+    # 收起态正文没人看，只有卡头 / 轮头那两行尾巴在动：往快里吐，别把后面的工具事件压太久
+    $take = 4
+    if ($pending -gt 4000) { $take = 60 }
+    elseif ($pending -gt 1200) { $take = 30 }
+    elseif ($pending -gt 400) { $take = 12 }
+  }
+  if ($take -gt $pending) { $take = $pending }
+  $rn.Body.Text = $rn.Body.Text + $script:reasonQueue.ToString(0, $take)
+  $script:reasonQueue.Remove(0, $take) | Out-Null
+  $script:reasonTypingTick++
+  # 收起态真正给人看的就这两行：步骤卡头的摘要、轮头右边的实时提示——跟着吐字一起刷
+  # （每 4 帧一次，别每帧重排）
+  if (($script:reasonTypingTick % 4) -eq 0) {
+    Update-ReasoningHeader $rn
+    if ($rn.Owner) { Update-StepHead $rn.Owner }
+    if ($script:turnProc -and -not $script:turnProc.Done) { Update-TurnProc $script:turnProc }
+  }
+  # 停在底部才跟着滚（用户往上翻旧内容时别硬拉回来），也别每帧都触发一次排版
+  if (($script:reasonTypingTick % 3) -eq 0) {
+    if (($Scroller.VerticalOffset + $Scroller.ViewportHeight) -ge ($Scroller.ExtentHeight - 120)) { $Scroller.ScrollToEnd() }
+  }
+}
+
+# 一轮思考结束：队列里剩下的直接补上（不能丢字），停表，收起光标
+function Flush-ReasonTyping($rn) {
+  if ($script:reasonTypingTimer) { $script:reasonTypingTimer.Stop() }
+  if ($rn -and $script:reasonQueue.Length -gt 0) {
+    $rn.Body.Text = $rn.Body.Text + $script:reasonQueue.ToString()
+  }
+  $script:reasonQueue.Clear() | Out-Null
+  if ($rn -and $rn.Caret) { $rn.Caret.Visibility = 'Collapsed' }
+}
+
+function Complete-Reasoning {
+  $n = $script:reasonNode
+  if (-not $n -or $n.Done) { return }
+  # 队列里还有没吐完的字就一律交给 16ms 的泵吐完再定格（收起态也一样：卡头那行尾巴
+  # 正是靠它一点点长出来的）。已经标过 PendingEnd 也不能在这里收——assistant-end /
+  # tool-start / turn-end 会连着各调一次，早先「标过就 Finish」等于第二次调用就把剩下的字
+  # 一次性倒出来，看着还是整段。
+  if ($script:reasonQueue.Length -gt 0) {
+    if (-not $n.PendingEnd) {
+      $n | Add-Member -NotePropertyName PendingEnd -NotePropertyValue $true -Force
+      $n.Secs = ((Get-Date) - $n.T0).TotalSeconds
+    }
+    return
+  }
+  Finish-Reasoning $n
+}
+
+# 真正定格一段思考：计时、收起、把正文落到 FullText / 复制日志、步骤卡头累计。
+# 队列里还有没吐完的字时，Complete-Reasoning 会把它推迟到泵吐空再调。
+function Finish-Reasoning($n) {
+  if (-not $n -or $n.Done) { return }
+  Flush-ReasonTyping $n
+  $n.Done = $true
+  # 历史回放里已经给过耗时（$ev.ms）就别用「刚刚过去 0 秒」盖掉它
+  if ($n.Secs -lt 0.1) { $n.Secs = ((Get-Date) - $n.T0).TotalSeconds }
+  $n.Open = $false
+  # 正文补全：实时流没维护 FullText（Body.Text 一直在累积，它就是全文）；
+  # 回放里超长思考只把前一段写进了 Body，那种情况 FullText 比 Body 长，不能被覆盖掉
+  if ($n.PSObject.Properties['FullText'] -and ([string]$n.FullText).Length -lt ([string]$n.Body.Text).Length) {
+    $n.FullText = [string]$n.Body.Text
+  }
+  # 复制菜单 / 复制日志要拿到完整正文
+  $full = Get-ReasonFullText $n
+  $n.Box.text = $full
+  Append-CopyLog ('[思考] ' + $full)
+  Update-ReasoningHeader $n
+  # 步骤卡头：把这一段的思考时长累进去（一步里可能想两回），还没结论时摘要先取思考开头
+  $sn = $n.Owner
+  if ($sn) {
+    $sn.ReasonSecs = [double]$sn.ReasonSecs + [double]$n.Secs
+    if (-not $sn.Snip) {
+      $one = (($full -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -First 1)
+      if ($null -ne $one) {
+        $one = ($one -replace '^\s*[#>\-*]+\s*', '').Trim()
+        if ($one) { $sn.Snip = $one }
+      }
+    }
+    Update-StepHead $sn
+  }
+  # 只解绑"当前"，节点本身还在界面上（点标题仍能展开），toggle 用的是节点 Tag 上的那一份
+  $script:reasonNode = $null
+  $script:pumpTarget = $null
+}
+
+# 后面还有东西要上屏（工具行 / 下一步 / 正文）：思考必须先吐完再走。
+# 否则队列还在慢慢吐、工具那一行已经「✓ 完成」，时序一看就是假的。
+function Settle-Reasoning {
+  $t = $script:pumpTarget
+  if (-not $t) { $t = $script:reasonNode }
+  if ($t -and -not $t.Done) { Finish-Reasoning $t }
+}
+
+# 思考吐完了，把之前压住的事件按原顺序放出来（回放期间不再二次压，避免死循环）
+function Resume-DeferredEvents {
+  if ($script:deferReplay) { return }
+  if (-not $script:deferredLines -or $script:deferredLines.Count -eq 0) { return }
+  $batch = @($script:deferredLines)
+  $script:deferredLines.Clear()
+  $script:deferReplay = $true
+  try {
+    foreach ($ln in $batch) { if ($ln -and $ln.Trim()) { Handle-Event $ln } }
+  } finally { $script:deferReplay = $false }
+}
+
+function Add-VerifyRow([string]$label, [int]$round) {
+  $outer = New-Object System.Windows.Controls.Border
+  $outer.Background = (Brush '#12141A')
+  $outer.BorderBrush = (Brush '#0FFFFFFF')
+  $outer.BorderThickness = '1'
+  $outer.CornerRadius = '6'
+  $outer.Padding = '9,5'
+  $outer.Margin = '0,0,0,5'
+  $outer.HorizontalAlignment = 'Left'
+  $outer.MaxWidth = 720
+
+  $dp = New-Object System.Windows.Controls.DockPanel
+  $status = New-Text '验证中…' 10.5 '#7C838E' 'Normal' 'Cascadia Mono, Consolas' 0
+  $status.VerticalAlignment = 'Center'
+  [System.Windows.Controls.DockPanel]::SetDock($status, 'Right')
+  $dp.Children.Add($status) | Out-Null
+
+  $icon = New-Text '🧪' 11 '#7C838E' 'Normal' 'Segoe UI Emoji, Segoe UI' 0
+  $icon.VerticalAlignment = 'Center'
+  $icon.Margin = '0,0,6,0'
+  [System.Windows.Controls.DockPanel]::SetDock($icon, 'Left')
+  $dp.Children.Add($icon) | Out-Null
+
+  $name = $(if ($round -gt 1) { "验证（第 $round 次）" } else { '验证' })
+  $nameTb = New-Text $name 11 '#9BA3B4' 'SemiBold' 'Segoe UI' 0
+  $nameTb.VerticalAlignment = 'Center'
+  $nameTb.Margin = '0,0,8,0'
+  [System.Windows.Controls.DockPanel]::SetDock($nameTb, 'Left')
+  $dp.Children.Add($nameTb) | Out-Null
+
+  $cmdTb = New-Text $label 11 '#CFD3D6' 'Normal' 'Cascadia Mono, Consolas' 0
+  $cmdTb.TextTrimming = 'CharacterEllipsis'
+  $cmdTb.TextWrapping = 'NoWrap'
+  $cmdTb.VerticalAlignment = 'Center'
+  $dp.Children.Add($cmdTb) | Out-Null
+
+  $outer.Child = $dp
+  $script:renderHost.Children.Add($outer) | Out-Null
+  return @{ Status = $status; Border = $outer }
+}
+
+function Add-SystemLine([string]$text, [string]$color = '#7C838E') {  $tb = New-Text $text 11 $color 'Normal' 'Segoe UI' 10
+  $tb.HorizontalAlignment = 'Left'
+  $script:renderHost.Children.Add($tb) | Out-Null
+}
+
+# ---------------- 极简 Markdown：粗体、行内代码、标题、列表、代码块 ----------------
+function New-Run([string]$t, [string]$color, [bool]$bold, [bool]$mono) {
+  $r = New-Object System.Windows.Documents.Run
+  $r.Text = $t
+  $r.Foreground = (Brush $color)
+  if ($bold) { $r.FontWeight = [System.Windows.FontWeights]::SemiBold }
+  if ($mono) { $r.FontFamily = (New-Font 'Cascadia Mono, Consolas') }
+  return $r
+}
+
+function Add-InlineLines($tb, $lines) {
+  $first = $true
+  foreach ($raw in $lines) {
+    $line = [string]$raw
+    if (-not $first) { $tb.Inlines.Add((New-Object System.Windows.Documents.LineBreak)) | Out-Null }
+    $first = $false
+    if ($line -match '^(#{1,6})\s+(.*)$') {
+      # 先把捕获组取出来：下面还要跑别的正则，$Matches 会被覆盖
+      $htext = [string]$Matches[2]
+      $tb.Inlines.Add((New-Run $htext '#F9FAFB' $true $false)) | Out-Null
+      continue
+    }
+    if ($line -match '^(\s*)[-*]\s+(.*)$') {
+      $lind = [string]$Matches[1]
+      $lbody = [string]$Matches[2]
+      $line = "$lind• $lbody"
+    }
+    $parts = [regex]::Split($line, '(\*\*[^*]+\*\*|`[^`]+`)')
+    foreach ($p in $parts) {
+      if (-not $p) { continue }
+      if ($p -match '^\*\*(.+)\*\*$') { $tb.Inlines.Add((New-Run $Matches[1] '#F9FAFB' $true $false)) | Out-Null }
+      elseif ($p -match '^`(.+)`$') { $tb.Inlines.Add((New-Run $Matches[1] '#9FC7FF' $false $true)) | Out-Null }
+      else { $tb.Inlines.Add((New-Run $p '#E6E8EE' $false $false)) | Out-Null }
+    }
+  }
+}
+
+# 代码块做成一张卡片：深底 + 细描边 + 语言标签，和 DSH 里的样子一致
+function New-CodeBlock([string]$code, [string]$lang) {
+  $outer = New-Object System.Windows.Controls.Border
+  $outer.Background = (Brush '#0A0C10')
+  $outer.BorderBrush = (Brush '#1FFFFFFF')
+  $outer.BorderThickness = '1'
+  $outer.CornerRadius = '8'
+  $outer.Padding = '12,8,12,10'
+  $outer.Margin = '0,4,0,10'
+
+  $sp = New-Object System.Windows.Controls.StackPanel
+  if ($lang) {
+    $sp.Children.Add((New-Text $lang 10 '#5B626D' 'Normal' 'Segoe UI' 6)) | Out-Null
+  }
+  $tb = New-Text $code 12.5 '#C9D6E4' 'Normal' 'Cascadia Mono, Consolas' 0
+  $tb.LineHeight = 19
+  $tb.LineStackingStrategy = 'BlockLineHeight'
+  $sp.Children.Add($tb) | Out-Null
+
+  $outer.Child = $sp
+  return $outer
+}
+
+# 把整段回答重绘成「段落 + 代码块卡片 + 表格卡片」。流式阶段仍然是纯文本，结束时再格式化。
+function Render-Markdown($hostPanel, [string]$text) {
+  $hostPanel.Children.Clear()
+  $lines = ($text -replace "`r`n", "`n") -split "`n"
+  $i = 0
+  $n = $lines.Count
+  while ($i -lt $n) {
+    # 表格：本行含 |，且下一行是 | --- | 分隔行
+    if ($lines[$i] -match '\|' -and ($i + 1) -lt $n -and ([string]$lines[$i + 1]) -match $script:tableRuleRe) {
+      $rows = New-Object System.Collections.ArrayList
+      [void]$rows.Add((Split-TableRow ([string]$lines[$i])))
+      $i += 2
+      while (($i -lt $n) -and (([string]$lines[$i]) -match '\|') -and (([string]$lines[$i]).Trim())) {
+        [void]$rows.Add((Split-TableRow ([string]$lines[$i])))
+        $i++
+      }
+      $card = New-TableCard $rows 1
+      if ($null -ne $card) { $hostPanel.Children.Add($card) | Out-Null }
+      continue
+    }
+    if ($lines[$i] -match '^\s*```\s*([^`]*)$') {
+      $lang = $Matches[1].Trim()
+      $buf = New-Object System.Text.StringBuilder
+      $i++
+      while ($i -lt $n -and $lines[$i] -notmatch '^\s*```') {
+        if ($buf.Length -gt 0) { $buf.Append("`n") | Out-Null }
+        $buf.Append([string]$lines[$i]) | Out-Null
+        $i++
+      }
+      $i++
+      $hostPanel.Children.Add((New-CodeBlock $buf.ToString() $lang)) | Out-Null
+      continue
+    }
+    $chunk = New-Object System.Collections.ArrayList
+    while ($i -lt $n -and $lines[$i] -notmatch '^\s*```') {
+      # 表格起始行也要断开：否则整张表被当成普通段落吞进来，竖线原样画出来。
+      # 判断条件与上面表格分支保持一致（本条含 | 且下一行是 |---| 分隔行）。
+      if ($lines[$i] -match '\|' -and ($i + 1) -lt $n -and ([string]$lines[$i + 1]) -match $script:tableRuleRe) { break }
+      [void]$chunk.Add([string]$lines[$i])
+      $i++
+    }
+    while ($chunk.Count -gt 0 -and -not ([string]$chunk[0]).Trim()) { $chunk.RemoveAt(0) }
+    while ($chunk.Count -gt 0 -and -not ([string]$chunk[$chunk.Count - 1]).Trim()) { $chunk.RemoveAt($chunk.Count - 1) }
+    if ($chunk.Count -eq 0) { continue }
+    $tb = New-Text '' 14 '#E6E8EE' 'Normal' 'Segoe UI' 8
+    $tb.LineHeight = 23
+    $tb.LineStackingStrategy = 'BlockLineHeight'
+    Add-InlineLines $tb $chunk
+    $hostPanel.Children.Add($tb) | Out-Null
+  }
+}
+
+# ---------------- 管道表格：| a | b | 加 | --- | 分隔行 → 网格卡片 ----------------
+# 表格是模型「给结论」时最常用的格式，原样输出成一堆竖线很难读。
+# 不追求完整 Markdown 语义，只做三件事：按列估宽度、表头给底色、行间画细线。
+$script:tableRuleRe = '^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$'
+
+function Split-TableRow([string]$line) {
+  $s = $line.Trim()
+  if ($s.StartsWith('|')) { $s = $s.Substring(1) }
+  if ($s.EndsWith('|')) { $s = $s.Substring(0, $s.Length - 1) }
+  $cells = New-Object System.Collections.ArrayList
+  $buf = New-Object System.Text.StringBuilder
+  # 逐字符扫：反引号内的 | 是内容不是分隔符（`a|b` 仍算一格）
+  $inCode = $false
+  foreach ($ch in $s.ToCharArray()) {
+    if ($ch -eq '`') { $inCode = -not $inCode }
+    if (($ch -eq '|') -and (-not $inCode)) {
+      [void]$cells.Add($buf.ToString().Trim())
+      [void]$buf.Clear()
+      continue
+    }
+    [void]$buf.Append($ch)
+  }
+  [void]$cells.Add($buf.ToString().Trim())
+  return $cells
+}
+
+# 单元格里的粗体 / 行内代码走和正文一样的切分逻辑
+function Add-TableInlines($tb, [string]$cell) {
+  if (-not $cell) { return }
+  $s = $cell -replace '<br\s*/?>', ' / '
+  $parts = [regex]::Split($s, '(\*\*[^*]+\*\*|`[^`]+`)')
+  foreach ($p in $parts) {
+    if (-not $p) { continue }
+    if ($p -match '^\*\*(.+)\*\*$') { $tb.Inlines.Add((New-Run ([string]$Matches[1]) '#F9FAFB' $true $false)) | Out-Null }
+    elseif ($p -match '^`(.+)`$') { $tb.Inlines.Add((New-Run ([string]$Matches[1]) '#9FC7FF' $false $true)) | Out-Null }
+    else { $tb.Inlines.Add((New-Run $p '#D4D9E0' $false $false)) | Out-Null }
+  }
+}
+
+# 列宽按「该列各行最长显示宽度」估星号比例；中文按 1.7 个字符宽算，单列上限 40
+function New-TableCard($rows, [int]$headerRows) {
+  $cols = 0
+  foreach ($r in $rows) { if ($r.Count -gt $cols) { $cols = $r.Count } }
+  if ($cols -eq 0) { return $null }
+  $w = [double[]]::new($cols)
+  for ($c = 0; $c -lt $cols; $c++) {
+    $max = 4.0
+    foreach ($r in $rows) {
+      if ($c -ge $r.Count) { continue }
+      $len = 0.0
+      foreach ($ch in ([string]$r[$c]).ToCharArray()) {
+        if ([int]$ch -gt 0x2E7F) { $len += 1.7 } else { $len += 1.0 }
+      }
+      if ($len -gt $max) { $max = $len }
+    }
+    # 每格左右各 10px 的 Margin 不参与上面的字符宽度估算，按字号折算成字符宽补回来，
+    # 否则「行数」这种两字窄列拿到的星号比例不够，会被挤成一字一行。
+    $max += 1.6
+    if ($max -gt 40) { $max = 40 }
+    $w[$c] = $max
+  }
+
+  $outer = New-Object System.Windows.Controls.Border
+  $outer.Background = (Brush '#12141A')
+  $outer.CornerRadius = '8'
+  $outer.BorderThickness = '1'
+  $outer.BorderBrush = (Brush '#1FFFFFFF')
+  $outer.Padding = '8,6,8,8'
+  $outer.Margin = '0,4,0,10'
+
+  $grid = New-Object System.Windows.Controls.Grid
+  for ($c = 0; $c -lt $cols; $c++) {
+    $cd = New-Object System.Windows.Controls.ColumnDefinition
+    $cd.Width = [System.Windows.GridLength]::new($w[$c], [System.Windows.GridUnitType]::Star)
+    $grid.ColumnDefinitions.Add($cd) | Out-Null
+  }
+  for ($r = 0; $r -lt $rows.Count; $r++) {
+    $rd = New-Object System.Windows.Controls.RowDefinition
+    $rd.Height = [System.Windows.GridLength]::Auto
+    $grid.RowDefinitions.Add($rd) | Out-Null
+  }
+
+  for ($r = 0; $r -lt $rows.Count; $r++) {
+    $row = $rows[$r]
+    $isHead = ($r -lt $headerRows)
+    if ($isHead) {
+      # 表头底色铺一整条横跨所有列的 Border，比逐格画省元素
+      $hb = New-Object System.Windows.Controls.Border
+      $hb.Background = (Brush '#1A1E27')
+      $hb.CornerRadius = '5'
+      $hb.Margin = '0,0,0,2'
+      [System.Windows.Controls.Grid]::SetRow($hb, $r)
+      [System.Windows.Controls.Grid]::SetColumn($hb, 0)
+      [System.Windows.Controls.Grid]::SetColumnSpan($hb, $cols)
+      $grid.Children.Add($hb) | Out-Null
+    }
+    for ($c = 0; $c -lt $cols; $c++) {
+      $cellTxt = ''
+      if ($c -lt $row.Count) { $cellTxt = [string]$row[$c] }
+      $tb = New-Text '' 12.5 '#D4D9E0' 'Normal' 'Segoe UI' 0
+      $tb.TextWrapping = 'Wrap'
+      $tb.Margin = '10,5,10,5'
+      $tb.VerticalAlignment = 'Center'
+      if ($isHead) { $tb.FontWeight = [System.Windows.FontWeights]::SemiBold }
+      Add-TableInlines $tb $cellTxt
+      [System.Windows.Controls.Grid]::SetRow($tb, $r)
+      [System.Windows.Controls.Grid]::SetColumn($tb, $c)
+      $grid.Children.Add($tb) | Out-Null
+    }
+    if (-not $isHead -and $r -lt ($rows.Count - 1)) {
+      # 行分隔线：一条只留底边的 Border，跨满整行
+      $ln = New-Object System.Windows.Controls.Border
+      $ln.BorderBrush = (Brush '#14FFFFFF')
+      $ln.BorderThickness = '0,0,0,1'
+      $ln.Margin = '6,0,6,0'
+      [System.Windows.Controls.Grid]::SetRow($ln, $r)
+      [System.Windows.Controls.Grid]::SetColumn($ln, 0)
+      [System.Windows.Controls.Grid]::SetColumnSpan($ln, $cols)
+      $ln.VerticalAlignment = 'Bottom'
+      $grid.Children.Add($ln) | Out-Null
+    }
+  }
+
+  $outer.Child = $grid
+  return $outer
+}
+
+# 历史回放时，单条超长正文先画前面一段，剩下的点一下再画
+function Add-FoldMore($panel, [string]$rest, [int]$chars) {
+  $b = New-Object System.Windows.Controls.Button
+  $b.Content = "… 还有 $chars 字，展开全文"
+  $b.HorizontalAlignment = 'Left'
+  $b.Height = 26
+  $b.Padding = '12,0'
+  $b.Margin = '4,2,0,0'
+  $b.FontSize = 11
+  $b.Cursor = 'Hand'
+  $b.Focusable = $false
+  $b.Background = (Brush '#12141A')
+  $b.Foreground = (Brush '#9BA3B4')
+  $b.BorderBrush = (Brush '#1FFFFFFF')
+  $b.BorderThickness = '1'
+  $b.Template = (New-FlatTemplate)
+  # PS 5.1 里闭包拿不到局部变量，靠 Tag 把要画的东西递过去
+  $b.Tag = @{ panel = $panel; rest = $rest }
+  $b.Add_Click({
+    param($s, $e)
+    $r = $s.Tag
+    $s.Visibility = 'Collapsed'
+    $box = New-Object System.Windows.Controls.StackPanel
+    Render-Markdown $box ([string]$r.rest)
+    $r.panel.Children.Add($box) | Out-Null
+  })
+  $panel.Children.Add($b) | Out-Null
+}
+
+# 审批选项卡片模板：不用系统 Button 默认模板 —— 原生模板在 IsEnabled=False 时变浅灰白底，深色界面里刺眼
+function New-OptionTemplate {
+  if ($script:optTpl) { return $script:optTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="8" Padding="{TemplateBinding Padding}">
+    <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#252933"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#28323F"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:optTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:optTpl
+}
+
+# 一个可选项：左边勾选位 + 标题（可带徽标）+ 说明
+function New-ChoiceCard([string]$title, [string]$desc, [string]$badge = '') {
+  $b = New-Object System.Windows.Controls.Button
+  $b.Cursor = 'Hand'
+  $b.Padding = '10,8'
+  $b.Margin = '0,5,0,0'
+  $b.HorizontalContentAlignment = 'Left'
+  $b.Background = (Brush '#12151A')
+  $b.BorderBrush = (Brush '#1FFFFFFF')
+  $b.BorderThickness = '1'
+  $b.Template = (New-OptionTemplate)
+
+  $grid = New-Object System.Windows.Controls.Grid
+  $c1 = New-Object System.Windows.Controls.ColumnDefinition
+  $c1.Width = [System.Windows.GridLength]::new(18.0)
+  $c2 = New-Object System.Windows.Controls.ColumnDefinition
+  $c2.Width = New-Object System.Windows.GridLength 1, ([System.Windows.GridUnitType]::Star)
+  $grid.ColumnDefinitions.Add($c1)
+  $grid.ColumnDefinitions.Add($c2)
+
+  $chk = New-Text ([string][char]0x2713) 12 '#7EA6FF' 'Bold' 'Segoe UI' 0
+  $chk.Visibility = 'Hidden'
+  $chk.VerticalAlignment = 'Top'
+  $chk.Margin = '0,1,0,0'
+  [System.Windows.Controls.Grid]::SetColumn($chk, 0)
+  $grid.Children.Add($chk) | Out-Null
+
+  $box = New-Object System.Windows.Controls.StackPanel
+  $tl = New-Object System.Windows.Controls.StackPanel
+  $tl.Orientation = 'Horizontal'
+  $tl.Children.Add((New-Text $title 11.5 '#E6E8EE' 'SemiBold' 'Segoe UI' 0)) | Out-Null
+  if ($badge) {
+    $bd = New-Object System.Windows.Controls.Border
+    $bd.Background = (Brush '#1D3A2C')
+    $bd.CornerRadius = '8'
+    $bd.Padding = '6,1'
+    $bd.Margin = '7,0,0,0'
+    $bd.VerticalAlignment = 'Center'
+    $bd.Child = (New-Text $badge 9.5 '#7BE0A8' 'Normal' 'Segoe UI' 0)
+    $tl.Children.Add($bd) | Out-Null
+  }
+  $box.Children.Add($tl) | Out-Null
+  if ($desc) {
+    $dt = New-Text $desc 11 '#8B929E' 'Normal' 'Segoe UI' 0
+    $dt.Margin = '0,3,0,0'
+    $box.Children.Add($dt) | Out-Null
+  }
+  [System.Windows.Controls.Grid]::SetColumn($box, 1)
+  $grid.Children.Add($box) | Out-Null
+
+  $b.Content = $grid
+  $b.Tag = @{ check = $chk }
+  return $b
+}
+
+# 审批卡：照 Kite「模型在问你」的样子 —— 深色卡 + 整块选项（✓ 选中 + 推荐徽标），
+# 选完收起选项、显示「你选了：…」。命令发 decision 字段，host 那边才认得出是允许还是拒绝
+# 选完统一收尾：选中项亮起 + 其余禁用 + 显示「你选了：…」+ 收起选项
+function Finish-Approval($picked, $ctx, [string]$label, [string]$borderColor) {
+  $ctx.done = $true
+  $picked.BorderBrush = (Brush $borderColor)
+  $picked.Background = (Brush '#28323F')
+  $picked.Tag.check.Visibility = 'Visible'
+  foreach ($b in @($ctx.yes, $ctx.session, $ctx.no)) {
+    if ($b -ne $picked) {
+      $b.BorderBrush = (Brush '#1FFFFFFF')
+      $b.IsEnabled = $false
+    }
+  }
+  $ctx.chosen.Text = '你选了：' + $label
+  $ctx.chosen.Visibility = 'Visible'
+  $ctx.options.Visibility = 'Collapsed'
+  $ctx.toggle.Content = ([string][char]0x2304) + ' 展开选项'
+}
+
+function Add-ApprovalCard($e) {
+  $reqId = [string]$e.reqId
+
+  $card = New-Object System.Windows.Controls.Border
+  $card.Background = (Brush '#14171D')
+  $card.BorderBrush = (Brush '#2A2F39')
+  $card.BorderThickness = '1'
+  $card.CornerRadius = '10'
+  $card.Padding = '14,12'
+  $card.Margin = '0,4,0,12'
+
+  $sp = New-Object System.Windows.Controls.StackPanel
+
+  # 标题行：橙点 + 「模型在问你 · 工具」
+  $hd = New-Object System.Windows.Controls.DockPanel
+  $dot = New-Object System.Windows.Controls.Border
+  $dot.Width = 16
+  $dot.Height = 16
+  $dot.CornerRadius = '8'
+  $dot.Background = (Brush '#FBBF24')
+  $dot.VerticalAlignment = 'Center'
+  $dot.Child = (New-Text '!' 10.5 '#1A1710' 'Bold' 'Segoe UI' 0)
+  [System.Windows.Controls.DockPanel]::SetDock($dot, 'Left')
+  $hd.Children.Add($dot) | Out-Null
+  $tt = New-Text ('模型在问你 · ' + [string]$e.tool) 12.5 '#E6E8EE' 'SemiBold' 'Segoe UI' 0
+  $tt.VerticalAlignment = 'Center'
+  $tt.Margin = '8,0,0,0'
+  $hd.Children.Add($tt) | Out-Null
+  $sp.Children.Add($hd) | Out-Null
+
+  # 问题：这个工具要什么权限
+  $q = New-Text ([string]$e.reason) 12 '#CFD3D6' 'Normal' 'Segoe UI' 0
+  $q.Margin = '0,8,0,0'
+  $sp.Children.Add($q) | Out-Null
+
+  if ($e.detail) {
+    $detBox = New-Object System.Windows.Controls.Border
+    $detBox.Background = (Brush '#0E1116')
+    $detBox.BorderBrush = (Brush '#14FFFFFF')
+    $detBox.BorderThickness = '1'
+    $detBox.CornerRadius = '6'
+    $detBox.Padding = '9,7'
+    $detBox.Margin = '0,8,0,0'
+    $det = New-Text ([string]$e.detail) 11 '#9BA3B4' 'Normal' 'Cascadia Mono, Consolas' 0
+    $det.MaxHeight = 96
+    $detBox.Child = $det
+    $sp.Children.Add($detBox) | Out-Null
+  }
+
+  # 「你选了：…」，选完才显示
+  $chosen = New-Text '' 11.5 '#C7CBD2' 'Normal' 'Segoe UI' 0
+  $chosen.Margin = '0,8,0,0'
+  $chosen.Visibility = 'Collapsed'
+  $sp.Children.Add($chosen) | Out-Null
+
+  $optWrap = New-Object System.Windows.Controls.StackPanel
+  $optWrap.Margin = '0,6,0,0'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($optWrap, 'ApprovalOptions')
+
+  $yes = New-ChoiceCard '允许一次' '只放行这一次；下次遇到同样的操作还会再问' '推荐'
+  $session = New-ChoiceCard '本会话都允许' '同一个工具 + 同一个目标不再问；换成别的文件/别的命令还会问'
+  $no = New-ChoiceCard '拒绝' '这一轮不再执行这条命令，模型要换个做法'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($yes, 'ApprovalAllow')
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($session, 'ApprovalAllowSession')
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($no, 'ApprovalDeny')
+  $optWrap.Children.Add($yes) | Out-Null
+  $optWrap.Children.Add($session) | Out-Null
+  $optWrap.Children.Add($no) | Out-Null
+  $sp.Children.Add($optWrap) | Out-Null
+
+  # 收起 / 展开选项
+  $toggle = New-Object System.Windows.Controls.Button
+  $toggle.Padding = '0'
+  $toggle.Margin = '2,8,0,0'
+  $toggle.HorizontalAlignment = 'Left'
+  $toggle.Cursor = 'Hand'
+  $toggle.Background = [System.Windows.Media.Brushes]::Transparent
+  $toggle.BorderThickness = '0'
+  $toggle.Foreground = (Brush '#7C838E')
+  $toggle.FontSize = 11
+  $toggle.Content = ([string][char]0x2304) + ' 收起选项'
+  $toggle.Template = (New-FlatTemplate)
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($toggle, 'ApprovalToggle')
+  $sp.Children.Add($toggle) | Out-Null
+
+  # 卡片之间要互相引用，统一挂在一份哈希上（PS 5.1 的事件回调里拿不到外部变量，只能从 Tag 取）
+  $ctx = @{ reqId = $reqId; options = $optWrap; toggle = $toggle; chosen = $chosen; yes = $yes; session = $session; no = $no; done = $false }
+  foreach ($b in @($yes, $session, $no)) { $b.Tag.ctx = $ctx }
+  $toggle.Tag = $ctx
+
+  $yes.Add_Click({
+    param($s, $ev)
+    $c = $s.Tag.ctx
+    if ($c.done) { return }
+    Send-Host @{ cmd = 'approve'; reqId = $c.reqId; decision = 'allowed-once' }
+    Finish-Approval $s $c '允许一次' '#4F7DF0'
+  })
+  $session.Add_Click({
+    param($s, $ev)
+    $c = $s.Tag.ctx
+    if ($c.done) { return }
+    Send-Host @{ cmd = 'approve'; reqId = $c.reqId; decision = 'allowed-session' }
+    Finish-Approval $s $c '本会话都允许' '#4F7DF0'
+  })
+  $no.Add_Click({
+    param($s, $ev)
+    $c = $s.Tag.ctx
+    if ($c.done) { return }
+    Send-Host @{ cmd = 'approve'; reqId = $c.reqId; decision = 'denied' }
+    Finish-Approval $s $c '拒绝' '#B45454'
+  })
+  $toggle.Add_Click({
+    param($s, $ev)
+    $c = $s.Tag
+    if ([string]$c.options.Visibility -eq 'Collapsed') {
+      $c.options.Visibility = 'Visible'
+      $s.Content = ([string][char]0x2304) + ' 收起选项'
+    } else {
+      $c.options.Visibility = 'Collapsed'
+      $s.Content = ([string][char]0x2304) + ' 展开选项'
+    }
+  })
+
+  $card.Child = $sp
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($card, 'ApprovalCard')
+  $script:renderHost.Children.Add($card) | Out-Null
+  $Scroller.ScrollToEnd()
+}
+
+# 提问卡：ask 工具让模型直接问用户一个选择题（样式跟审批卡一致）
+function Add-QuestionCard($e) {
+  $reqId = [string]$e.reqId
+
+  $card = New-Object System.Windows.Controls.Border
+  $card.Background = (Brush '#14171D')
+  $card.BorderBrush = (Brush '#2A2F39')
+  $card.BorderThickness = '1'
+  $card.CornerRadius = '10'
+  $card.Padding = '14,12'
+  $card.Margin = '0,4,0,12'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($card, 'QuestionCard')
+
+  $sp = New-Object System.Windows.Controls.StackPanel
+  $hd = New-Object System.Windows.Controls.DockPanel
+  $tt = New-Text '模型在问你' 12.5 '#E6E8EE' 'SemiBold' 'Segoe UI' 0
+  $tt.VerticalAlignment = 'Center'
+  [System.Windows.Controls.DockPanel]::SetDock($tt, 'Left')
+  $hd.Children.Add($tt) | Out-Null
+  $sp.Children.Add($hd) | Out-Null
+
+  $q = New-Text ([string]$e.question) 12 '#CFD3D6' 'Normal' 'Segoe UI' 0
+  $q.Margin = '0,8,0,0'
+  $q.TextWrapping = 'Wrap'
+  $sp.Children.Add($q) | Out-Null
+
+  $chosen = New-Text '' 11.5 '#C7CBD2' 'Normal' 'Segoe UI' 0
+  $chosen.Margin = '0,8,0,0'
+  $chosen.TextWrapping = 'Wrap'
+  $chosen.Visibility = 'Collapsed'
+  $sp.Children.Add($chosen) | Out-Null
+
+  $optWrap = New-Object System.Windows.Controls.StackPanel
+  $optWrap.Margin = '0,6,0,0'
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($optWrap, 'QuestionOptions')
+
+  $ctx = @{ reqId = $reqId; options = $optWrap; chosen = $chosen; buttons = @(); done = $false }
+  $idx = 0
+  foreach ($opt in @($e.options)) {
+    if ($null -eq $opt) { continue }
+    $label = [string]$opt
+    $b = New-ChoiceCard $label ''
+    [System.Windows.Automation.AutomationProperties]::SetAutomationId($b, ('QuestionOption' + $idx))
+    $b.Tag.ctx = $ctx
+    $b.Tag.label = $label
+    $b.Tag.check.Text = [string][char]0x2713
+    $b.Add_Click({
+      param($s, $ev)
+      $c = $s.Tag.ctx
+      if ($c.done) { return }
+      $c.done = $true
+      Send-Host @{ cmd = 'answer'; reqId = $c.reqId; value = [string]$s.Tag.label }
+      $s.BorderBrush = (Brush '#4F7DF0')
+      $s.Background = (Brush '#2160A5FA')
+      $s.Tag.check.Visibility = 'Visible'
+      foreach ($x in $c.buttons) {
+        if ($x -ne $s) {
+          $x.BorderBrush = (Brush '#1FFFFFFF')
+          $x.IsEnabled = $false
+        }
+      }
+      $c.chosen.Text = '你选择了：' + [string]$s.Tag.label
+      $c.chosen.Visibility = 'Visible'
+      $c.options.Visibility = 'Collapsed'
+    })
+    $ctx.buttons += $b
+    $optWrap.Children.Add($b) | Out-Null
+    $idx++
+  }
+  $sp.Children.Add($optWrap) | Out-Null
+
+  $card.Child = $sp
+  $script:renderHost.Children.Add($card) | Out-Null
+  $Scroller.ScrollToEnd()
+}
+
+# 计划卡：todo_write 的结构化结果画成一张「执行方案」清单（同一条任务反复写就原地更新）
+function Update-TodoCard($items) {
+  $arr = @($items)
+  if (-not $script:todoCard -or $null -eq $script:todoCard.card.Parent) {
+    $card = New-Object System.Windows.Controls.Border
+    $card.Background = (Brush '#12141A')
+    $card.BorderBrush = (Brush '#1FFFFFFF')
+    $card.BorderThickness = '1'
+    $card.CornerRadius = '8'
+    $card.Padding = '12,10'
+    $card.Margin = '0,4,0,10'
+    [System.Windows.Automation.AutomationProperties]::SetAutomationId($card, 'TodoCard')
+
+    $sp = New-Object System.Windows.Controls.StackPanel
+    $hd = New-Object System.Windows.Controls.DockPanel
+    $tt = New-Text '执行方案' 11.5 '#9BA3B4' 'SemiBold' 'Segoe UI' 0
+    [System.Windows.Controls.DockPanel]::SetDock($tt, 'Left')
+    $hd.Children.Add($tt) | Out-Null
+    $cnt = New-Text '' 10.5 '#6F7684' 'Normal' 'Segoe UI' 0
+    $cnt.HorizontalAlignment = 'Right'
+    $hd.Children.Add($cnt) | Out-Null
+    $sp.Children.Add($hd) | Out-Null
+    $body = New-Object System.Windows.Controls.StackPanel
+    $body.Margin = '0,6,0,0'
+    $sp.Children.Add($body) | Out-Null
+    # 轮末状态行：清单写完之后模型可能再没回写过，这里补一句「还剩 n 项 / 全部完成」，
+    # 否则界面停在那次写入的进度上，看着像一步都没做
+    $tail = New-Text '' 10.5 '#6F7684' 'Normal' 'Segoe UI' 0
+    $tail.Margin = '0,6,0,0'
+    $tail.Visibility = 'Collapsed'
+    [System.Windows.Automation.AutomationProperties]::SetAutomationId($tail, 'TodoTail')
+    $sp.Children.Add($tail) | Out-Null
+    $card.Child = $sp
+
+    $script:todoCard = @{ card = $card; body = $body; count = $cnt; tail = $tail; done = 0; total = 0 }
+    $script:renderHost.Children.Add($card) | Out-Null
+  }
+
+  $script:todoCard.body.Children.Clear()
+  $done = 0
+  foreach ($it in $arr) {
+    if ($null -eq $it) { continue }
+    $ok = [bool]$it.done
+    if ($ok) { $done++ }
+    $row = New-Object System.Windows.Controls.DockPanel
+    $row.Margin = '0,2,0,2'
+    $mk = $([string][char]0x2713)
+    $mc = '#4ADE80'
+    if (-not $ok) {
+      $mk = [string][char]0x25CB
+      $mc = '#6B7280'
+    }
+    $mark = New-Text $mk 11 $mc 'Normal' 'Segoe UI' 0
+    $mark.Width = 16
+    $mark.VerticalAlignment = 'Top'
+    [System.Windows.Controls.DockPanel]::SetDock($mark, 'Left')
+    $row.Children.Add($mark) | Out-Null
+    $tc = '#C7CBD2'
+    if ($ok) { $tc = '#5B626D' }
+    $tx = New-Text ([string]$it.text) 11.5 $tc 'Normal' 'Segoe UI' 0
+    $tx.TextWrapping = 'Wrap'
+    if ($ok) { $tx.TextDecorations = [System.Windows.TextDecorations]::Strikethrough }
+    $row.Children.Add($tx) | Out-Null
+    $script:todoCard.body.Children.Add($row) | Out-Null
+  }
+  $script:todoCard.count.Text = "$done/$($arr.Count)"
+  $script:todoCard.done = $done
+  $script:todoCard.total = $arr.Count
+  # 刚写进来的清单还没到轮末：状态行先收起（等 turn-end 再定论）
+  $script:todoCard.tail.Text = ''
+  $script:todoCard.tail.Visibility = 'Collapsed'
+}
+
+# 轮末给执行方案卡补一句状态：模型没回写时也能看出「这一轮结束了，还差几项」
+function Set-TodoCardTail($text, $color) {
+  if (-not $script:todoCard) { return }
+  $c = $script:todoCard.card
+  if ($null -eq $c.Parent) { return }
+  $script:todoCard.tail.Text = [string]$text
+  $script:todoCard.tail.Foreground = (Brush $color)
+  $script:todoCard.tail.Visibility = 'Visible'
+}
+
+function Format-Ago($ms) {
+  # .NET Framework 4.8 没有 DateTime.ToUnixTimeMilliseconds（那是 .NET Core 的）
+  $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  $m = [math]::Round(($now - [double]$ms) / 60000)
+  if ($m -lt 1) { return '刚刚' }
+  if ($m -lt 60) { return "$m 分钟前" }
+  $h = [math]::Floor($m / 60)
+  if ($h -lt 24) { return "$h 小时前" }
+  return "$([math]::Floor($h / 24)) 天前"
+}
+
+# 会话行的右键菜单：重命名 / 移到分组 / 取消分组 / 删除
+# 菜单项的 Tag 挂一份哈希表（id / title / group），回调从 $s.Tag 取——
+# PS 5.1 下事件里的 GetNewClosure 拿不到外部变量
+function New-SessionMenu([object]$box) {
+  $cm = New-Object System.Windows.Controls.ContextMenu
+  $cm.Background = (Brush '#14171D')
+  $cm.Foreground = (Brush '#E6E8EE')
+  $cm.BorderBrush = (Brush '#2A2F39')
+  $cm.BorderThickness = '1'
+  $cm.Template = (New-CtxTemplate)
+
+  $mi = New-Object System.Windows.Controls.MenuItem
+  $mi.Header = '重命名…'
+  $mi.Foreground = (Brush '#E6E8EE')
+  $mi.Background = [System.Windows.Media.Brushes]::Transparent
+  $mi.Padding = '0'
+  $mi.Template = (New-MenuItemTemplate)
+  $mi.Tag = $box
+  $mi.Add_Click({
+    param($s, $e)
+    $b = $s.Tag
+    Show-Input -title ('重命名「' + $b.title + '」') -hint '留空＝恢复成用第一条消息当标题' -value ([string]$b.title) -okText '重命名' `
+               -onOk { param($r) Send-Host @{ cmd = 'rename-session'; id = [string]$r.arg.id; title = [string]$r.text } } `
+               -arg @{ id = [string]$b.id }
+  })
+  $cm.Items.Add($mi) | Out-Null
+
+  $mg = New-Object System.Windows.Controls.MenuItem
+  $mg.Header = '移到分组…'
+  $mg.Foreground = (Brush '#E6E8EE')
+  $mg.Background = [System.Windows.Media.Brushes]::Transparent
+  $mg.Padding = '0'
+  $mg.Template = (New-MenuItemTemplate)
+  $mg.Tag = $box
+  $mg.Add_Click({
+    param($s, $e)
+    $b = $s.Tag
+    $hint = $(if (@($script:sessionGroups).Count -gt 0) {
+      '点下面已有的分组，或直接打一个新名字（回车）＝新建分组；留空＝移到未分组'
+    } else { '填一个组名（比如项目名）；留空＝未分组' })
+    Show-Input -title '移到分组' -hint $hint -value ([string]$b.group) -okText '移动' `
+               -choices @($script:sessionGroups) -choiceCurrent ([string]$b.group) `
+               -onOk { param($r) Send-Host @{ cmd = 'group-session'; id = [string]$r.arg.id; group = [string]$r.text } } `
+               -arg @{ id = [string]$b.id }
+  })
+  $cm.Items.Add($mg) | Out-Null
+
+  if ([string]$box.group) {
+    $mu = New-Object System.Windows.Controls.MenuItem
+    $mu.Header = '取消分组'
+    $mu.Foreground = (Brush '#E6E8EE')
+    $mu.Background = [System.Windows.Media.Brushes]::Transparent
+    $mu.Padding = '0'
+    $mu.Template = (New-MenuItemTemplate)
+    $mu.Tag = $box
+    $mu.Add_Click({ param($s, $e) Send-Host @{ cmd = 'group-session'; id = [string]$s.Tag.id; group = '' } })
+    $cm.Items.Add($mu) | Out-Null
+  }
+
+  $md = New-Object System.Windows.Controls.MenuItem
+  $md.Header = '删除会话…'
+  $md.Foreground = (Brush '#E6E8EE')
+  $md.Background = [System.Windows.Media.Brushes]::Transparent
+  $md.Padding = '0'
+  $md.Template = (New-MenuItemTemplate)
+  $md.Tag = $box
+  $md.Add_Click({
+    param($s, $e)
+    $b = $s.Tag
+    Show-Confirm -title ('删除会话「' + $b.title + '」？') `
+                 -text "会删掉它的会话日志和 checkpoint，不能恢复。会话里的附件文件也会一起删。" `
+                 -yesText '删除' `
+                 -onYes { param($targetId) Send-Host @{ cmd = 'delete-session'; id = $targetId } } `
+                 -arg $b.id
+  })
+  $cm.Items.Add($md) | Out-Null
+
+  return $cm
+}
+
+# 左栏一行会话：标题 + N 轮 · 时间，悬停露出 ×，右键出菜单
+function New-SessionRow($it) {
+  $row = New-Object System.Windows.Controls.Border
+  $row.CornerRadius = '16'
+  $row.Padding = '11,8'
+  $row.Margin = '0,2,0,2'
+  $row.Cursor = 'Hand'
+  $sid = [string]$it.id
+  $stitle = [string]$it.title
+  $selected = ($sid -eq [string]$script:sessionId)
+  $row.Background = $(if ($selected) { Brush '#2160A5FA' } else { [System.Windows.Media.Brushes]::Transparent })
+  $row.BorderThickness = '0'
+
+  $grid = New-Object System.Windows.Controls.Grid
+  $c1 = New-Object System.Windows.Controls.ColumnDefinition
+  $c1.Width = New-Object System.Windows.GridLength 1, ([System.Windows.GridUnitType]::Star)
+  $c2 = New-Object System.Windows.Controls.ColumnDefinition
+  $c2.Width = [System.Windows.GridLength]::Auto
+  $grid.ColumnDefinitions.Add($c1)
+  $grid.ColumnDefinitions.Add($c2)
+
+  $sp = New-Object System.Windows.Controls.StackPanel
+  $t = New-Text $stitle 12 '#E6E8EE' 'Normal' 'Segoe UI' 2
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($t, 'SessionTitle')
+  $t.TextTrimming = 'CharacterEllipsis'
+  $t.TextWrapping = 'NoWrap'
+  $sp.Children.Add($t) | Out-Null
+  $meta = New-Text "$($it.turns) 轮 · $(Format-Ago $it.updatedAt)" 10 '#6B7280' 'Normal' 'Segoe UI' 0
+  $sp.Children.Add($meta) | Out-Null
+  [System.Windows.Controls.Grid]::SetColumn($sp, 0)
+  $grid.Children.Add($sp) | Out-Null
+
+  # 删除按钮：平时藏着，鼠标移到这一行才露出来
+  $del = New-Object System.Windows.Controls.Button
+  # 删除用垃圾桶图标（Segoe MDL2 Assets 的 E74D），不用字符 ×——在深色界面上太像关窗口
+  $del.Content = [string][char]0xE74D
+  $del.FontFamily = (New-Font 'Segoe MDL2 Assets')
+  $del.FontSize = 12
+  $del.Width = 22
+  $del.Height = 22
+  $del.Padding = '0'
+  $del.Cursor = 'Hand'
+  $del.Background = [System.Windows.Media.Brushes]::Transparent
+  $del.Foreground = (Brush '#6B7280')
+  $del.BorderThickness = '0'
+  # 自绘模板：系统 Button 一悬停就是浅色底，深色行上一块白方块很跳
+  $del.Template = (New-FlatTemplate)
+  $del.VerticalAlignment = 'Center'
+  $del.Visibility = 'Hidden'
+  $del.ToolTip = '删除这个会话'
+  [System.Windows.Controls.Grid]::SetColumn($del, 1)
+  $grid.Children.Add($del) | Out-Null
+
+  $row.Tag = @{ id = $sid; title = $stitle; group = ([string]$it.group); del = $del; dragging = $false; dragStart = $null }
+  $del.Tag = $row.Tag
+  $del.Add_Click({
+    param($s, $ev)
+    $ev.Handled = $true
+    Show-Confirm -title ('删除会话「' + $s.Tag.title + '」？') `
+                 -text "会删掉它的会话日志和 checkpoint，不能恢复。会话里的附件文件也会一起删。" `
+                 -yesText '删除' `
+                 -onYes { param($targetId) Send-Host @{ cmd = 'delete-session'; id = $targetId } } `
+                 -arg $s.Tag.id
+  })
+  $del.Add_MouseEnter({ param($s, $e) $s.Foreground = (Brush '#F87171') })
+  $del.Add_MouseLeave({ param($s, $e) $s.Foreground = (Brush '#6B7280') })
+
+  $row.Child = $grid
+  $row.ContextMenu = (New-SessionMenu $row.Tag)
+
+  $row.Add_MouseLeftButtonUp({
+    param($s, $e)
+    # 刚拖完的那一下松手不算「点开这个会话」
+    if ($s.Tag.dragging) { $s.Tag.dragging = $false; return }
+    Send-Host @{ cmd = 'load-session'; id = [string]$s.Tag.id }
+  })
+  $row.Add_MouseEnter({
+    param($s, $e)
+    if (-not $s.Tag.dragging) { $s.Background = (Brush '#0AFFFFFF') }
+    $s.Tag.del.Visibility = 'Visible'
+  })
+  # 拖动会话行到分组头上 = 移进那个分组（组头 Drop 里接手）。
+  # 按下先记起点，移动超过一行的判定阈值才真正启动拖动——否则手一抖就把「点」变成「拖」，
+  # 会话切不过去。松手后 $s.Tag.dragging 还留着 true，交给 MouseLeftButtonUp 跳过这一次点击。
+  $row.AllowDrop = $true
+  $row.Add_PreviewMouseLeftButtonDown({
+    param($s, $e)
+    $s.Tag.dragging = $false
+    $s.Tag.dragStart = $e.GetPosition($s)
+  })
+  $row.Add_PreviewMouseMove({
+    param($s, $e)
+    if ($e.LeftButton -ne [System.Windows.Input.MouseButtonState]::Pressed) { return }
+    $p0 = $s.Tag.dragStart
+    if (-not $p0) { return }
+    if ($s.Tag.dragging) { return }
+    $p = $e.GetPosition($s)
+    if ([math]::Abs($p.X - $p0.X) -lt 6 -and [math]::Abs($p.Y - $p0.Y) -lt 6) { return }
+    $s.Tag.dragging = $true
+    try {
+      [System.Windows.DragDrop]::DoDragDrop($s, [System.Windows.DataObject]::new('PackLeaderSession', [string]$s.Tag.id),
+        [System.Windows.DragDropEffects]::Move)
+    } catch {
+      Log ('拖动会话失败: ' + ($_ | Out-String))
+    }
+    $s.Tag.dragStart = $null
+  })
+  $row.Add_MouseLeave({
+    param($s, $e)
+    $s.Tag.dragStart = $null
+    $s.Tag.del.Visibility = 'Hidden'
+    if ($s.Tag.id -eq [string]$script:sessionId) { $s.Background = (Brush '#2160A5FA') }
+    else { $s.Background = [System.Windows.Media.Brushes]::Transparent }
+  })
+  return $row
+}
+
+# 组名 → 是否收起（只在这次运行里记，不落盘）
+$script:groupCollapsed = @{}
+# 现有的分组名：右键「移到分组」时当提示
+$script:sessionGroups = @()
+
+function Toggle-SessionGroup($t) {
+  $now = -not [bool]$script:groupCollapsed[$t.key]
+  $script:groupCollapsed[$t.key] = $now
+  $t.panel.Visibility = $(if ($now) { 'Collapsed' } else { 'Visible' })
+  $t.chevron.Text = $(if ($now) { '▸' } else { '▾' })
+  Log ("组头切换：'" + [string]$t.key + "' → " + $(if ($now) { '收起' } else { '展开' }))
+}
+
+function Set-Sessions($items) {
+  # 记一份标题：左栏宽度上限按「最长的那个标题能不能完整显示」来定
+  $script:sideTitles = @()
+  if ($items) { $script:sideTitles = @($items | ForEach-Object { [string]$_.title }) }
+  # id → 标题：后台会话跑完/还在跑时要在提示行里报出是哪一条
+  $script:sessionTitles = @{}
+  if ($items) { foreach ($it in @($items)) { $script:sessionTitles[[string]$it.id] = [string]$it.title } }
+  # 改名后顶栏标题要立刻跟上：host 改完 meta 就回一条 sessions，这里拿当前会话的新标题直接写回去。
+  # 不加这段的话，左栏名字变了、顶栏还挂着旧标题，得切一次会话才刷新（用户实测报过）。
+  $curId = [string]$script:sessionId
+  if ($curId -and $script:sessionTitles.ContainsKey($curId)) {
+    $newTitle = [string]$script:sessionTitles[$curId]
+    $want = if ($newTitle -and $newTitle -ne '(empty)' -and $newTitle.Trim() -ne '') { $newTitle } else { '新对话' }
+    if ([string]$TitleText.Text -ne $want) { $TitleText.Text = $want }
+  }
+  $SessionList.Children.Clear()
+  if (-not $items -or $items.Count -eq 0) {
+    $empty = New-Text '还没有会话' 11 '#5B626D' 'Normal' 'Segoe UI' 0
+    $empty.Margin = '8,4,0,0'
+    $SessionList.Children.Add($empty) | Out-Null
+    Update-SideFit
+    return
+  }
+  # 按组分：有组的按名字排，没组的放最后。host 已经按 updatedAt 倒序给过，组内不再重排
+  $buckets = [ordered]@{}
+  foreach ($it in $items) {
+    $g = ([string]$it.group).Trim()
+    if (-not $buckets.Contains($g)) { $buckets[$g] = New-Object System.Collections.ArrayList }
+    $buckets[$g].Add($it) | Out-Null
+  }
+  $script:sessionGroups = @($buckets.Keys | Where-Object { $_ -ne '' } | Sort-Object)
+  $names = @($script:sessionGroups) + ''
+  foreach ($g in $names) {
+    if (-not $buckets.Contains($g)) { continue }
+    $rows = $buckets[$g]
+    $panel = New-Object System.Windows.Controls.StackPanel
+    foreach ($it in $rows) { $panel.Children.Add((New-SessionRow $it)) | Out-Null }
+    # 一个分组都没有时不显示「未分组」这个头，跟以前一样平铺
+    if ($g -ne '' -or $script:sessionGroups.Count -gt 0) {
+      $label = $(if ($g) { $g } else { '未分组' })
+      $collapsed = [bool]$script:groupCollapsed[$g]
+      # 组头用 Button 而不是 Border：Button 有 AutomationPeer，UIA 能直接 Invoke，
+      # 圆角/悬停交给 New-FlatTemplate（和底部模型按钮同一套）
+      $head = New-Object System.Windows.Controls.Button
+      $head.Padding = '8,3'
+      $head.Margin = '0,6,0,2'
+      $head.Cursor = 'Hand'
+      $head.HorizontalContentAlignment = 'Left'
+      $head.Background = [System.Windows.Media.Brushes]::Transparent
+      $head.BorderThickness = '0'
+      $head.Template = (New-FlatTemplate)
+      $head.ToolTip = '点击收起 / 展开这个分组'
+      [System.Windows.Automation.AutomationProperties]::SetAutomationId($head, 'SessionGroupHead')
+      # Button 的 Content 是个 StackPanel，UIA 取不到 Name；显式给一个（验证脚本靠它认组）
+      [System.Windows.Automation.AutomationProperties]::SetName($head, $label)
+      $hline = New-Object System.Windows.Controls.StackPanel
+      $hline.Orientation = 'Horizontal'
+      $ch = New-Text $(if ($collapsed) { '▸' } else { '▾' }) 9.5 '#6B7280' 'Normal' 'Segoe UI' 0
+      $ch.VerticalAlignment = 'Center'
+      $nm = New-Text $label 10.5 '#8A91A0' 'SemiBold' 'Segoe UI' 0
+      [System.Windows.Automation.AutomationProperties]::SetAutomationId($nm, 'SessionGroupName')
+      $nm.Margin = '5,0,0,0'
+      $nm.TextTrimming = 'CharacterEllipsis'
+      $nm.VerticalAlignment = 'Center'
+      $cnt = New-Text ([string]$rows.Count) 9.5 '#4B5158' 'Normal' 'Segoe UI' 0
+      $cnt.Margin = '6,0,0,0'
+      $cnt.VerticalAlignment = 'Center'
+      $hline.Children.Add($ch) | Out-Null
+      $hline.Children.Add($nm) | Out-Null
+      $hline.Children.Add($cnt) | Out-Null
+      $head.Content = $hline
+      $head.Tag = @{ key = $g; panel = $panel; chevron = $ch }
+      $head.Add_Click({ param($s, $e) Toggle-SessionGroup $s.Tag })
+      # 拖放目标：会话行拖到组头 = 移进这个组（未分组头的 key 是空串，正好对应「取消分组」）
+      $head.AllowDrop = $true
+      $head.Add_DragOver({
+        param($s, $e)
+        if (-not $e.Data.GetDataPresent('PackLeaderSession')) { return }
+        $e.Effects = [System.Windows.DragDropEffects]::Move
+        $e.Handled = $true
+      })
+      $head.Add_DragEnter({
+        param($s, $e)
+        if (-not $e.Data.GetDataPresent('PackLeaderSession')) { return }
+        $s.Background = (Brush '#2160A5FA')
+      })
+      $head.Add_DragLeave({
+        param($s, $e)
+        $s.Background = [System.Windows.Media.Brushes]::Transparent
+      })
+      $head.Add_Drop({
+        param($s, $e)
+        $s.Background = [System.Windows.Media.Brushes]::Transparent
+        if (-not $e.Data.GetDataPresent('PackLeaderSession')) { return }
+        $sid2 = [string]$e.Data.GetData('PackLeaderSession')
+        if (-not $sid2) { return }
+        $e.Handled = $true
+        # 拖进来等于一次显式移动：即使目标组和当前组相同也发一次（幂等），
+        # 省掉「怎么没反应」的困惑——组名一样时 host 只会重写同一个 meta
+        Send-Host @{ cmd = 'group-session'; id = $sid2; group = [string]$s.Tag.key }
+      })
+      $SessionList.Children.Add($head) | Out-Null
+      $panel.Visibility = $(if ($collapsed) { 'Collapsed' } else { 'Visible' })
+    }
+    $SessionList.Children.Add($panel) | Out-Null
+  }
+  # 标题变了：重新量一次左栏该有多宽（撑不下就放宽上限，全都装得下就收紧）
+  Update-SideFit
+}
+
+# ---------------------------------------------------------------- 按需加载历史 + 提问索引
+$script:replayEvents = @()
+$script:replayAt = 0
+$script:replayHasUser = $false
+$script:replayEnd = $null
+$script:moreRow = $null
+$script:replayRenderJob = $null
+$script:historyLoading = $false
+$script:historyRequestId = 0
+$script:historyCount = 0
+$script:historyQuestions = @()
+$script:historyBefore = 0
+$script:pendingJump = -1
+$script:renderEventIndex = -1
+$script:userElements = @{}
+
+# 画一个历史事件。初次切换会话时会分多个 UI 时间片调用，避免一口气创建几百个控件卡住窗口。
+function Render-ReplayEvent($ev) {
+  # 回放的卡没有墙钟耗时：拿事件自带的时间戳记下这一轮的头尾
+  $at = [double]$ev.at
+  $cur = $script:turnProc
+  if ($cur -and -not $cur.Done -and $at -gt 0) {
+    # 时间戳也要喂给已经定局的历史轮：它的耗时和轮头时钟都按首尾事件算
+    $cur.AtLast = $at
+    if ($cur.At0 -le 0) { $cur.At0 = $at }
+    Update-TurnProc $cur
+  }
+  # 回放里的一轮 = turn/start 之后、turn/end 之前的那一段，已经从库里读回来了，
+  # 所以它当场就是「已完成」：历史轮的轮卡和步骤卡都只报已完成 / 最终结论，
+  # 不再出现「思考中…」「正在做…」这种进行中的说法。
+  # 真的还在跑的那一轮由回放收尾处补的活卡（Live=$true）负责显示，两者不会混。
+  # 提问那一条不建卡：轮卡得排在你的消息下面，不能抢在它之前。
+  if ($ev.kind -eq 'user/message') {
+    # 一轮从用户消息开始：上一轮的过程卡和工具块在这里收掉，回放也是一轮一张
+    Close-TurnProc
+    Reset-ToolGroup
+    # 执行方案卡一轮一张：回放时上一轮的卡不能接着被下一轮的清单改写
+    $script:todoCard = $null
+    Add-UserMessage ([string]$ev.text) $ev.files
+    $script:replayHasUser = $true
+  }
+  elseif ($ev.kind -eq 'assistant/message') {
+    # 历史里没有 step/start 事件：每条 assistant/message 就是一步的产出，在这里开一张新的步骤卡。
+    # 轮卡在这一刻才建（排在提问下面），建出来先按「历史轮」标一遍再往里画，
+    # 这样轮头从第一帧起就是「已完成」，不会先闪一下「思考中…」。
+    Set-TurnHistorical (Get-TurnProc)
+    New-StepBlock | Out-Null
+    # 历史里的思考过程也要能看，默认收起成一行摘要。
+    # 正文在这里就整段写进 TextBlock（不再挂起到「点开那一刻」才写）：
+    # 打开旧会话是一次性的，之后点展开永远立刻看到全文，没有内容往外长的加载过程。
+    if ($ev.reasoning) {
+      $tp = $script:turnProc
+      if ($tp.At0 -le 0) { $tp.At0 = $at }
+      $rn = Add-ReasoningBlock
+      # Add-ReasoningBlock 复用整轮的同一张思考条：同轮后续几段按追加写，段前那行空行由它自己加
+      Set-ReasoningFull $rn ([string]$ev.reasoning) -Append
+      $rn.Secs = [math]::Round(([double]$ev.ms) / 1000.0, 1)
+      Complete-Reasoning
+    }
+    if ($ev.text) {
+      Close-ToolGroup
+      if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
+      $txt = [string]$ev.text
+      if ($txt.Length -gt $script:replayFoldChars) {
+        # 一条几千字的回答一次全画出来，布局和滚动都会变慢：先画前面一段
+        Render-Markdown $script:assistantBody $txt.Substring(0, $script:replayFoldChars)
+        Add-FoldMore $script:assistantBody $txt.Substring($script:replayFoldChars) ($txt.Length - $script:replayFoldChars)
+      } else {
+        Render-Markdown $script:assistantBody $txt
+      }
+      # 卡头摘要取这条消息的第一行（回放里收起态就看这一行）
+      Set-StepConclusion $script:stepNode $txt
+      $script:currentAssistant = $null
+    }
+  }
+  elseif ($ev.kind -eq 'tool/call') {
+    # 有的轮次只有工具、没有正文：轮卡也要在这里才建（同样先标成历史轮）
+    Set-TurnHistorical (Get-TurnProc)
+    $tp = $script:turnProc
+    if ($tp.At0 -le 0) { $tp.At0 = $at }
+    # 历史里只存了入参和结果：摘要取自关键字段，展开区放完整参数
+    $sum = ''
+    $argsText = ''
+    if ($ev.call.args) {
+      try { $argsText = ($ev.call.args | ConvertTo-Json -Compress -Depth 4) } catch { $argsText = '' }
+      if ($argsText.Length -gt 2000) { $argsText = $argsText.Substring(0, 2000) + '…' }
+      foreach ($k in @('path', 'pattern', 'cmd', 'command', 'query', 'url')) {
+        $p = $ev.call.args.PSObject.Properties[$k]
+        if ($p -and $p.Value) { $sum = [string]$p.Value; break }
+      }
+      if (-not $sum) { $sum = $argsText }
+    }
+    $st = Add-ToolLine ([string]$ev.call.name) $sum $argsText
+    $script:toolRows[[string]$ev.call.id] = $st
+  }
+  elseif ($ev.kind -eq 'tool/result') {
+    $st = $script:toolRows[[string]$ev.callId]
+    if ($st) {
+      # 回放里结果正文就在事件里（content），截一段给展开区
+      $preview = [string]$ev.content
+      if ($preview.Length -gt 2000) { $preview = $preview.Substring(0, 2000) + '…' }
+      if ($ev.ok) { Set-ToolLineDone ([string]$ev.callId) "✓  $($ev.ms)ms" $true ([int]$ev.ms) $preview }
+      else { Set-ToolLineDone ([string]$ev.callId) '✕  失败' $false ([int]$ev.ms) $preview }
+    }
+    # 执行方案：历史里只存了文本结果（「待办 3/4」+ [x]/[ ] 行），解析回清单再画卡。
+    # 回放的这一轮已经结束，所以卡尾直接给最终状态。
+    if ([string]$ev.name -eq 'todo_write') {
+      $titems = @()
+      foreach ($ln in ([string]$ev.content -split "`n")) {
+        $m = [regex]::Match($ln, '^\s*\[( |x|X)\]\s*(.+)$')
+        if ($m.Success) {
+          $titems += @{ text = $m.Groups[2].Value.Trim(); done = ($m.Groups[1].Value -ne ' ') }
+        }
+      }
+      if ($titems.Count -gt 0) {
+        Update-TodoCard $titems
+        $tleft = @($titems | Where-Object { -not $_.done }).Count
+        if ($tleft -le 0) { Set-TodoCardTail '本轮结束 · 全部完成' '#4ADE80' }
+        else { Set-TodoCardTail "本轮结束 · 还剩 $tleft 项未完成" '#FBBF24' }
+      }
+    }
+  }
+  elseif ($ev.kind -eq 'memory/saved') {
+    Add-MemoryCard $ev.items | Out-Null
+  }
+  elseif ($ev.kind -eq 'memory/undone') {
+    Set-MemoryUndone @($ev.ids)
+  }
+}
+# ---------------------------------------------------------------- 滚动刻度条
+# 左侧那列密集短横线：看着是一列刻度，实际上每一根都是一个 Rectangle，
+# 宽度/亮度按「离波峰多远」走高斯轮廓。两个关键点：
+#   1) 每根刻度的宽度/亮度靠 Style 里的 Tag 触发器分级（Tag=0..24 档），
+#      逐帧只改变化了的几根的 Tag，不会每帧重排整列（150 根全量写 Width 会明显掉帧）。
+#   2) 波峰位置本身用 16ms 定时器做缓动插值，指针跟手、滚动时顺着滑过去，不跳变。
+$script:tsN = 0
+$script:tsStrips = $null
+$script:tsItems = $null
+$script:tsTier = $null
+$script:tsDots = @()
+$script:tsStep = 6.0
+$script:tsWmax = 22.0
+$script:tsThick = 2.0
+$script:tsAvail = 0.0
+$script:tsTheigh = 20.0
+$script:tsHotY = -1.0
+$script:tsAnchorY = -1.0
+$script:tsViewY = -1.0
+$script:tsUserY = -1.0
+$script:tsUserAt = [DateTime]::MinValue
+$script:tsAnim = $null
+$script:tsAnimQ = $false
+$script:tsViewBar = $null
+$script:tsNewBar = $null
+$script:tsStyle = $null
+$script:tsTiers = 24
+$script:tsProbe = $false
+$script:tsLitLo = 0
+$script:tsLitHi = -1
+
+# 一档一份 Style：Tag=k → 宽度 8+16k/24、亮度 0.22+0.78k/24。
+# 生成一次，整列共用同一个 Style 实例（每根各建一个 Style 会白白造几千个触发器）。
+function Initialize-StripTicks {
+  if ($script:tsStyle) { return }
+  $sb = New-Object System.Text.StringBuilder
+  [void]$sb.Append('<Style xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" ')
+  [void]$sb.Append('xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="{x:Type Rectangle}">')
+  # 基础值必须写在 Style 里而不是元素上：本地值优先于 Style 的 Trigger，
+  # 初始化时给元素写 Width 会让整条波峰永远不生效（只剩同一宽度的一列）。
+  [void]$sb.Append('<Setter Property="Width" Value="10"/><Setter Property="Opacity" Value="0.38"/>')
+  $inv = [System.Globalization.CultureInfo]::InvariantCulture
+  # Triggers 必须包一层 <Style.Triggers>：直接挂在 <Style> 下会被当成
+  # SetterBaseCollection 收，报「向类型为 SetterBaseCollection 的集合中添加值引发了异常」。
+  [void]$sb.Append('<Style.Triggers>')
+  # 亮色：越宽越白（0.22 → 1.0 不透明度，同一支 #DFE5EE 靠不透明度叠出层次）
+  for ($k = 0; $k -le $script:tsTiers; $k++) {
+    $w = 10.0 + 16.0 * $k / $script:tsTiers
+    $o = 0.38 + 0.62 * $k / $script:tsTiers
+    $ws = [string]::Format($inv, '{0:0.##}', $w)
+    $os = [string]::Format($inv, '{0:0.###}', $o)
+    [void]$sb.Append("<Trigger Property=""Tag"" Value=""$k""><Setter Property=""Width"" Value=""$ws""/>")
+    [void]$sb.Append("<Setter Property=""Opacity"" Value=""$os""/></Trigger>")
+  }
+  [void]$sb.Append('</Style.Triggers></Style>')
+  try {
+    $script:tsStyle = [Windows.Markup.XamlReader]::Parse($sb.ToString())
+  } catch {
+    # 触发器解析不出来就退回逐帧直接写 Width/Opacity（慢一点，但不会白屏）
+    Log ("刻度条 Style 解析失败，退回直写模式: " + $_.Exception.Message)
+    $script:tsStyle = $null
+  }
+}
+
+# 建立/调整这一列刻度。canvas 高度变了才重建，平时只更新几何参数。
+function Update-StripGeometry {
+  Initialize-StripTicks
+  $h = [double]$QuestionIndexCanvas.ActualHeight
+  $w = [double]$QuestionIndexCanvas.ActualWidth
+  if ($w -le 0) { $w = 28.0 }
+  $script:tsAvail = [math]::Max(0.0, $h)
+  # 索引就是提问本身：多少个提问画多少根（新对话没有提问，就一根都不画）。
+  # 提问少时整列居中、间距最多 9px；提问特别多时压到 3px 一档，仍然铺得下。
+  $qN = @($script:historyQuestions).Count
+  if ($qN -le 0) {
+    $QuestionIndexCanvas.Children.Clear()
+    $script:tsViewBar = $null
+    $script:tsNewBar = $null
+    $script:tsStrips = @()
+    $script:tsTier = @()
+    $script:tsN = 0
+    $script:tsStep = 0.0
+    $script:tsTop0 = 0.0
+    $script:tsLitLo = 0
+    $script:tsLitHi = -1
+    $script:qiStep = 0.0
+    $script:qiTop0 = 0.0
+    return
+  }
+  $n = $qN
+  $p = 9.0
+  if ($n -gt 1) {
+    $p = [math]::Min(9.0, ($h - 14.0) / ($n - 1))
+    if ($p -lt 3.0) { $p = 3.0 }
+  }
+  $top0 = ($h - ($n - 1) * $p) / 2
+  if ($top0 -lt 6.0) { $top0 = 6.0 }
+  $script:tsStep = $p
+  $script:tsTop0 = $top0
+  $script:qiStep = $p
+  $script:qiTop0 = $top0
+  $script:tsWmax = [math]::Max(10.0, [math]::Min(26.0, $w - 4.0))
+  $thick = [math]::Max(1.4, [math]::Min(2.4, 0.42 * ($p / 6.0) * 6.0))
+  $script:tsThick = [math]::Round($thick, 1)
+  # 波峰半宽跟着刻度间距走：约 1.7 根间距，收得比之前紧——中心那根自己吃满档，
+  # 上下各一根大半个头，再往外很快衰减掉，滚到某个提问时「当前那根明显变粗变白」。
+  $script:tsTheigh = [math]::Max(7.0, [math]::Min(18.0, $p * 1.7))
+  if ($script:tsStrips -and $script:tsStrips.Count -eq $n) {
+    # 数量没变（高度微调）：只把每根刻度的纵向位置按新间距摆一遍
+    $script:tsN = $n
+    for ($i = 0; $i -lt $n; $i++) {
+      $script:tsStrips[$i].Height = $script:tsThick
+      [System.Windows.Controls.Canvas]::SetTop($script:tsStrips[$i], [math]::Max(0.0, [math]::Min($h - $script:tsThick, $top0 + $i * $p)))
+    }
+    return
+  }
+  $QuestionIndexCanvas.Children.Clear()
+  $script:tsViewBar = $null
+  $script:tsNewBar = $null
+  $script:tsLitLo = 0
+  $script:tsLitHi = -1
+  $script:tsStrips = New-Object object[] $n
+  $script:tsTier = New-Object int[] $n
+  for ($i = 0; $i -lt $n; $i++) {
+    $r = New-Object System.Windows.Shapes.Rectangle
+    $r.Height = $script:tsThick
+    $r.RadiusX = 0.7
+    $r.RadiusY = 0.7
+    $r.Fill = (Brush '#DFE5EE')
+    $r.IsHitTestVisible = $false
+    $r.Tag = '0'
+    # Width/Opacity 不在这里赋：本地值会压住 Style 触发器（见 Initialize-StripTicks）
+    if ($script:tsStyle) { $r.Style = $script:tsStyle } else { $r.Width = 10.0; $r.Opacity = 0.38 }
+    [System.Windows.Controls.Canvas]::SetLeft($r, 0)
+    [System.Windows.Controls.Canvas]::SetTop($r, [math]::Max(0.0, [math]::Min($h - $script:tsThick, $top0 + $i * $p)))
+    $QuestionIndexCanvas.Children.Add($r) | Out-Null
+    $script:tsStrips[$i] = $r
+    $script:tsTier[$i] = 0
+  }
+  $script:tsN = $n
+  # 视口指示线：白亮短线（Kite 那条滚动指示）
+  if (-not $script:tsViewBar) {
+    $vb = New-Object System.Windows.Shapes.Rectangle
+    $vb.Height = 3
+    $vb.RadiusX = 1.5
+    $vb.RadiusY = 1.5
+    $vb.Fill = (Brush '#FFFFFF')
+    $vb.Visibility = 'Collapsed'
+    $vb.IsHitTestVisible = $false
+    [System.Windows.Controls.Panel]::SetZIndex($vb, 10)
+    $QuestionIndexCanvas.Children.Add($vb) | Out-Null
+    $script:tsViewBar = $vb
+  }
+  # 底部「最新位置」标记：一根细蓝条
+  if (-not $script:tsNewBar) {
+    $nb = New-Object System.Windows.Shapes.Rectangle
+    $nb.Width = 3
+    $nb.Height = 12
+    $nb.RadiusX = 1.5
+    $nb.RadiusY = 1.5
+    $nb.Fill = (Brush '#4F8BFF')
+    $nb.Visibility = 'Collapsed'
+    $nb.IsHitTestVisible = $false
+    [System.Windows.Controls.Panel]::SetZIndex($nb, 11)
+    $QuestionIndexCanvas.Children.Add($nb) | Out-Null
+    $script:tsNewBar = $nb
+  }
+  # 波峰缓动：16ms 一帧，向目标位置逼近（0.3 的比例，约 120ms 收拢），
+  # 期间顺手把整列刻度的宽度/亮度刷一遍 —— 这就是「波峰平滑滑动」本身
+  if (-not $script:tsAnim) {
+    $script:tsAnim = New-Object System.Windows.Threading.DispatcherTimer
+    $script:tsAnim.Interval = [TimeSpan]::FromMilliseconds(16)
+    $script:tsAnim.Add_Tick({
+      $script:tsAnim.Stop()
+      $dy = [double]$script:tsAnchorY - [double]$script:tsHotY
+      $done = $false
+      if ([math]::Abs($dy) -lt 0.25) {
+        $script:tsHotY = $script:tsAnchorY
+        $done = $true
+      } else {
+        $script:tsHotY = [double]$script:tsHotY + $dy * 0.3
+      }
+      Update-StripPeak
+      if ($done) { $script:tsAnimQ = $false } else { $script:tsAnim.Start() }
+    })
+  }
+}
+
+# 把波峰推到某个 y（缓动过去）。$y < 0 表示回落成当前视口位置。
+function Set-StripPeakTarget([double]$y) {
+  if ($y -lt 0 -or [double]$script:tsViewY -lt 0) { $y = [double]$script:tsViewY }
+  if ($y -lt 0) { return }
+  $script:tsAnchorY = $y
+  if ($script:tsAnim -and -not $script:tsAnimQ) {
+    $script:tsAnimQ = $true
+    $script:tsAnim.Start()
+  } elseif (-not $script:tsAnim) {
+    $script:tsHotY = $y
+    Update-StripPeak
+  }
+}
+
+# 逐帧刷一遍：按波峰位置算高斯权重 → 换档（Tag），顺带刷提问刻度的亮度
+function Update-StripPeak {
+  $n = [int]$script:tsN
+  if ($n -le 0) { return }
+  $hs = [double]$script:tsHotY
+  if ($hs -lt 0 -and [double]$script:tsViewY -ge 0) { $hs = [double]$script:tsViewY }
+  if ($hs -lt 0) { return }
+  $p = [double]$script:tsStep
+  if ($p -le 0) { return }
+  $th = [double]$script:tsTheigh
+  $tiers = [int]$script:tsTiers
+  $strips = $script:tsStrips
+  $tier = $script:tsTier
+  $style = $script:tsStyle
+  # 只刷波峰附近的刻度（高斯在 3.5σ 外已经是 0 档）：远处那截根本不用碰，
+  # 这样一帧的开销是个位数根控件的换档，长对话滚动也不掉帧。
+  $center = ($hs - [double]$script:tsTop0) / $p
+  $lo = [int][math]::Floor($center - 3.6 * $th / $p) - 1
+  $hi = [int][math]::Ceiling($center + 3.6 * $th / $p) + 1
+  if ($lo -lt 0) { $lo = 0 }
+  if ($hi -gt ($n - 1)) { $hi = $n - 1 }
+  $k0 = -1
+  $k1 = -1
+  for ($i = $lo; $i -le $hi; $i++) {
+    # 波峰移走后，上一次点亮的刻度要退回去：这里从 $lo 起扫，但 lo 覆盖了旧波峰吗？
+    # 不一定——所以下面单独把 $tier>0 却落在区间外的那几根退档（数量很少）。
+    $y = [double]$script:tsTop0 + $i * $p
+    $d = ($y - $hs) / $th
+    $v = [math]::Exp(-0.5 * $d * $d)
+    $k = [int][math]::Round($v * $tiers)
+    if ($k -lt 0) { $k = 0 }
+    if ($k -gt $tiers) { $k = $tiers }
+    if ($k -ne $tier[$i]) {
+      $tier[$i] = $k
+      if ($style) {
+        # 换档：Style 的触发器跟着 Tag 走，宽度和亮度一起变
+        $strips[$i].Tag = [string]$k
+      } else {
+        $strips[$i].Width = 10.0 + 16.0 * $k / $tiers
+        $strips[$i].Opacity = 0.38 + 0.62 * $k / $tiers
+      }
+    }
+    if ($k -eq $tiers -and $k0 -lt 0) { $k0 = $i }
+    if ($k -gt 0) { $k1 = $i; if ($k0 -lt 0) { $k0 = $i } }
+  }
+  # 上一次点亮的刻度如果在新的窗口之外，退回底色档
+  $lastLo = [int]$script:tsLitLo
+  $lastHi = [int]$script:tsLitHi
+  if ($lastLo -lt $lo) {
+    $e = [math]::Min($lastHi, $lo - 1)
+    for ($i = $lastLo; $i -le $e; $i++) {
+      if ($tier[$i] -ne 0) {
+        $tier[$i] = 0
+        if ($style) { $strips[$i].Tag = '0' } else { $strips[$i].Width = 10.0; $strips[$i].Opacity = 0.38 }
+      }
+    }
+  }
+  if ($lastHi -gt $hi) {
+    $s0 = [math]::Max($lastLo, $hi + 1)
+    for ($i = $s0; $i -le $lastHi; $i++) {
+      if ($tier[$i] -ne 0) {
+        $tier[$i] = 0
+        if ($style) { $strips[$i].Tag = '0' } else { $strips[$i].Width = 10.0; $strips[$i].Opacity = 0.38 }
+      }
+    }
+  }
+  $script:tsLitLo = $lo
+  $script:tsLitHi = $hi
+  if ($script:tsProbe) { Write-StripProbe $hs $k0 $k1 }
+}
+
+# 自检用：把当前这一帧的波峰位置和宽度档位写进界面日志（PL_STRIPS_PROBE=1 才开）
+function Write-StripProbe([double]$hs, [int]$k0, [int]$k1) {
+  $now = [DateTime]::UtcNow
+  if (($now - $script:tsProbeAt).TotalMilliseconds -lt 400) { return }
+  $script:tsProbeAt = $now
+  $n = [int]$script:tsN
+  if ($n -le 0) { return }
+  $p = [double]$script:tsStep
+  $c = [int][math]::Round($hs / $p)
+  if ($c -lt 0) { $c = 0 }
+  if ($c -ge $n) { $c = $n - 1 }
+  $lo = $c - 5
+  if ($lo -lt 0) { $lo = 0 }
+  $hi = $c + 5
+  if ($hi -ge $n) { $hi = $n - 1 }
+  $parts = @()
+  for ($i = $lo; $i -le $hi; $i++) {
+    $w = [double]$script:tsStrips[$i].Width
+    $o = [double]$script:tsStrips[$i].Opacity
+    $tag = $i - $c
+    $parts += ("{0}:{1:0.#}/{2:0.00}" -f $tag, $w, $o)
+  }
+  Log ("strips n=$n hot=" + [math]::Round($hs, 1) + " peak=$c " + ($parts -join ' '))
+}
+
+# 视口位置在刻度条上的 y（顶部留 7px，底部贴着最后一根）
+function Get-StripViewY {
+  $ext = [double]$Scroller.ExtentHeight
+  $h = [double]$QuestionIndexCanvas.ActualHeight
+  if ($ext -le 0 -or $h -le 0) { return -1.0 }
+  $scrollable = $ext - [double]$Scroller.ViewportHeight
+  $pr = 0.0
+  if ($scrollable -gt 0) {
+    $pr = [math]::Max(0.0, [math]::Min(1.0, ([double]$Scroller.VerticalOffset) / $scrollable))
+  }
+  $y = 7.0 + $pr * ($h - 7.0)
+  # 视口波峰落在「离它最近的那根提问白杠」上，而不是两根之间的空处
+  $p = [double]$script:tsStep
+  $n = [int]$script:tsN
+  if ($p -gt 0 -and $n -gt 0) {
+    $i = [int][math]::Round(($y - [double]$script:tsTop0) / $p)
+    if ($i -lt 0) { $i = 0 }
+    if ($i -ge $n) { $i = $n - 1 }
+    $y = [double]$script:tsTop0 + $i * $p
+  }
+  return $y
+}
+
+# 刻度条上离鼠标最近的那条提问（鼠标 y → 提问）
+function Nearest-Question([double]$y) {
+  $qs = @($script:historyQuestions)
+  if ($qs.Count -le 0) { return $null }
+  $step = [double]$script:qiStep
+  if ($step -le 0) { $step = 8.0 }
+  $t0 = [double]$script:qiTop0
+  if ($t0 -le 0) { $t0 = 3.0 }
+  $i = [int][math]::Round(($y - $t0) / $step)
+  if ($i -lt 0) { $i = 0 }
+  if ($i -ge $qs.Count) { $i = $qs.Count - 1 }
+  return $qs[$i]
+}
+
+$script:qiPreviewInfo = @{}
+$script:qiSelEvent = -1
+$script:qiHoverKey = -1
+$script:qiHot = -1
+$script:qiBound = $false
+$script:tsProbeAt = [DateTime]::MinValue
+
+# 索引悬停预览：深色小卡，标题是问题原文、底下是那一轮回答的开头
+# （跟 Kite 一样：不点进去也能知道那段对话讲了什么）
+function Ensure-QuestionPreview {
+  # 卡片在 XAML 里（RootGrid 上的覆盖层）；Popup 会飘出窗口，不用了
+  if ($script:qPreview) { return }
+  $card = $window.FindName('QPreviewCard')
+  if (-not $card) { return }
+  $script:qPreview = $card
+  $script:qPreviewTitle = $window.FindName('QPreviewTitle')
+  $script:qPreviewBody = $window.FindName('QPreviewBody')
+  $script:qPreviewFoot = $window.FindName('QPreviewFoot')
+}
+
+# 悬停在刻度条任意位置就预览最近的提问（每一根刻度只有 2px 高，硬去点它太难用；
+# Kite 也是悬停在条上就出预览卡）
+function Show-QuestionPreview([double]$y, [int]$eventIndex) {
+  Ensure-QuestionPreview
+  $info = $script:qiPreviewInfo[$eventIndex]
+  if (-not $info) { return }
+  $script:qPreviewTitle.Text = [string]$info.title
+  $bodyText = [string]$info.body
+  if ($bodyText.Length -gt 200) { $bodyText = $bodyText.Substring(0, 200) + '…' }
+  $script:qPreviewBody.Text = $bodyText
+  $script:qPreviewBody.Visibility = $(if ($bodyText) { 'Visible' } else { 'Collapsed' })
+  $script:qPreviewFoot.Text = "第 $($info.n) 个提问 · 点击跳到这一段"
+  $card = $script:qPreview
+  if (-not $card) { return }
+  $card.Visibility = 'Visible'
+  $px = 10.0
+  $py = 10.0
+  $card.Measure((New-Object System.Windows.Size(380, [double]::PositiveInfinity)))
+  $cw = [double]$card.DesiredSize.Width
+  $ch = [double]$card.DesiredSize.Height
+  if ($rootGrid -and $cw -gt 0) {
+    # 刻度条在左边，卡片就贴在它右边；纵向跟着指针，再夹进窗口里
+    # 别用 PointFromScreen：它依赖窗口当前的屏幕位置，125% DPI / 窗口刚显示时
+    # 会给出 0 或错位的基址（卡片就贴在窗口顶部，不跟手）。用相对根 Grid 的变换。
+    $base = $null
+    try { $base = $QuestionIndexCanvas.TransformToAncestor($rootGrid).Transform((New-Object System.Windows.Point(0, 0))) } catch { $base = $null }
+    if (-not $base) { $base = New-Object System.Windows.Point(0, 0) }
+    $px = $base.X + [double]$QuestionIndexCanvas.ActualWidth + 8.0
+    $maxX = [double]$rootGrid.ActualWidth - $cw - 10
+    if ($px -gt $maxX) { $px = [math]::Max(10.0, $maxX) }
+    $py = $base.Y + $y - ($ch / 2)
+    $lo = 10.0
+    $hi = [double]$rootGrid.ActualHeight - $ch - 10
+    if ($hi -lt $lo) { $hi = $lo }
+    $py = [math]::Max($lo, [math]::Min($hi, $py))
+    if ($script:tsProbe) { Log ("preview: y=" + [math]::Round($y, 1) + " base=$" + [math]::Round($base.Y, 1) + " baseX=" + [math]::Round($base.X, 1) + " ch=" + [math]::Round($ch, 1) + " py=" + [math]::Round($py, 1) + " px=" + [math]::Round($px, 1) + " rootH=" + [math]::Round([double]$rootGrid.ActualHeight, 1)) }
+    $card.Margin = (New-Object System.Windows.Thickness($px, $py, 0, 0))
+  }
+}
+
+function Hide-QuestionPreview {
+  if ($script:qPreview) { $script:qPreview.Visibility = 'Collapsed' }
+}
+
+# 波峰扫过某条提问 / 悬停在它上面：那一条变宽变亮（其余靠波峰包络自然衰减）
+function Set-QiDot([int]$eventIndex, [bool]$hot) {
+  # 白杠的宽度/亮度统一由波峰（Style 档位）控制；这里再写本地值会压住 Style 触发器，
+  # 整条波峰的宽度变化就全废了（本地值优先于 Style 的 Trigger）。
+  return
+}
+
+# 点击刻度的反馈：那一条白一下、加长再回落
+function Select-QuestionIndex([int]$eventIndex, $dot) {
+  $script:qiSelEvent = $eventIndex
+  if (-not $dot -and $script:qiDots) { $dot = $script:qiDots[$eventIndex] }
+  if (-not $dot) { return }
+  $pulseW = New-Object System.Windows.Media.Animation.DoubleAnimation
+  $pulseW.From = [double]$dot.Width
+  $pulseW.To = 24
+  $pulseW.Duration = [System.Windows.Duration]::new([TimeSpan]::FromMilliseconds(140))
+  $script:qiPulseDot = $dot
+  $script:qiPulseEvent = $eventIndex
+  # 脉冲完把动画清掉再按普通态重画，否则会一直「卡」在放大后的尺寸（动画优先级高过本地值）
+  $pulseW.Add_Completed({
+    if ($script:qiPulseDot) {
+      $script:qiPulseDot.BeginAnimation([System.Windows.FrameworkElement]::WidthProperty, $null)
+      Set-QiDot ([int]$script:qiPulseEvent) ([int]$script:qiHot -eq [int]$script:qiPulseEvent)
+      $script:qiPulseDot = $null
+    }
+  })
+  $dot.BeginAnimation([System.Windows.FrameworkElement]::WidthProperty, $pulseW)
+}
+
+# 滚动时只挪指示线 + 把波峰缓动到新位置，不重画整列（不然长对话一滚就卡）
+function Update-QuestionIndexBar {
+  if (-not $script:tsViewBar) { return }
+  $h = [double]$QuestionIndexCanvas.ActualHeight
+  $ext = [double]$Scroller.ExtentHeight
+  $total = [double]$script:historyCount
+  if ($h -le 0 -or $ext -le 0 -or $total -le 0) {
+    $script:tsViewBar.Visibility = 'Collapsed'
+    if ($script:tsNewBar) { $script:tsNewBar.Visibility = 'Collapsed' }
+    return
+  }
+  $vh = [double]$Scroller.ViewportHeight
+  $scrollable = $ext - $vh
+  $pr = 0.0
+  if ($scrollable -gt 0) {
+    $pr = [math]::Max(0.0, [math]::Min(1.0, ([double]$Scroller.VerticalOffset) / $scrollable))
+  }
+  # 视口覆盖的全局事件区间：只渲染了尾巴（historyBefore > 0）时，窗口内的滚动比例要摊回全局
+  $e0 = [double]$script:historyBefore + $pr * $total
+  $e1 = $e0 + ($vh / $ext) * $total
+  if ($e1 -gt ($e0 + $total)) { $e1 = $e0 + $total }
+  $qs = @($script:historyQuestions)
+  $qn = $qs.Count
+  $i0 = 0
+  $i1 = 0
+  for ($i = 0; $i -lt $qn; $i++) {
+    $ev = [double]$qs[$i].eventIndex
+    if ($ev -le $e0) { $i0 = $i }
+    if ($ev -le $e1) { $i1 = $i }
+  }
+  $script:qiLitFrom = $i0
+  $script:qiLitTo = $i1
+  # 视口位置 → 刻度条上的 y：波峰落在「眼前正在读的那几段提问」的中点上。
+  # 不能拿滚动比例直接铺满整列：历史是分批加载的，只渲染了尾巴时滚到最后一个
+  # 提问，按比例算出来的波峰还停在整列中间，跟眼前的内容对不上。
+  $y = 7.0 + $pr * ($h - 7.0)
+  if ($qn -gt 0 -and [double]$script:tsStep -gt 0) {
+    $y = [double]$script:tsTop0 + (($i0 + $i1) / 2.0) * [double]$script:tsStep
+  }
+  $script:tsViewY = $y
+  # 不再画「视口白线」和底部蓝条：那一列只留提问白杠，
+  # 当前位置就靠波峰（对应那根变大变亮）自己表示，不额外多两根。
+  # 指针不在刻度条上时，波峰跟着视口走（缓动滑过去，不跳变）
+  if ([double]$script:tsUserY -lt 0 -and ([DateTime]::UtcNow - $script:tsUserAt).TotalMilliseconds -gt 200) {
+    Set-StripPeakTarget $y
+  }
+}
+
+# 一列密集刻度 + 提问节点：视口位置随滚动平滑对齐，鼠标悬停时波峰跟手并弹出预览
+function Draw-QuestionIndex {
+  if (-not $QuestionIndexCanvas) { return }
+  Hide-QuestionPreview
+  $script:qiHoverKey = -1
+  $script:qiHot = -1
+  $script:qiDots = @{}
+  $script:qiIndex = @{}
+  $script:qiPreviewInfo = @{}
+  $script:qiSelEvent = -1
+  $script:tsDots = @()
+  $script:tsUserY = -1.0
+  if (-not $script:tsProbe -and $env:PL_STRIPS_PROBE -eq '1') { $script:tsProbe = $true }
+  # 整条接管悬停/点击：每一根刻度只有 2px 高，硬点它太难用
+  if (-not $script:qiBound) {
+    $script:qiBound = $true
+    $script:qiPendY = 0.0
+    $script:qiPendEvent = -1
+    # 鼠标停下 60ms 再出卡：刻度很密，不然指针一动预览就在相邻两条之间闪
+    $script:qiDwell = New-Object System.Windows.Threading.DispatcherTimer
+    $script:qiDwell.Interval = [TimeSpan]::FromMilliseconds(60)
+    $script:qiDwell.Add_Tick({
+      $script:qiDwell.Stop()
+      if ($script:qiPendEvent -ge 0) { Show-QuestionPreview $script:qiPendY $script:qiPendEvent }
+    })
+    $QuestionIndexCanvas.Add_MouseMove({
+      param($s, $e)
+      # 指针在刻度条上：波峰直接跟手（不走缓动，手感才跟得住）
+      $script:tsUserY = $e.GetPosition($s).Y
+      $script:tsUserAt = [DateTime]::UtcNow
+      $script:tsHotY = $script:tsUserY
+      $script:tsAnchorY = $script:tsUserY
+      Update-StripPeak
+      $q = Nearest-Question $script:tsUserY
+      if (-not $q) {
+        # 指针落在两段提问之间：预览收起来，别一直挂着上一段的卡
+        if ($script:qiHoverKey -ge 0) {
+          $script:qiHoverKey = -1
+          Hide-QuestionPreview
+        }
+        return
+      }
+      $key = [int]$q.eventIndex
+      if ($script:qiHot -ne $key) {
+        if ($script:qiHot -ge 0) { Set-QiDot $script:qiHot $false }
+        $script:qiHot = $key
+        Set-QiDot $key $true
+      }
+      if ($script:qiHoverKey -eq $key) { return }
+      $script:qiPendY = $script:tsUserY
+      $script:qiPendEvent = $key
+      $script:qiDwell.Stop()
+      $script:qiDwell.Start()
+    })
+    $QuestionIndexCanvas.Add_MouseLeave({
+      $script:tsUserY = -1.0
+      $script:qiHoverKey = -1
+      if ($script:qiHot -ge 0) {
+        Set-QiDot $script:qiHot $false
+        $script:qiHot = -1
+      }
+      if ($script:qiDwell) { $script:qiDwell.Stop() }
+      Hide-QuestionPreview
+      # 指针离开：波峰缓动回到当前视口位置
+      Set-StripPeakTarget -1
+    })
+    $QuestionIndexCanvas.Add_MouseLeftButtonUp({
+      param($s, $e)
+      $y = $e.GetPosition($s).Y
+      $q = Nearest-Question $y
+      if (-not $q) { return }
+      Hide-QuestionPreview
+      Select-QuestionIndex ([int]$q.eventIndex) $null
+      Jump-ToQuestion ([int]$q.eventIndex)
+    })
+  }
+  Update-StripGeometry
+  $h = $QuestionIndexCanvas.ActualHeight
+  # 新对话没有提问 → 一根索引都不画（刻度已经在 Update-StripGeometry 里清空了）
+  if ($h -le 0 -or $script:historyCount -le 0) {
+    if ($script:tsNewBar) { $script:tsNewBar.Visibility = 'Collapsed' }
+    return
+  }
+  # 提问节点：在密集刻度之上叠一列稍宽的短线，波峰扫过时亮起来
+  $qs = @($script:historyQuestions)
+  $qCount = $qs.Count
+  # 几何由 Update-StripGeometry 统一算（索引就是提问），这里只取它的结果
+  $step = [double]$script:qiStep
+  $top0 = [double]$script:qiTop0
+  $script:qiDotH = [math]::Max(1.5, [math]::Min(3.0, $step * 0.5))
+  $script:qiLitFrom = -1
+  $script:qiLitTo = -2
+  if ($step -le 0) { return }
+  $n = 0
+  $stripsNow = @($script:tsStrips)
+  foreach ($q in $qs) {
+    $n++
+    $ev = [int]$q.eventIndex
+    $script:qiPreviewInfo[$ev] = @{
+      n = $n
+      title = [string]$q.text
+      body = [string]$q.answer
+    }
+    $script:qiIndex[$ev] = ($n - 1)
+    # 索引白杠就是上面那批刻度本身（一个提问一根），不再另建一套元素
+    if (($n - 1) -lt $stripsNow.Count) { $script:qiDots[$ev] = $stripsNow[$n - 1] }
+  }
+  # 视口位置先算一遍：波峰的第一帧就落在当前读到的地方
+  Update-QuestionIndexBar
+  if ([double]$script:tsHotY -lt 0) {
+    $script:tsHotY = [double]$script:tsViewY
+    if ($script:tsHotY -lt 0) { $script:tsHotY = 7.0 }
+    $script:tsAnchorY = $script:tsHotY
+  }
+  if ([int]$script:tsLitHi -lt 0) {
+    # 首帧还没算过波峰：把亮边界放到当前波峰上，否则第一次 Update-StripPeak 会漏掉退档
+    $script:tsLitLo = 0
+    $script:tsLitHi = -1
+  }
+  Update-StripPeak
+  if ($script:tsProbe) { Log ("strips init: n=$($script:tsN) step=" + [math]::Round($script:tsStep, 2) + " wmax=$($script:tsWmax) questions=$qCount") }
+}
+
+$QuestionIndexCanvas.Add_SizeChanged({ Draw-QuestionIndex })
+$Scroller.Add_ScrollChanged({ Update-QuestionIndexBar })
+
+function Send-HistoryRequest([string]$mode, [int]$cursor = 0, [int]$target = 0) {
+  if ($script:historyLoading) { return }
+  $script:historyLoading = $true
+  $script:historyRequestId++
+  $script:historyT0 = [System.Diagnostics.Stopwatch]::StartNew()
+  $script:historyFetched = 0
+  Send-Host @{ cmd = 'history-slice'; session = $script:sessionId; requestId = $script:historyRequestId; mode = $mode; cursor = $cursor; target = $target }
+}
+
+function Start-HistoryRender($e) {
+  $mode = [string]$e.mode
+  if ($mode -eq 'around' -or $mode -eq 'tail') {
+    Clear-Transcript
+    $script:historyLoading = $true
+    $script:replayHasUser = $false
+    $script:replayEnd = $null
+    $script:userElements = @{}
+    $script:historyBefore = [int]$e.from
+    $Scroller.ScrollToTop()
+  }
+  $from = [int]$e.from
+  $events = @($e.events)
+  if ($events.Count -eq 0) { $script:historyLoading = $false; return }
+  $panel = New-Object System.Windows.Controls.StackPanel
+  if ($mode -eq 'before') {
+    $insertAt = 0
+    if ($script:moreRow -and $Transcript.Children.IndexOf($script:moreRow) -eq 0) { $insertAt = 1 }
+    $Transcript.Children.Insert($insertAt, $panel)
+    $script:replayRenderJob = @{ events = $events; from = $from; next = 0; panel = $panel; mode = $mode; truncated = [bool]$e.truncated; nextFrom = [int]$e.nextFrom }
+  } else {
+    $Transcript.Children.Add($panel) | Out-Null
+    $script:replayRenderJob = @{ events = $events; from = $from; next = 0; panel = $panel; mode = $mode; jumpTo = $e.jumpTo; truncated = [bool]$e.truncated; nextFrom = [int]$e.nextFrom }
+  }
+  if ($mode -eq 'tail') { $script:historyTailFill = $true }
+  elseif ($mode -eq 'around') { $script:historyTailFill = $false }
+  $script:historyFetched += $events.Count
+  $script:replayEvents = $events
+  $script:replayAt = $from
+}
+
+function Continue-ReplayRender {
+  $job = $script:replayRenderJob
+  if (-not $job) { return }
+  $chunkOffset = $Scroller.VerticalOffset
+  $chunkExtent = if ($job.mode -eq 'before') { $Scroller.ExtentHeight } else { 0 }
+  $prevHost = $script:renderHost
+  $script:renderHost = $job.panel
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  try {
+    while ([int]$job.next -lt $job.events.Count -and $sw.ElapsedMilliseconds -lt 12) {
+      $script:renderEventIndex = [int]$job.from + [int]$job.next
+      Render-ReplayEvent $job.events[[int]$job.next]
+      $job.next = [int]$job.next + 1
+    }
+  } finally {
+    $script:renderEventIndex = -1
+    $script:renderHost = $prevHost
+  }
+  if ($job.mode -eq 'before') {
+    $Scroller.UpdateLayout()
+    $delta = $Scroller.ExtentHeight - [double]$chunkExtent
+    if ($delta -gt 0) { $Scroller.ScrollToVerticalOffset($chunkOffset + $delta) }
+  } elseif ($job.mode -eq 'tail' -or ($job.mode -eq 'after' -and $script:historyTailFill)) {
+    # 首屏边画边贴底：不然用户会看着内容从上往下填，而 Kite 切过去就是直接停在最新一条
+    $Scroller.ScrollToEnd()
+  }
+  if ([int]$job.next -lt $job.events.Count) {
+    # 靠 50ms 定时器轮询接着画的话，每帧只干 12ms、空等 38ms，长历史切过去就是
+    # 一段一段往外冒（实测 198 个事件要 2.3 秒）。这里画完立刻排下一片，只在两片
+    # 之间让出一次输入响应，整段连着读完，体感从「慢慢长出来」变成「一下就有了」。
+    if (-not $script:renderQueued) {
+      $script:renderQueued = $true
+      [System.Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
+        [System.Windows.Threading.DispatcherPriority]::Background,
+        [Action]{
+          $script:renderQueued = $false
+          Continue-ReplayRender
+        }) | Out-Null
+    }
+    return
+  }
+
+  Close-TurnProc
+  Close-ToolGroup
+  $script:currentAssistant = $null
+  $script:replayRenderJob = $null
+  # 历史画完了：如果这个会话此刻真的还有一轮在跑，末尾补一张活卡（呼吸灯 + 阶段词 + 计时）。
+  # 历史里的轮次都已经定格「已完成」，进行中的状态只由这张活卡来报，两者不会混在一起。
+  # 这一轮的事件可能先于历史到达（那时 $script:turnProc 已经是活卡），那就不再补第二张。
+  if ($script:busy -and (-not $script:turnProc -or -not $script:turnProc.Live)) {
+    New-TurnProc | Out-Null
+    Set-Busy $true
+    $Scroller.ScrollToEnd()
+  }
+  if ($job.mode -eq 'before') {
+    $script:historyBefore = [int]$job.from
+  } else {
+    $script:historyBefore = [int]$job.from
+    if ($null -ne $job.jumpTo -and $script:userElements.ContainsKey([int]$job.jumpTo)) {
+      $script:userElements[[int]$job.jumpTo].BringIntoView()
+    } elseif ($job.mode -eq 'tail' -or ($job.mode -eq 'after' -and $script:historyTailFill)) {
+      $Scroller.ScrollToEnd()
+    }
+  }
+  # host 按字节把一段历史切开了：这一段画完就接着拉下一段，用户不用管
+  if ($job.truncated) {
+    $script:historyLoading = $false
+    if ($job.mode -eq 'before') { Send-HistoryRequest 'before' ([int]$job.from) }
+    else { Send-HistoryRequest 'after' ([int]$job.nextFrom) }
+    return
+  }
+  $script:historyTailFill = $false
+  $script:historyLoading = $false
+  if ($script:historyT0) {
+    Log ("history: mode=$($job.mode) 事件=$($script:historyFetched) 耗时=$($script:historyT0.ElapsedMilliseconds)ms")
+    $script:historyT0 = $null
+  }
+  Update-ReplayMore
+  if ($script:pendingNotice -and $script:pendingNotice.Count -gt 0) {
+    foreach ($n in $script:pendingNotice) { Add-SystemLine ([string]$n[0]) ([string]$n[1]) }
+    $script:pendingNotice.Clear()
+  }
+  # 历史画完了，再把挂着的审批/提问补在末尾（要等清屏后的历史先排好）
+  if ($script:pendingCards -and $script:pendingCards.Count -gt 0) {
+    foreach ($c in $script:pendingCards) {
+      if ([string]$c[0] -eq 'approval') { Add-ApprovalCard $c[1] } else { Add-QuestionCard $c[1] }
+    }
+    $script:pendingCards.Clear()
+  }
+  if ($script:pendingJump -ge 0) {
+    $target = $script:pendingJump
+    $script:pendingJump = -1
+    Jump-ToQuestion $target
+  }
+}
+
+function Update-ReplayMore {
+  if ($script:historyBefore -gt 0) {
+    if (-not $script:moreRow) {
+      $b = New-Object System.Windows.Controls.Button
+      $b.HorizontalAlignment = 'Center'
+      $b.Height = 26
+      $b.Padding = '12,0'
+      $b.Margin = '0,0,0,10'
+      $b.FontSize = 11
+      $b.Cursor = 'Hand'
+      $b.Focusable = $false
+      $b.Background = (Brush '#12141A')
+      $b.Foreground = (Brush '#9BA3B4')
+      $b.BorderBrush = (Brush '#1FFFFFFF')
+      $b.BorderThickness = '1'
+      $b.Template = (New-FlatTemplate)
+      $b.ToolTip = '也可以直接往上滚，到底会自动加载'
+      $b.Add_Click({ param($s, $e) Load-OlderHistory })
+      $script:moreRow = $b
+    }
+    $script:moreRow.Content = '↑ 显示更早的对话'
+    if ($Transcript.Children.IndexOf($script:moreRow) -lt 0) {
+      $Transcript.Children.Insert(0, $script:moreRow) | Out-Null
+    }
+    return
+  }
+  if ($script:moreRow) {
+    $Transcript.Children.Remove($script:moreRow) | Out-Null
+    $script:moreRow = $null
+  }
+  if ($script:replayEnd) { return }
+  if ($script:replayHasUser) {
+    $end = New-Text "— 以上为历史记录 · $($script:historyCount) 条事件 —" 10 '#4B5158' 'Normal' 'Segoe UI' 0
+    $script:replayEnd = $end
+    $Transcript.Children.Add($end) | Out-Null
+  } else {
+    Add-EmptyState
+  }
+}
+
+# 画一批：$older=$true 时往顶部插（用户往上翻），否则追加到末尾（刚切过去）
+# 往上补一批。插完要把视口留在原来看到的地方：顶部突然多出内容时
+# ScrollViewer 的偏移量是按顶部算的，不补一下画面会往下跳一屏。
+function Load-OlderHistory {
+  if ($script:historyBefore -le 0 -or $script:historyLoading) { return }
+  Send-HistoryRequest 'before' $script:historyBefore
+}
+
+function Jump-ToQuestion([int]$eventIndex) {
+  if ($script:userElements.ContainsKey($eventIndex)) {
+    $script:userElements[$eventIndex].BringIntoView()
+    return
+  }
+  if ($script:historyLoading) { $script:pendingJump = $eventIndex; return }
+  Send-HistoryRequest 'around' 0 $eventIndex
+}
+
+function Clear-Transcript {
+  $script:replayRenderJob = $null
+  $script:historyLoading = $false
+  $script:userElements = @{}
+  $Transcript.Children.Clear()
+  $script:todoCard = $null
+  # 底部胶囊挂在聊天区最后，连同在跑的调用一起清掉（下一件工具开始会重新建）
+  $script:bottomPill = $null
+  $script:liveCalls = @{}
+  $script:currentAssistant = $null
+  $script:pendingText.Clear() | Out-Null
+  $script:reasonNode = $null
+  $script:toolRows = @{}
+  $script:toolGroup = $null
+  $script:turnProc = $null
+  $script:stepBox = $null
+  $script:stepNode = $null
+  $script:assistantBox = $null
+  $script:copyLog.Clear() | Out-Null
+  $script:copyBoxOf = @{}
+  $script:memoryCards = New-Object System.Collections.ArrayList
+  if ($AttachList) { Update-AttachList }
+$script:verifyRows = @{}
+}
+
+function Add-EmptyState {
+  $sp = New-Object System.Windows.Controls.StackPanel
+  $sp.Margin = '0,48,0,0'
+  $sp.Children.Add((New-Text '开始对话' 20 '#F9FAFB' 'SemiBold' 'Segoe UI' 8)) | Out-Null
+  $sp.Children.Add((New-Text '读文件、改代码、跑命令。每个写操作都会先问你。' 12.5 '#7C838E' 'Normal' 'Segoe UI' 20)) | Out-Null
+  foreach ($ex in @('这个项目的入口在哪里？', '帮我改掉 src 里的 bug', '把 README 里过时的部分更新一下')) {
+    $b = New-Object System.Windows.Controls.Button
+    $b.Content = $ex
+    $b.HorizontalAlignment = 'Left'
+    $b.Height = 28
+    $b.Padding = '12,0'
+    $b.FontSize = 12
+    $b.Margin = '0,0,0,7'
+    $b.Cursor = 'Hand'
+    $b.Background = (Brush '#12141A')
+    $b.Foreground = (Brush '#CFD3D6')
+    $b.BorderBrush = (Brush '#1FFFFFFF')
+    $b.BorderThickness = '1'
+    $b.Tag = [string]$ex
+    $b.Template = (New-FlatTemplate)
+    $b.Add_Click({ param($s, $e) Start-Turn ([string]$s.Tag) })
+    $sp.Children.Add($b) | Out-Null
+  }
+  $script:renderHost.Children.Add($sp) | Out-Null
+}
+
+# ---------------------------------------------------------------- 与 host 通信
+# 演示模式（-Demo）：不连 host，只回放 scripts/timeline-demo.json 里那三轮事件，
+# 用来看多轮执行流的完整效果（正文流 / 执行方案 / 底部胶囊），不真跑任何工具。
+$script:demoLines = @()
+$script:demoIdx = 0
+$script:demoWiped = $false
+# 回放的停顿：工具刚开始跑时多停一拍，胶囊和「运行中...」才看得见
+$script:demoHold = 0
+if ($Demo) {
+  $demoPath = Join-Path $root 'scripts\timeline-demo.json'
+  if (Test-Path $demoPath) {
+    # PS 5.1 的 Get-Content 按 ANSI 读，中文会乱码；显式按 UTF-8 读
+    $script:demoLines = @([System.IO.File]::ReadAllLines($demoPath, [System.Text.Encoding]::UTF8))
+    Log ("演示模式：" + $script:demoLines.Count + " 条事件，来自 " + $demoPath)
+  } else {
+    Log ("演示模式：找不到 " + $demoPath)
+  }
+}
+
+# ---------- 窗口标题栏配色（DWM） ----------
+# 注意这一整段必须放在 Start-Host 之外：演示模式（-Demo）下 Start-Host 第一行就 return，
+# 以前那段 Add-Type 写在函数体里，于是演示窗口的标题栏一直是系统配色（用户正是从这个窗口报的问题）。
+# 标题栏必须是界面自己的颜色，不能交给系统：Win11 默认让非客户区吃 Mica，
+# 于是深灰的界面顶上顶着一条由桌面壁纸染色的暗紫/暗红条（用户报了「边框和整体颜色不一致」）。
+#   DWMWA_USE_IMMERSIVE_DARK_MODE = 20（Win10 2004+，更早的版本是 19）：让按钮/文字走深色
+#   DWMWA_BORDER_COLOR  = 34、DWMWA_CAPTION_COLOR = 35、DWMWA_TEXT_COLOR = 36（Win11 22H2+）
+#   DWMWA_SYSTEMBACKDROP_TYPE = 38，值 1 = DWMSBT_NONE：关掉 Mica/亚克力
+# 颜色按 COLORREF 传（0x00BBGGRR，和 WPF 的 #RRGGBB 反着来）。
+function Set-TitleBarLook([IntPtr]$h) {
+  # Add-Type 放在函数里而不是脚本顶层：它要现编译一个小程序集（几十毫秒），
+  # 写在顶层就排到 ShowDialog 之前，白白推迟首帧；第一次调用时编译，窗口已经画出来了。
+  if (-not ('PL.Dwm' -as [type])) {
+    Add-Type -Namespace PL -Name Dwm -MemberDefinition @'
+[DllImport("dwmapi.dll")]
+public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+'@
+  }
+  $attrs = @(
+    @(38, 1),          # 背景：不透明纯色，不跟壁纸
+    @(20, 1), @(19, 1),# 深色模式（新旧两个属性号都试）
+    @(35, 0x0015110F), # 标题栏 #0F1115，和主内容区同一色
+    @(36, 0x00EEE8E6), # 标题文字 #E6E8EE，和界面主文字同一色
+    @(34, 0x0015110F), # 外框线也同色，省掉一圈突兀的亮边
+    @(33, 2)           # DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND：
+                       # WindowStyle=None 之后系统不再给圆角，角就变成直角了，这里要回来
+  )
+  foreach ($a in $attrs) {
+    # 逐条 try：老系统上 34/35/36/38 会失败，不能让一条把后面的全带下去
+    try {
+      $v = [int]$a[1]
+      [void][PL.Dwm]::DwmSetWindowAttribute($h, [int]$a[0], [ref]$v, 4)
+    } catch { }
+  }
+}
+
+# ---------- host 启动（挪到窗口显示之后，见 Add_Loaded） ----------
+# 实测这一段要 ~300ms（node 冷启动 + LinePump 现编译）。放在 ShowDialog 之前，
+# 就是「双击后先干等 0.3 秒」。窗口先出来，host 在 Loaded 里补上；这期间发的消息先排队。
+$script:proc = $null
+$script:pumpOut = $null
+$script:pumpErr = $null
+$script:hostQueue = New-Object System.Collections.ArrayList
+$script:hostStarted = $false
+function Start-Host {
+  # 演示模式：只回放脚本，永不起 host（原来这段 spawn 被 if (-not $Demo) 包着）
+  if ($Demo) { $script:hostQueue.Clear(); return }
+  $script:hostT0 = [System.Diagnostics.Stopwatch]::StartNew()
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$node = (Get-Command node -ErrorAction SilentlyContinue).Source
+if (-not $node) { $node = 'node.exe' }
+$psi.FileName = $node
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+$psi.RedirectStandardInput = $true
+$psi.RedirectStandardOutput = $true
+$psi.RedirectStandardError = $true
+$psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+$psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+$psi.WorkingDirectory = $root
+# 性能日志：同一个 run 继续往下传，host 写自己那份，按 mono 能拼成一条时间轴
+if ($script:perfMode -ne 'off') {
+  $psi.EnvironmentVariables['PL_PERF'] = [string]$script:perfMode
+  if ($script:perfRun) { $psi.EnvironmentVariables['PL_PERF_RUN'] = [string]$script:perfRun }
+  if ($script:perfT0 -gt 0) { $psi.EnvironmentVariables['PL_PERF_T0'] = [string]$script:perfT0 }
+}
+$hostArgs = @('--disable-warning=ExperimentalWarning', $hostTs, '--cwd', $Cwd, '--mode', $Mode)
+# 只把「真正给了值」的传下去：空串传成 --data-dir '' 会被 host 解析成当前目录
+if ($DataDir) { $hostArgs += @('--data-dir', $DataDir) }
+if ($BaseUrl) { $hostArgs += @('--base-url', $BaseUrl) }
+if ($Model) { $hostArgs += @('--model', $Model) }
+if ($ApiKey) { $hostArgs += @('--api-key', $ApiKey) }
+if ($Session) { $hostArgs += @('--resume', $Session) }
+# .NET Framework 4.8 没有 ArgumentList（那是 .NET Core 的），只能自己拼带引号的字符串
+$psi.Arguments = ($hostArgs | ForEach-Object {
+  if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+}) -join ' '
+
+if ($script:hostStarted) { return }
+$script:hostStarted = $true
+$script:proc = [System.Diagnostics.Process]::Start($psi)
+Log "host 已启动 pid=$($script:proc.Id)"
+Perf 'span' 'host-spawn' $script:hostT0.ElapsedMilliseconds @{ pid = $script:proc.Id }
+
+# 为什么需要这个东西：PowerShell 的脚本事件处理器（Add_OutputDataReceived）在
+# ShowDialog() 阻塞期间不会被调度（runspace 被占着），子进程的输出永远读不到。
+# 所以用一段 C# 起后台线程读行，UI 线程只从队列里取。
+Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading;
+
+public class LinePump
+{
+    private readonly Queue<string> q = new Queue<string>();
+    private readonly object gate = new object();
+    private readonly StreamReader reader;
+    private volatile bool done;
+
+    public LinePump(StreamReader r) { reader = r; }
+
+    public void Start()
+    {
+        var t = new Thread(Pump) { IsBackground = true };
+        t.Start();
+    }
+
+    private void Pump()
+    {
+        try
+        {
+            string line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                lock (gate) { q.Enqueue(line); }
+            }
+        }
+        catch { }
+        done = true;
+    }
+
+    /// <summary>没有新行时返回 null；流结束且取空后也返回 null</summary>
+    public string Take()
+    {
+        lock (gate) { return q.Count > 0 ? q.Dequeue() : null; }
+    }
+
+    public bool Finished { get { lock (gate) { return done && q.Count == 0; } } }
+
+    /// <summary>还排着没取走的行数——界面卡时它会变长，是「渲染跟不上」的直接证据</summary>
+    public int Count { get { lock (gate) { return q.Count; } } }
+}
+'@ -Language CSharp
+
+  if ($script:proc) {
+    $script:pumpOut = New-Object LinePump -ArgumentList $script:proc.StandardOutput
+    $script:pumpOut.Start()
+    $script:pumpErr = New-Object LinePump -ArgumentList $script:proc.StandardError
+    $script:pumpErr.Start()
+    Log '输出泵已启动'
+    Perf 'span' 'host-pump' $script:hostT0.ElapsedMilliseconds
+  }
+  # 窗口先出来后用户手快发的消息，host 一起来就补发（不然会静默丢掉）
+  if ($script:hostQueue.Count -gt 0) {
+    $pending = @($script:hostQueue)
+    $script:hostQueue.Clear()
+    foreach ($o in $pending) { Send-Host $o }
+  }
+}
+
+function Send-Host($obj) {
+  # host 未就绪（窗口先显示、它在 Loaded 里才起）：先排队，起来后补发，不能静默丢
+  if ($Demo) { return }
+  if (-not $script:proc) { [void]$script:hostQueue.Add($obj); return }
+  try {
+    $line = ($obj | ConvertTo-Json -Compress -Depth 6)
+    # 必须走 BaseStream 自己写 UTF-8 字节：.NET Framework 4.8 的 StandardInput 是
+    # 按 Console.InputEncoding（中文系统是 GBK）编码的，中文提示词写到子进程就变乱码了。
+    # 4.8 也没有 StandardInputEncoding 这个属性（.NET Core 才有）。
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($line + "`n")
+    $script:proc.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+    $script:proc.StandardInput.BaseStream.Flush()
+  } catch {
+    Log ("写入 host 失败: " + ($_ | Out-String))
+  }
+}
+
+# ---------------------------------------------------------------- 状态
+$script:busy = $false
+$script:currentAssistant = $null
+$script:assistantBody = $null
+$script:pendingText = New-Object System.Text.StringBuilder
+$script:toolRows = @{}
+$script:verifyRows = @{}
+$script:todoCard = $null
+$script:tickSeen = $false
+$script:modelName = $Model
+$script:modelChoices = @()
+$script:cwdPath = ''
+$script:modelPopup = $null
+$script:flatTpl = $null
+$script:fetching = $false
+$script:sessionId = ''
+$script:hostGone = $false
+$script:history = New-Object System.Collections.ArrayList
+$script:historyIdx = 0
+$script:cfgBaseURL = ''
+$script:cfgKeyMasked = ''
+# 供应商列表（host 的 ready / config / config-loaded 事件带来）
+$script:cfgProviders = @()
+$script:cfgActiveProvider = ''
+$script:verifyCmd = ''
+# 看图默认开（和 src/core/settings.ts 的 DEFAULT_VISION 一致）；host 的 ready 事件会带来真实值
+$script:visionOn = $true
+$script:logsDir = ''
+# 初始「有没有 Key」按掩码判断（启动时为没有）；host 的 ready / config-loaded 事件会带来真实值
+$script:hasKey = $false
+
+# ---------------------------------------------------------------- 确认框
+# 为什么不用 MessageBox：它画的是系统白底，和这套深色界面完全不搭（用户原话：样式不统一）。
+# 这里是窗口内的浮层，回调式：点"删除"才执行，点取消什么也不做。
+$script:confirmRun = $null
+
+function Show-Confirm {
+  # $arg 是给回调的实参：不靠 GetNewClosure 隐式捕获，PowerShell 5.1 下那个写法不可靠
+  # （见下面删除按钮处的注释）
+  param([string]$title, [string]$text, [string]$yesText = '确定', [scriptblock]$onYes, [object]$arg)
+  $ConfirmTitle.Text = $title
+  $ConfirmText.Text = $text
+  $ConfirmYes.Content = $yesText
+  $script:confirmRun = $onYes
+  $script:confirmArg = $arg
+  $ConfirmOverlay.Visibility = 'Visible'
+  $ConfirmYes.Focus() | Out-Null
+}
+
+function Hide-Confirm {
+  $ConfirmOverlay.Visibility = 'Collapsed'
+  $script:confirmRun = $null
+  $script:confirmArg = $null
+}
+
+$ConfirmNo.Add_Click({ Hide-Confirm })
+$ConfirmYes.Add_Click({
+  $run = $script:confirmRun
+  $arg = $script:confirmArg
+  Hide-Confirm
+  if ($run) { & $run $arg }
+})
+
+# ---------------------------------------------------------------- 单行输入（重命名 / 分组）
+# 和确认框同一套深色浮层：不用 Microsoft.VisualBasic 的 InputBox（白底系统框，样式不统一）
+$script:inputRun = $null
+$script:inputArg = $null
+
+# 已存分组的选择项：点一下就等于「在输入框里填了这个名字」
+# （回车/「移动」走的还是同一个 submit，不另开一条路径）
+function Set-InputChoices([string[]]$names, [string]$current) {
+  $InputGroupList.Children.Clear()
+  $list = @($names | Where-Object { $_ })
+  if ($list.Count -eq 0) {
+    $InputGroupBox.Visibility = 'Collapsed'
+    return
+  }
+  $InputGroupBox.Visibility = 'Visible'
+  # 「未分组」放最前：从某个组里退出来也是常见操作
+  $all = @('') + $list
+  foreach ($n in $all) {
+    $label = $(if ($n) { $n } else { '未分组' })
+    $isCur = ([string]$n -eq [string]$current)
+    $b = New-Object System.Windows.Controls.Button
+    $b.Content = $(if ($isCur) { $label + '  ✓' } else { $label })
+    $b.Tag = [string]$n
+    $b.Height = 26
+    $b.Margin = '0,0,0,4'
+    $b.Padding = '9,0'
+    $b.HorizontalContentAlignment = 'Left'
+    $b.Cursor = 'Hand'
+    $b.FontSize = 11.5
+    $b.BorderThickness = '1'
+    $b.Background = $(if ($isCur) { Brush '#28323F' } else { [System.Windows.Media.Brushes]::Transparent })
+    $b.Foreground = $(if ($isCur) { Brush '#8AB4FF' } else { Brush '#C7CBD2' })
+    $b.BorderBrush = $(if ($isCur) { Brush '#4D8AB4FF' } else { Brush '#1FFFFFFF' })
+    $b.Template = (New-FlatTemplate)
+    [System.Windows.Automation.AutomationProperties]::SetAutomationId($b, 'InputGroupOption')
+    [System.Windows.Automation.AutomationProperties]::SetName($b, $label)
+    $b.Add_Click({
+      param($s, $e)
+      # 点选只是把名字填进输入框：用户还能改，或者点「移动」确认
+      $InputField.Text = [string]$s.Tag
+      $InputField.Focus() | Out-Null
+      $InputField.CaretIndex = ([string]$InputField.Text).Length
+    })
+    $InputGroupList.Children.Add($b) | Out-Null
+  }
+}
+
+# 回调参数：$r.arg 是调用方给的上下文，$r.text 是用户输入（已 Trim）
+function Show-Input {
+  param([string]$title, [string]$hint = '', [string]$value = '', [string]$okText = '确定', [scriptblock]$onOk, [object]$arg,
+        [string[]]$choices = @(), [string]$choiceCurrent = '')
+  $InputTitle.Text = $title
+  $InputHint.Text = $hint
+  $InputHint.Visibility = $(if ($hint) { 'Visible' } else { 'Collapsed' })
+  $InputField.Text = $value
+  $InputYes.Content = $okText
+  Set-InputChoices $choices $(if ($choiceCurrent) { $choiceCurrent } else { $value })
+  $script:inputRun = $onOk
+  $script:inputArg = $arg
+  $InputOverlay.Visibility = 'Visible'
+  $InputField.Focus() | Out-Null
+  $InputField.SelectAll()
+}
+
+function Hide-Input {
+  $InputOverlay.Visibility = 'Collapsed'
+  $InputGroupBox.Visibility = 'Collapsed'
+  $InputGroupList.Children.Clear()
+  $script:inputRun = $null
+  $script:inputArg = $null
+}
+
+function Submit-Input {
+  $run = $script:inputRun
+  $r = @{ arg = $script:inputArg; text = ([string]$InputField.Text).Trim() }
+  Hide-Input
+  if ($run) { & $run $r }
+}
+
+$InputNo.Add_Click({ Hide-Input })
+$InputYes.Add_Click({ Submit-Input })
+$InputField.Add_PreviewKeyDown({
+  param($s, $e)
+  if ($e.Key -eq [System.Windows.Input.Key]::Return) { $e.Handled = $true; Submit-Input }
+  elseif ($e.Key -eq [System.Windows.Input.Key]::Escape) { $e.Handled = $true; Hide-Input }
+})
+$InputOverlay.Add_MouseLeftButtonUp({
+  param($s, $e)
+  # 点浮层的空白处 = 取消（点在卡片上时 OriginalSource 不是浮层本身）
+  if ([object]::ReferenceEquals($e.OriginalSource, $InputOverlay)) { Hide-Input }
+})
+
+# ---------------------------------------------------------------- 附件
+$script:attachFiles = New-Object System.Collections.ArrayList
+function Format-FileSize([double]$n) {
+  if ($n -lt 1024) { return "$([int]$n) B" }
+  if ($n -lt 1048576) { return "$([math]::Round($n / 1024)) KB" }
+  return "$([math]::Round($n / 1048576, 1)) MB"
+}
+
+# ---------------- 图片预览 ----------------
+function Show-ImagePreview([string]$path) {
+  if (-not $path) { return }
+  try {
+    $bytes = [System.IO.File]::ReadAllBytes($path)
+    $ms = [System.IO.MemoryStream]::new($bytes)
+    $bi = New-Object System.Windows.Media.Imaging.BitmapImage
+    $bi.BeginInit()
+    $bi.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+    $bi.StreamSource = $ms
+    $bi.EndInit()
+    $PreviewImage.Source = $bi
+    # 按窗口现尺寸算最大边，别让图顶到标题栏或两边
+    $PreviewImage.MaxWidth = [math]::Max(320, $window.ActualWidth - 40)
+    $PreviewImage.MaxHeight = [math]::Max(240, $window.ActualHeight - 120)
+    $PreviewName.Text = ('{0}  ·  {1} × {2}  ·  {3}' -f [System.IO.Path]::GetFileName($path), $bi.PixelWidth, $bi.PixelHeight, (Format-FileSize ([int64]$bytes.Length)))
+    $ImagePreview.Visibility = 'Visible'
+  } catch {
+    Log ('预览失败（' + $path + '）: ' + ($_ | Out-String))
+    Add-SystemLine ('打不开这张图：' + [System.IO.Path]::GetFileName($path)) '#F87171'
+  }
+}
+
+function Hide-ImagePreview {
+  $ImagePreview.Visibility = 'Collapsed'
+  $PreviewImage.Source = $null
+}
+
+# ---------------- 模型切换（底部那颗按钮 + 弹出菜单） ----------------
+function Update-ModelPill([string]$name) {
+  $t = $name
+  if (-not $t) { $t = '模型' }
+  $short = $t
+  if ($short.Length -gt 26) { $short = $short.Substring(0, 25) + '…' }
+  $ModelPill.Content = $short
+  $ModelPill.ToolTip = $(if ($name) { '当前模型：' + $name + '（点一下切换）' } else { '切换模型' })
+}
+
+# 工作目录按钮：只放最后两段目录名，完整路径放 ToolTip（中间那条工具栏位置有限）
+function Update-CwdPill([string]$path) {
+  $script:cwdPath = [string]$path
+  $label = '目录'
+  if ($path) {
+    $trimmed = ([string]$path).TrimEnd([char]92, [char]47)
+    $leaf = [System.IO.Path]::GetFileName($trimmed)
+    if (-not $leaf) { $leaf = $trimmed }
+    $parent = [System.IO.Path]::GetFileName([System.IO.Path]::GetDirectoryName($trimmed))
+    $label = $(if ($parent) { [System.IO.Path]::Combine($parent, $leaf) } else { $leaf })
+    if ($label.Length -gt 26) { $label = '…' + $label.Substring($label.Length - 25) }
+  }
+  $PickFolderBtn.Content = $label
+  $PickFolderBtn.ToolTip = $(if ($path) { '工作目录：' + $path + '（点一下换）' } else { '选择工作目录' })
+}
+
+# ---------------------------------------------------------------- 工作目录选择浮层
+# 系统 FolderBrowserDialog 是白底原生框，和这套深色界面不像一家人，所以自己画一个。
+# 交互：路径栏可直接粘路径回车跳；列表点一行就进去；底部「用这个目录」确认当前位置。
+$script:folderSel = ''          # 当前浏览到的目录；'' = 此电脑（列盘符）
+$script:folderPickRun = $null   # 确认回调；为空时默认给 host 发 cwd
+
+function Get-FolderDirs([string]$path) {
+  # 只列子目录，跳过隐藏/系统目录（$Recycle.Bin、System Volume Information 点进去只会报错）。
+  # 用 DirectoryInfo 枚举而不是 Get-ChildItem：列 C:\Windows\System32 这种大目录时快得多。
+  $list = New-Object System.Collections.ArrayList
+  if (-not $path) {
+    foreach ($d in [System.IO.DriveInfo]::GetDrives()) {
+      if (-not $d.IsReady) { continue }
+      $note = [string]$d.VolumeLabel
+      $list.Add([pscustomobject]@{ path = $d.RootDirectory.FullName; name = $d.RootDirectory.FullName; note = $note }) | Out-Null
+    }
+    return @($list)
+  }
+  try {
+    $di = New-Object System.IO.DirectoryInfo $path
+    foreach ($d in $di.EnumerateDirectories()) {
+      $at = $d.Attributes
+      if (($at -band [System.IO.FileAttributes]::Hidden) -ne 0) { continue }
+      if (($at -band [System.IO.FileAttributes]::System) -ne 0) { continue }
+      $list.Add([pscustomobject]@{ path = $d.FullName; name = $d.Name; note = '' }) | Out-Null
+    }
+  } catch { }
+  # 别在返回处多包一层逗号：PowerShell 会把整个数组当成"一个"目录名传下去，
+  # 结果所有子文件夹挤进同一行文本（踩过）
+  return @($list | Sort-Object name)
+}
+
+function New-FolderRow([string]$path, [string]$name, [string]$note) {
+  $b = New-Object System.Windows.Controls.Button
+  $b.Padding = '9,0'
+  $b.Height = 28
+  $b.Margin = '0,0,0,1'
+  $b.HorizontalContentAlignment = 'Left'
+  $b.Cursor = 'Hand'
+  $b.Foreground = (Brush '#C7CBD2')
+  $b.Background = [System.Windows.Media.Brushes]::Transparent
+  $b.BorderThickness = '0'
+  $b.FontSize = 12
+  $b.Template = (New-FlatTemplate)
+  $b.Tag = [string]$path
+  $dp = New-Object System.Windows.Controls.DockPanel
+  if ($note) {
+    $nt = New-Object System.Windows.Controls.TextBlock
+    $nt.Text = $note
+    $nt.FontSize = 10.5
+    $nt.Foreground = (Brush '#5B626D')
+    $nt.VerticalAlignment = 'Center'
+    $nt.Margin = '8,0,2,0'
+    [System.Windows.Controls.DockPanel]::SetDock($nt, 'Right')
+    $dp.Children.Add($nt) | Out-Null
+  }
+  $ic = New-Object System.Windows.Controls.TextBlock
+  $ic.Text = '📁'
+  $ic.FontSize = 12
+  $ic.Margin = '0,0,8,0'
+  $ic.VerticalAlignment = 'Center'
+  [System.Windows.Controls.DockPanel]::SetDock($ic, 'Left')
+  $dp.Children.Add($ic) | Out-Null
+  $tb = New-Object System.Windows.Controls.TextBlock
+  $tb.Text = $name
+  $tb.FontSize = 12
+  $tb.TextTrimming = 'CharacterEllipsis'
+  $tb.TextWrapping = 'NoWrap'
+  $tb.VerticalAlignment = 'Center'
+  $dp.Children.Add($tb) | Out-Null
+  $b.Content = $dp
+  [System.Windows.Automation.AutomationProperties]::SetAutomationId($b, 'FolderRow')
+  [System.Windows.Automation.AutomationProperties]::SetName($b, $name)
+  $b.Add_Click({
+    param($s, $e)
+    # 点一行就进去：不搞「先选中再打开」，路径栏本身就是「当前在哪」的反馈
+    Set-FolderPath ([string]$s.Tag)
+  })
+  return $b
+}
+
+function Get-ParentFolder([string]$path) {
+  if (-not $path) { return '' }
+  $p = [System.IO.Directory]::GetParent($path)
+  if ($p) { return $p.FullName }
+  return ''   # 已经在盘根：上一级＝此电脑
+}
+
+function Show-FolderList {
+  $FolderList.Children.Clear()
+  $dirs = @(Get-FolderDirs $script:folderSel)
+  if ($dirs.Count -eq 0) {
+    $FolderEmpty.Text = $(if ($script:folderSel) { "「$($script:folderSel)」下面没有子文件夹，可以直接点「用这个目录」。" } else { '没有可用的磁盘。' })
+    $FolderEmpty.Visibility = 'Visible'
+  } else {
+    $FolderEmpty.Visibility = 'Collapsed'
+    foreach ($d in $dirs) { $FolderList.Children.Add((New-FolderRow $d.path $d.name $d.note)) | Out-Null }
+  }
+  $FolderHint.Text = $(if ($script:folderSel) { '点一行进入该文件夹；也可以用上面的路径栏直接粘路径。' } else { '选一个磁盘，或直接在路径栏里粘完整路径再回车。' })
+  # 「此电脑」视图没有「当前目录」可确认，按钮置灰避免点了个空
+  $FolderPick.IsEnabled = [bool]$script:folderSel
+  $FolderUp.IsEnabled = $true
+  try { $FolderScroll.ScrollToTop() } catch { }
+}
+
+function Set-FolderPath([string]$path) {
+  $p = ([string]$path).Trim()
+  if ($p) {
+    $p = $p.Trim('"').Trim()
+    if ($p.Length -gt 3) { $p = $p.TrimEnd([char]92, [char]47) }
+    if (-not [System.IO.Directory]::Exists($p)) {
+      # 路径不存在：不清掉列表，只在中间提示一下，用户还能继续点别的
+      $FolderEmpty.Text = '路径不存在：' + $p
+      $FolderEmpty.Visibility = 'Visible'
+      return
+    }
+  }
+  $script:folderSel = $p
+  $FolderPath.Text = $p
+  Show-FolderList
+}
+
+function Show-FolderPicker {
+  param([scriptblock]$onPick, [string]$start)
+  $s = [string]$start
+  if (-not $s) { $s = [string]$script:cwdPath }
+  if (-not $s) { $s = [string]$env:USERPROFILE }
+  if ($s -and -not [System.IO.Directory]::Exists($s)) { $s = [string]$env:USERPROFILE }
+  $script:folderPickRun = $onPick
+  $script:folderSel = ''
+  $FolderOverlay.Visibility = 'Visible'
+  Set-FolderPath $s
+}
+
+function Hide-FolderPicker {
+  $FolderOverlay.Visibility = 'Collapsed'
+  $FolderList.Children.Clear()
+  $script:folderPickRun = $null
+}
+
+function Confirm-FolderPick {
+  $p = [string]$script:folderSel
+  if (-not $p) { return }
+  $run = $script:folderPickRun
+  Hide-FolderPicker
+  if ($run) { & $run $p }
+  else {
+    # 先乐观更新胶囊：host 那边还要走一趟（切 cwd 可能要重启工具环境），
+    # 不等它的 cwd 事件，点了就立刻看到新目录，host 回来再覆盖一次同样的值。
+    Update-CwdPill $p
+    Send-Host @{ cmd = 'cwd'; dir = $p }
+  }
+}
+
+$FolderCancel.Add_Click({ Hide-FolderPicker })
+$FolderPick.Add_Click({ Confirm-FolderPick })
+$FolderUp.Add_Click({ Set-FolderPath (Get-ParentFolder $script:folderSel) })
+$FolderRoot.Add_Click({ Set-FolderPath '' })
+$FolderPath.Add_PreviewKeyDown({
+  param($s, $e)
+  if ($e.Key -eq [System.Windows.Input.Key]::Return) {
+    $e.Handled = $true
+    Set-FolderPath $FolderPath.Text
+  }
+})
+$FolderOverlay.Add_MouseLeftButtonUp({
+  param($s, $e)
+  # 点遮罩空白处＝取消（点在卡片上时 OriginalSource 不是遮罩本身）
+  if ([object]::ReferenceEquals($e.OriginalSource, $FolderOverlay)) { Hide-FolderPicker }
+})
+
+# 下拉菜单自己画：ContextMenu 的 MenuItem 是系统模板（白底、蓝高亮），深色界面上太跳
+function New-FlatTemplate {
+  if ($script:flatTpl) { return $script:flatTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="14" Padding="{TemplateBinding Padding}">
+    <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#252933"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#2C333F"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:flatTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:flatTpl
+}
+
+# 选中态专用模板：悬停 / 按下都保持蓝底，不被灰色 hover 盖掉选中感
+function New-SelTemplate {
+  if ($script:selTpl) { return $script:selTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="14" Padding="{TemplateBinding Padding}">
+    <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#252D3B"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#2A3443"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:selTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:selTpl
+}
+
+# 发送键：蓝色实心，悬停亮一点、禁用变暗蓝，同样不走系统模板
+function New-SendTemplate {
+  if ($script:sendTpl) { return $script:sendTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="6" Padding="{TemplateBinding Padding}">
+    <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#3D6CFF"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#2450E0"/>
+    </Trigger>
+    <Trigger Property="IsEnabled" Value="False">
+      <Setter TargetName="bd" Property="Background" Value="#2F3A5C"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:sendTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:sendTpl
+}
+
+# 圆形发送键：28x28 蓝底圆形箭头，悬停亮一点、禁用变暗蓝
+function New-SendCircleTemplate {
+  if ($script:sendCircleTpl) { return $script:sendCircleTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="14" Padding="{TemplateBinding Padding}">
+    <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#3D6CFF"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#2450E0"/>
+    </Trigger>
+    <Trigger Property="IsEnabled" Value="False">
+      <Setter TargetName="bd" Property="Background" Value="#2F3A5C"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:sendCircleTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:sendCircleTpl
+}
+
+# 停止键：暗红胶囊 + 左边一个小方块（原模块里没有对应图标字，直接用矩形画，缩放不失真）。
+# Content 仍然是文字：跑的时候代码会把 Content 改成「正在中断…」，宽度自然长出去。
+function New-StopTemplate {
+  if ($script:stopTpl) { return $script:stopTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+          BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="14" Padding="{TemplateBinding Padding}">
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center">
+      <Rectangle x:Name="sq" Width="8" Height="8" RadiusX="2" RadiusY="2"
+                 Fill="{TemplateBinding Foreground}" VerticalAlignment="Center" Margin="0,0,7,0"/>
+      <ContentPresenter VerticalAlignment="Center"/>
+    </StackPanel>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#3A1A1F"/>
+      <Setter TargetName="bd" Property="BorderBrush" Value="#80F87171"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#4A2027"/>
+    </Trigger>
+    <Trigger Property="IsEnabled" Value="False">
+      <Setter Property="Opacity" Value="0.55"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:stopTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:stopTpl
+}
+
+# 标题栏的窗口按钮（最小化 / 最大化）：透明底、悬停一层白纱，高度铺满标题栏
+function New-CaptionTemplate {
+  if ($script:captionTpl) { return $script:captionTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+  <Border x:Name="bd" Background="{TemplateBinding Background}">
+    <ContentPresenter x:Name="cp" HorizontalAlignment="Center" VerticalAlignment="Center"
+                      TextBlock.Foreground="{TemplateBinding Foreground}"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#22FFFFFF"/>
+      <Setter TargetName="cp" Property="TextBlock.Foreground" Value="#FFFFFF"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#38FFFFFF"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:captionTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:captionTpl
+}
+
+# 关闭键：悬停是 Windows 惯例的红底白字，不跟着另外两个按钮走白纱
+function New-CaptionCloseTemplate {
+  if ($script:captionCloseTpl) { return $script:captionCloseTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+  <Border x:Name="bd" Background="{TemplateBinding Background}">
+    <ContentPresenter x:Name="cp" HorizontalAlignment="Center" VerticalAlignment="Center"
+                      TextBlock.Foreground="{TemplateBinding Foreground}"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#C42B1C"/>
+      <Setter TargetName="cp" Property="TextBlock.Foreground" Value="#FFFFFF"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#9E2014"/>
+      <Setter TargetName="cp" Property="TextBlock.Foreground" Value="#FFFFFF"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:captionCloseTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:captionCloseTpl
+}
+
+# 危险操作（删除/确认删）：红底按钮，悬停亮一点；不走系统模板，避免悬停变白底
+function New-DangerTemplate {
+  if ($script:dangerTpl) { return $script:dangerTpl }
+  $xaml = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+  <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="6" Padding="{TemplateBinding Padding}">
+    <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#FF8A8A"/>
+    </Trigger>
+    <Trigger Property="IsPressed" Value="True">
+      <Setter TargetName="bd" Property="Background" Value="#E05A5A"/>
+    </Trigger>
+    <Trigger Property="IsEnabled" Value="False">
+      <Setter TargetName="bd" Property="Background" Value="#5A3A3E"/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>
+'@
+  $script:dangerTpl = [System.Windows.Markup.XamlReader]::Parse($xaml)
+  return $script:dangerTpl
+}
+
+# 底栏、左栏的按钮统一自绘：系统模板一悬停就是浅灰/白底，跟深色界面对不上
+$ModelPill.Template = (New-FlatTemplate)
+$ModePill.Template = (New-FlatTemplate)
+$AttachBtn.Template = (New-FlatTemplate)
+
+$PickFolderBtn.Template = (New-FlatTemplate)
+$StopBtn.Template = (New-StopTemplate)
+$MinBtn.Template = (New-CaptionTemplate)
+$MaxBtn.Template = (New-CaptionTemplate)
+$CloseBtn.Template = (New-CaptionCloseTemplate)
+$NewChatBtn.Template = (New-FlatTemplate)
+$SettingsBtn.Template = (New-FlatTemplate)
+$SendBtn.Template = (New-SendCircleTemplate)
+# 设置面板、确认框、预览、输入浮层里的按钮也要同一套，不然一悬停就冒浅色块
+$CfgFetch.Template = (New-FlatTemplate)
+$CfgOpenLogs.Template = (New-FlatTemplate)
+$CfgCancel.Template = (New-FlatTemplate)
+$ConfirmNo.Template = (New-FlatTemplate)
+$InputNo.Template = (New-FlatTemplate)
+$FolderUp.Template = (New-FlatTemplate)
+$FolderRoot.Template = (New-FlatTemplate)
+$FolderCancel.Template = (New-FlatTemplate)
+$FolderPick.Template = (New-SendTemplate)
+$PreviewClose.Template = (New-FlatTemplate)
+$CfgSave.Template = (New-SendTemplate)
+$InputYes.Template = (New-SendTemplate)
+$ConfirmYes.Template = (New-DangerTemplate)
+
+function New-MenuRow([string]$text, [string]$mark) {
+  $b = New-Object System.Windows.Controls.Button
+  $b.Padding = '10,7'
+  $b.HorizontalContentAlignment = 'Left'
+  $b.Cursor = 'Hand'
+  $b.FontSize = 11.5
+  $b.FontFamily = 'Cascadia Mono, Consolas'
+  $b.Foreground = (Brush '#CFD3D6')
+  $b.Background = [System.Windows.Media.Brushes]::Transparent
+  $b.BorderThickness = '0'
+  $b.Template = (New-FlatTemplate)
+  $inner = New-Object System.Windows.Controls.DockPanel
+  $mk = New-Object System.Windows.Controls.TextBlock
+  $mk.Text = $mark
+  $mk.Width = 16
+  $mk.Foreground = (Brush '#8AB4FF')
+  $mk.FontFamily = 'Segoe UI'
+  $mk.VerticalAlignment = 'Center'
+  [System.Windows.Controls.DockPanel]::SetDock($mk, 'Left')
+  $inner.Children.Add($mk) | Out-Null
+  $tb = New-Object System.Windows.Controls.TextBlock
+  $tb.Text = $text
+  $tb.TextTrimming = 'CharacterEllipsis'
+  $tb.TextWrapping = 'NoWrap'
+  $tb.VerticalAlignment = 'Center'
+  $inner.Children.Add($tb) | Out-Null
+  $b.Content = $inner
+  return $b
+}
+
+# 模型菜单的内容区：按供应商分组列出各自的模型，$filter 非空时按名字过滤。
+#
+# 为什么要分组：一个人常同时配好几家（公司网关、官方 API、本地 Ollama），
+# 同一个模型名在不同家往往是不同的东西；平铺成一列时看不出「这行是哪家的」，
+# 选错了还得回设置里翻半天。
+function Update-ModelRows([string]$filter) {
+  $rows = $script:modelRows
+  if (-not $rows) { return }
+  $rows.Children.Clear()
+  $f = ([string]$filter).Trim().ToLowerInvariant()
+  $providers = @($script:cfgProviders)
+  # 一家都没配（老配置只有顶层 baseURL/apiKey/model）：当成唯一一家「默认」列出来
+  if ($providers.Count -eq 0) {
+    $providers = @([pscustomobject]@{
+      id = ''; name = ''; baseURL = $script:cfgBaseURL
+      model = $script:modelName; models = @($script:modelChoices)
+    })
+  }
+  $any = $false
+  foreach ($p in $providers) {
+    $models = @($p.models | Where-Object { $_ })
+    if ($models.Count -eq 0 -and $p.model) { $models = @([string]$p.model) }
+    $matched = @()
+    foreach ($m in $models) {
+      if ($f -and -not ([string]$m).ToLowerInvariant().Contains($f)) { continue }
+      $matched += [string]$m
+    }
+    if ($matched.Count -eq 0) { continue }
+    $any = $true
+
+    # 组头：供应商名（没起名字就用端点，和设置面板上的显示一致）
+    $head = New-Object System.Windows.Controls.TextBlock
+    $pname = [string]$p.name
+    if (-not $pname) { $pname = [string]$p.baseURL }
+    $head.Text = $pname
+    $head.FontSize = 10.5
+    $head.FontFamily = 'Segoe UI'
+    $head.Foreground = (Brush '#7C838E')
+    $head.Margin = '10,9,10,3'
+    $head.TextTrimming = 'CharacterEllipsis'
+    $rows.Children.Add($head) | Out-Null
+
+    foreach ($m in $matched) {
+      $isCur = ([string]$m -eq [string]$script:modelName) -and
+               ((-not $p.id) -or ([string]$p.id -eq [string]$script:cfgActiveProvider))
+      $row = New-MenuRow $m $(if ($isCur) { '✓' } else { '' })
+      # PS 5.1 的坑：事件里别用 GetNewClosure（会把整个作用域复制一份，$script 里改的东西全丢），
+      # 要传的值都塞进 Tag，处理时再拆开
+      $row.Tag = ([string]$p.id) + [char]1 + $m
+      $row.Add_Click({
+        param($s, $e)
+        if ($script:modelPopup) { $script:modelPopup.IsOpen = $false }
+        $parts = ([string]$s.Tag) -split ([char]1), 2
+        $msg = @{ cmd = 'use-model'; model = $parts[1] }
+        if ($parts[0]) { $msg['providerId'] = $parts[0] }
+        Send-Host $msg
+      })
+      $rows.Children.Add($row) | Out-Null
+    }
+  }
+  if (-not $any) {
+    $tip = $(if ($f) { '没有匹配的模型' } else { '还没有模型列表，打开设置拉一次' })
+    $rows.Children.Add((New-MenuRow $tip '')) | Out-Null
+  }
+}
+
+# 底部模型按钮的菜单：搜索框 + 按供应商分组 + 当前项打勾
+function Show-ModelMenu([object]$anchor) {
+  if ($script:modelPopup) { $script:modelPopup.IsOpen = $false }
+  $box = New-Object System.Windows.Controls.Border
+  $box.Background = (Brush '#1B1F27')
+  $box.BorderBrush = (Brush '#33FFFFFF')
+  $box.BorderThickness = '1'
+  $box.CornerRadius = '8'
+  $box.Padding = '4'
+  $box.MinWidth = 260
+  $box.MaxWidth = 470
+  $col = New-Object System.Windows.Controls.StackPanel
+
+  # 搜索框：一家端点就可能列出上百个模型，没有搜索只能一路滚
+  $searchLabel = New-Object System.Windows.Controls.TextBlock
+  $searchLabel.Text = '搜索模型'
+  $searchLabel.FontSize = 10
+  $searchLabel.FontFamily = 'Segoe UI'
+  $searchLabel.Foreground = (Brush '#5B626D')
+  $searchLabel.Margin = '8,4,8,3'
+  $col.Children.Add($searchLabel) | Out-Null
+
+  $search = New-Object System.Windows.Controls.TextBox
+  $search.FontSize = 11.5
+  $search.FontFamily = 'Cascadia Mono, Consolas'
+  $search.Foreground = (Brush '#E5E7EB')
+  $search.Background = (Brush '#16181D')
+  $search.BorderThickness = '1'
+  $search.BorderBrush = (Brush '#26FFFFFF')
+  $search.Padding = '7,5'
+  $search.Margin = '4,0,4,4'
+  $search.CaretBrush = (Brush '#8AB4FF')
+  $col.Children.Add($search) | Out-Null
+
+  $rows = New-Object System.Windows.Controls.StackPanel
+  $script:modelRows = $rows
+  $scroll = New-Object System.Windows.Controls.ScrollViewer
+  $scroll.MaxHeight = 330
+  $scroll.VerticalScrollBarVisibility = 'Auto'
+  $scroll.HorizontalScrollBarVisibility = 'Disabled'
+  # 坑：ScrollViewer 的 Child 是 protected，PS 里 $scroll.Child = ... 会抛
+  # 「The property 'Child' cannot be found on this object」，整条点击链跟着崩；要用 Content
+  $scroll.Content = $rows
+  $col.Children.Add($scroll) | Out-Null
+
+  # 边打字边过滤（内容区重画，菜单本身不重建，焦点不丢）
+  $search.Add_TextChanged({
+    param($s, $e)
+    Update-ModelRows ([string]$s.Text)
+  })
+
+  Update-ModelRows ''
+
+  $sep = New-Object System.Windows.Controls.Border
+  $sep.Height = '1'
+  $sep.Margin = '6,4,6,4'
+  $sep.Background = (Brush '#1FFFFFFF')
+  $col.Children.Add($sep) | Out-Null
+
+  $cfg = New-MenuRow '在设置里换端点 / 拉取模型…' ''
+  $cfg.Foreground = (Brush '#8AB4FF')
+  $cfg.FontFamily = 'Segoe UI'
+  $cfg.Add_Click({
+    if ($script:modelPopup) { $script:modelPopup.IsOpen = $false }
+    Open-Settings
+  })
+  $col.Children.Add($cfg) | Out-Null
+
+  $box.Child = $col
+  $pop = New-Object System.Windows.Controls.Primitives.Popup
+  $pop.PlacementTarget = $anchor
+  $pop.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Top
+  $pop.VerticalOffset = -6
+  $pop.StaysOpen = $false
+  $pop.AllowsTransparency = $true
+  $pop.Child = $box
+  $script:modelPopup = $pop
+  $pop.IsOpen = $true
+
+  # 有哪家的模型列表还是空的（新加的供应商 / 从没拉过）：趁菜单开着先问一次，
+  # 回包后由 'models' 事件重画内容区，不用让用户再点第二遍。
+  # 不再要求「有 Key」：免鉴权的端点（本地推理服务、网关）没 Key 照样列得出模型，
+  # 卡在这儿会让设置里配好的模型在对话框里一个都不显示。
+  $needFetch = $false
+  foreach ($p in @($script:cfgProviders)) { if (@($p.models | Where-Object { $_ }).Count -eq 0) { $needFetch = $true } }
+  if ($needFetch -or @($script:cfgProviders).Count -eq 0) {
+    Send-Host @{ cmd = 'list-models'; all = $true }
+  }
+  try { $search.Focus() | Out-Null } catch { }
+}
+
+
+# 扩展名判断图片：和 src/core/attach.ts 里的 IMAGE_EXT 对齐
+function Test-ImagePath([string]$path) {
+  $ext = [System.IO.Path]::GetExtension($path).ToLowerInvariant()
+  return @('.png', '.jpg', '.jpeg', '.webp', '.gif') -contains $ext
+}
+
+# 缩略图：DecodePixelHeight 只解到 168px 高，几百 MB 的截图也不会把整张读进内存。
+# 坑：必须先设 CacheOption=OnLoad 再给 StreamSource，EndInit 时才会真的解码；
+# 顺序反过来（先给流、再设 OnLoad）会变成延迟解码，流一关就解不出来，
+# 最后 Image 的宽是 0——附件条上只剩文件名，缩略图根本不显示（实测）。
+# 用 MemoryStream 而非 FileStream：不占文件句柄，用户的原图随时能删能改。
+function New-ImageThumb([string]$path, [double]$h = 40) {
+  try {
+    $ms = [System.IO.MemoryStream]::new([System.IO.File]::ReadAllBytes($path))
+    $bi = New-Object System.Windows.Media.Imaging.BitmapImage
+    $bi.BeginInit()
+    $bi.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+    $bi.DecodePixelHeight = 168
+    $bi.StreamSource = $ms
+    $bi.EndInit()
+    $img = New-Object System.Windows.Controls.Image
+    $img.Source = $bi
+    $img.Height = $h
+    $img.MaxWidth = 140
+    $img.Stretch = 'Uniform'
+    # 缩略图包一层无边框按钮：Image 本身不参与 UIA 的 Invoke，包成按钮既好点也好测
+    $btn = New-Object System.Windows.Controls.Button
+    $btn.Content = $img
+    # 缩略图外面套一圈浅色边框：粘的是深色界面截图时，缩略图本身也是深色的，
+    # 没有边框就和附件条底色糊成一片，看起来像“根本没生成缩略图”（用户实测踩过）
+    $btn.Padding = '3'
+    $btn.Margin = '0,0,7,0'
+    $btn.Template = (New-FlatTemplate)
+    $btn.BorderThickness = '1'
+    $btn.BorderBrush = (Brush '#6B7484')
+    $btn.Background = (Brush '#343C48')
+    $btn.VerticalAlignment = 'Center'
+    $btn.Cursor = 'Hand'
+    $btn.ToolTip = '点开看大图'
+    $btn.Tag = $path
+    $btn.Add_Click({
+      param($s, $e)
+      $e.Handled = $true
+      Show-ImagePreview ([string]$s.Tag)
+    })
+    return $btn
+  } catch {
+    Log ("缩略图生成失败（$path）: " + ($_ | Out-String))
+    return $null
+  }
+}
+
+function Update-AttachList {
+  $AttachList.Children.Clear()
+  if ($script:attachFiles.Count -eq 0) {
+    $AttachList.Visibility = 'Collapsed'
+    return
+  }
+  $AttachList.Visibility = 'Visible'
+  foreach ($f in @($script:attachFiles)) {
+    $size = 0
+    try { $size = (Get-Item -LiteralPath $f -ErrorAction Stop).Length } catch { }
+    $b = New-Object System.Windows.Controls.Border
+    $b.Background = (Brush '#1F242C')
+    $b.BorderBrush = (Brush '#1FFFFFFF')
+    $b.BorderThickness = '1'
+    $b.CornerRadius = '6'
+    $b.Padding = '6,4,5,4'
+    $b.Margin = '0,0,6,6'
+    $sp = New-Object System.Windows.Controls.StackPanel
+    $sp.Orientation = 'Horizontal'
+    # 图片给缩略图：粘完截图要能一眼看出贴的是哪张，只给个文件名等于没预览
+    if (Test-ImagePath $f) {
+      $thumb = New-ImageThumb $f 56
+      if ($thumb) { $sp.Children.Add($thumb) | Out-Null }
+    }
+    $txt = New-Object System.Windows.Controls.StackPanel
+    $txt.VerticalAlignment = 'Center'
+    $name = [System.IO.Path]::GetFileName($f)
+    $nameTb = New-Text $name 10.5 '#CFD3D6' 'Normal' 'Segoe UI' 0
+    $nameTb.MaxWidth = 200
+    $nameTb.TextTrimming = 'CharacterEllipsis'
+    $nameTb.TextWrapping = 'NoWrap'
+    $txt.Children.Add($nameTb) | Out-Null
+    $txt.Children.Add((New-Text (Format-FileSize $size) 9.5 '#7C838E' 'Normal' 'Segoe UI' 1)) | Out-Null
+    $sp.Children.Add($txt) | Out-Null
+    $x = New-Object System.Windows.Controls.Button
+    # 移除也是这样：垃圾桶图标，不用字符 ×
+    $x.Content = [string][char]0xE74D
+    $x.FontFamily = (New-Font 'Segoe MDL2 Assets')
+    $x.Width = 16
+    $x.Height = 16
+    $x.Margin = '6,0,0,0'
+    $x.FontSize = 10.5
+    $x.Cursor = 'Hand'
+    $x.BorderThickness = '0'
+    $x.Template = (New-FlatTemplate)
+    $x.Background = [System.Windows.Media.Brushes]::Transparent
+    $x.Foreground = (Brush '#7C838E')
+    $x.VerticalAlignment = 'Center'
+    $x.ToolTip = '移除'
+    # 路径挂在按钮自己的 Tag 上：PS 5.1 下这里用 GetNewClosure 拿到的 $f 是 null，
+    # 点 × 就抛「不能对 Null 值表达式调用方法」把整个窗口带崩（实测）
+    $x.Tag = $f
+    $x.Add_Click({
+      param($s, $e)
+      [void]$script:attachFiles.Remove([string]$s.Tag)
+      Update-AttachList
+    })
+    $sp.Children.Add($x) | Out-Null
+    $b.Child = $sp
+    $AttachList.Children.Add($b) | Out-Null
+  }
+}
+
+function Add-Attachments([object]$paths) {
+  foreach ($p in @($paths)) {
+    $path = [string]$p
+    if (-not $path) { continue }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+    if ($script:attachFiles -contains $path) { continue }
+    $script:attachFiles.Add($path) | Out-Null
+  }
+  Update-AttachList
+}
+
+$AttachBtn.Add_Click({
+  $dlg = New-Object Microsoft.Win32.OpenFileDialog
+  $dlg.Multiselect = $true
+  $dlg.Title = '选择要发给模型的文件'
+  $dlg.Filter = '所有文件 (*.*)|*.*'
+  if ($dlg.ShowDialog()) { Add-Attachments $dlg.FileNames }
+})
+
+# 插队不单独放按钮：跑着的时候按 Enter 就是插话（见 Start-Turn 的 busy 分支）
+
+# 粘贴：Clipboard 里是图片或文件时收成附件。
+# WPF 的 TextBox 只认文本格式，截图/文件在它眼里“没东西可粘”——Ctrl+V 毫无反应，也不报错。
+# 所以自己在 PreviewKeyDown 里看一眼剪贴板，当成附件收下，再吃掉这次按键。
+# 剪贴板位图落盘：CF_DIB 里的 alpha 字节常常是 0（截屏工具不填），原样编码就是全透明 PNG，
+# 缩略图/预览看着一片白，发给模型的也是白板。这里把 alpha 统一补成 255，RGB 原样保留。
+if (-not ('PLClipImage' -as [type])) {
+  Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+  Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+  Add-Type -ReferencedAssemblies ([System.Drawing.Bitmap].Assembly.Location) -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
+
+public static class PLClipImage {
+  public static void SaveOpaque(Bitmap src, string path) {
+    int w = src.Width, h = src.Height;
+    var rect = new Rectangle(0, 0, w, h);
+    using (var dst = new Bitmap(w, h, PixelFormat.Format32bppArgb)) {
+      var sd = src.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+      int stride = sd.Stride;
+      int bytes = stride * h;
+      var buf = new byte[bytes];
+      Marshal.Copy(sd.Scan0, buf, 0, bytes);
+      src.UnlockBits(sd);
+      bool anyAlpha = false;
+      for (int i = 3; i < bytes; i += 4) { if (buf[i] != 0) { anyAlpha = true; break; } }
+      if (!anyAlpha) { for (int i = 3; i < bytes; i += 4) buf[i] = 255; }
+      var dd = dst.LockBits(rect, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+      Marshal.Copy(buf, 0, dd.Scan0, bytes);
+      dst.UnlockBits(dd);
+      dst.Save(path, ImageFormat.Png);
+    }
+  }
+}
+'@
+}
+function Save-ClipboardImage {
+  # 落成临时 png：附件入库是按文件路径拷的，剪贴板里的位图没路径
+  $dir = Join-Path $env:TEMP 'packleader-paste'
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  $path = Join-Path $dir ('paste-{0}.png' -f (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+  # 剪贴板里直接带 PNG 流时原样落盘，最保真。多数截图工具不放这个格式，会走下面的回退。
+  try {
+    $png = [System.Windows.Clipboard]::GetData('PNG')
+    $bytes = $null
+    if ($png -is [System.IO.MemoryStream]) { $bytes = $png.ToArray() }
+    elseif ($png -is [byte[]]) { $bytes = $png }
+    if ($bytes -and $bytes.Length -gt 8) {
+      [System.IO.File]::WriteAllBytes($path, $bytes)
+      return $path
+    }
+  } catch { }
+  # 回退：GetImage 拿回来的位图 alpha 常常整张是 0（RGB 内容还在），
+  # 直接编码就存成全透明图 —— 缩略图、预览、发给模型的都是白板。保存前把 alpha 补成 255。
+  $bmp = $null
+  try { $bmp = [System.Windows.Forms.Clipboard]::GetImage() } catch { return $null }
+  if (-not $bmp) { return $null }
+  try {
+    [PLClipImage]::SaveOpaque($bmp, $path)
+  } catch {
+    return $null
+  } finally {
+    $bmp.Dispose()
+  }
+  return $path
+}
+
+$InputBox.Add_PreviewKeyDown({
+  param($s, $e)
+  if ($e.Key -ne [System.Windows.Input.Key]::V) { return }
+  if (([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Control) -eq 0) { return }
+  $added = $false
+  try {
+    if ([System.Windows.Clipboard]::ContainsFileDropList()) {
+      # 在资源管理器里 Ctrl+C 一个文件：剪贴板同时有文件名文本和文件列表，按附件走才对
+      $paths = [System.Windows.Clipboard]::GetFileDropList()
+      if ($paths -and $paths.Count -gt 0) { Add-Attachments @($paths); $added = $true }
+    } elseif ([System.Windows.Clipboard]::ContainsImage()) {
+      # 截图（Win+Shift+S、QQ/微信截图…）只有位图没有文件，存成临时 png 再当附件
+      $imgPath = Save-ClipboardImage
+      if ($imgPath) { Add-Attachments @($imgPath); $added = $true }
+    }
+  } catch {
+    Log ("粘贴附件失败: " + ($_ | Out-String))
+  }
+  # 收进附件就吃掉这次粘贴，别让 TextBox 再插一段文件路径文本
+  if ($added) { $e.Handled = $true }
+})
+
+# 拖拽：TextBox 自己会吞掉 Drop，所以把它的 AllowDrop 关掉，统一由窗口收
+$window.AllowDrop = $true
+$InputBox.AllowDrop = $false
+$InputBox.Add_DragOver({ param($s, $e) if ($e.Data -and $e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) { $e.Effects = 'Copy' } })
+$window.Add_DragOver({ param($s, $e) if ($e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) { $e.Effects = 'Copy'; $e.Handled = $true } })
+$window.Add_Drop({
+  param($s, $e)
+  if ($e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) {
+    Add-Attachments $e.Data.GetData([System.Windows.DataFormats]::FileDrop)
+    $e.Handled = $true
+  }
+})
+
+
+# ---------------------------------------------------------------- 设置面板
+# 供应商列表的界面态：$script:providers 是「表单里的整份列表」，$script:activeProvider 是当前生效那家。
+# 布局上刻意让三个输入框只编辑「选中行」，列表本身是唯一的真相：
+# 每次改完输入框（切行 / 保存）都把输入框回写进列表，绝不会出现「框里是 A、列表里是 B」。
+$script:providers = @()
+$script:activeProvider = ''
+$script:editingProvider = ''
+# 最近一次「拉取」拿到的候选模型名（只用来画 chips，勾选状态存在 $p.models 上）
+$script:modelChipAll = @()
+$script:provSelBrush = Brush '#1E2836'
+$script:provCurBrush = Brush '#1B2230'
+
+function New-ProviderId {
+  return ('p-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+}
+
+# 把表单里正在编辑的那一行的三个输入框回写进列表（输入框留空＝不动该项，与 host 的语义一致）
+function Apply-FormToProvider {
+  if (-not $script:editingProvider) { return }
+  foreach ($p in $script:providers) {
+    if ($p.id -ne $script:editingProvider) { continue }
+    $p.name = $CfgName.Text.Trim()
+    $url = $CfgUrl.Text.Trim()
+    if ($url) { $p.baseURL = $url }
+    $key = $CfgKey.Text.Trim()
+    if ($key) { $p.apiKey = $key; $p.hasKey = $true; $p.newKey = $key }
+    $p.model = $CfgModel.Text.Trim()
+    # 模型名框里那个必须留在这家的列表里：对话框菜单靠它在当前项上打勾
+    $models = @(Get-ProviderModels $p)
+    if ($p.model -and ($models -notcontains [string]$p.model)) { $models = @([string]$p.model) + $models }
+    Set-ProviderModels $p $models
+    return
+  }
+}
+
+function Get-Provider($id) {
+  foreach ($p in $script:providers) { if ($p.id -eq $id) { return $p } }
+  return $null
+}
+
+# 一家供应商已保存的模型名（去空、保序）。老 config.json 里可能没有 models，一律用 @() 兜底
+function Get-ProviderModels($p) {
+  $out = @()
+  if (-not $p) { return $out }
+  foreach ($m in @($p.models)) { if ($m) { $out += [string]$m } }
+  return $out
+}
+
+function Set-ProviderModels($p, $list) {
+  if (-not $p) { return }
+  $clean = @()
+  foreach ($m in @($list)) {
+    $m = ([string]$m).Trim()
+    if ($m -and ($clean -notcontains $m)) { $clean += $m }
+  }
+  $p | Add-Member -NotePropertyName models -NotePropertyValue $clean -Force
+}
+
+# 勾上 / 取消勾一个模型。当前「模型名」框里那个不许取消：那家就没模型可用了，
+# 对话框菜单上「打勾的那一行」也会找不到自己。
+function Set-ModelChip([string]$m, [bool]$on) {
+  $p = Get-Provider $script:editingProvider
+  if (-not $p) { return }
+  $list = @(Get-ProviderModels $p)
+  if ($on) {
+    if ($list -notcontains $m) { $list += $m }
+  } else {
+    if ($m -eq $CfgModel.Text.Trim()) { return }
+    $list = @($list | Where-Object { $_ -ne $m })
+  }
+  Set-ProviderModels $p $list
+}
+
+# 模型 chips：打勾＝随保存写进这家；点一下顺带把它设成这家的默认模型。
+# 画料 = 这家已存的列表 ∪ 最近一次拉取的结果 ∪ 模型名框里的那个，
+# 所以不点「拉取」也能看到、能取消勾选之前存过的模型。
+function Draw-ModelChips([string]$hint) {
+  $ModelChips.Children.Clear()
+  $p = Get-Provider $script:editingProvider
+  $sel = @(Get-ProviderModels $p)
+  $cur = $CfgModel.Text.Trim()
+  if ($cur -and ($sel -notcontains $cur)) { $sel += $cur }
+  $items = @()
+  foreach ($m in @($sel) + @($script:modelChipAll)) {
+    $m = ([string]$m).Trim()
+    if ($m -and ($items -notcontains $m)) { $items += $m }
+  }
+  if ($items.Count -eq 0) {
+    $ModelChips.Visibility = 'Collapsed'
+    if (-not $hint) { $hint = '点「拉取」从端点列出可用模型；勾上的模型会保存到这家，所有对话都能选。' }
+    $ModelHint.Foreground = (Brush '#7C838E')
+    $ModelHint.Text = $hint
+    return
+  }
+  $ModelChips.Visibility = 'Visible'
+  # 全选 / 清空：端点常列出几十个模型，一个个点太累；清空只留下当前默认模型（那家不能一个模型都没有）
+  $allBtn = New-Object System.Windows.Controls.Button
+  $allBtn.Content = '全选'
+  $allBtn.FontSize = 10.5
+  $allBtn.Padding = '8,3,8,3'
+  $allBtn.Margin = '0,0,6,6'
+  $allBtn.Cursor = 'Hand'
+  $allBtn.BorderThickness = '0'
+  $allBtn.Template = (New-FlatTemplate)
+  $allBtn.Background = (Brush '#14161B')
+  $allBtn.Foreground = (Brush '#8AB4FF')
+  $allBtn.ToolTip = '把这个端点列出的模型全部勾上（保存后对话框菜单里都能选）'
+  $allBtn.Add_Click({
+    $pp = Get-Provider $script:editingProvider
+    if ($pp) { Set-ProviderModels $pp @($script:modelChipAll) }
+    Draw-ModelChips ''
+  })
+  $ModelChips.Children.Add($allBtn) | Out-Null
+
+  $noneBtn = New-Object System.Windows.Controls.Button
+  $noneBtn.Content = '清空'
+  $noneBtn.FontSize = 10.5
+  $noneBtn.Padding = '8,3,8,3'
+  $noneBtn.Margin = '0,0,6,6'
+  $noneBtn.Cursor = 'Hand'
+  $noneBtn.BorderThickness = '0'
+  $noneBtn.Template = (New-FlatTemplate)
+  $noneBtn.Background = (Brush '#14161B')
+  $noneBtn.Foreground = (Brush '#7C838E')
+  $noneBtn.ToolTip = '只留下当前默认模型（这一家的模型列表不能是空的）'
+  $noneBtn.Add_Click({
+    $pp = Get-Provider $script:editingProvider
+    if ($pp) { Set-ProviderModels $pp @($CfgModel.Text.Trim()) }
+    Draw-ModelChips ''
+  })
+  $ModelChips.Children.Add($noneBtn) | Out-Null
+  foreach ($m in $items) {
+    $on = ($sel -contains $m)
+    $btn = New-Object System.Windows.Controls.Button
+    $btn.Content = $(if ($on) { [string][char]0x2713 + ' ' + $m } else { $m })
+    $btn.FontSize = 10.5
+    $btn.FontFamily = 'Cascadia Mono, Consolas'
+    $btn.Padding = '8,3,8,3'
+    $btn.Margin = '0,0,6,6'
+    $btn.Cursor = 'Hand'
+    $btn.BorderThickness = '1'
+    $btn.BorderBrush = $(if ($on) { Brush '#4D8AB4FF' } else { Brush '#1FFFFFFF' })
+    $btn.Template = (New-FlatTemplate)
+    $btn.Background = $(if ($on) { Brush '#1E2836' } else { Brush '#1A1D24' })
+    $btn.Foreground = $(if ($on) { Brush '#8AB4FF' } else { Brush '#CFD3D6' })
+    $btn.ToolTip = $(if ($on) { '已保存到这家（点一下取消；当前默认模型不能取消）' } else { '点一下：保存到这家，并设为它的默认模型' })
+    $btn.Tag = [string]$m
+    $btn.Add_Click({
+      param($s, $e)
+      $name = [string]$s.Tag
+      $p2 = Get-Provider $script:editingProvider
+      if (-not $p2) { return }
+      if (@(Get-ProviderModels $p2) -contains $name) {
+        # 已勾选：再点一次取消；当前默认模型的那一项不做变化（取消它这家就没模型了）
+        if ($CfgModel.Text.Trim() -ne $name) { Set-ModelChip $name $false }
+      } else {
+        # 未勾选：勾上，顺带设为这家的默认模型（用户点它就是想把这家切到这个模型）
+        Set-ModelChip $name $true
+        $CfgModel.Text = $name
+      }
+      Draw-ModelChips ''
+    })
+    $ModelChips.Children.Add($btn) | Out-Null
+  }
+  $ModelHint.Foreground = (Brush '#7C838E')
+  if (-not $hint) {
+    $hint = "共 $($items.Count) 个候选，已勾 $($sel.Count) 个：勾上的会随保存写进这家，所有对话框底部的模型菜单都能选。"
+  }
+  $ModelHint.Text = $hint
+}
+
+# 选中某一行：先把当前编辑内容存回去，再换成这一行的值
+function Select-Provider([string]$id) {
+  Apply-FormToProvider
+  $p = Get-Provider $id
+  if (-not $p) { return }
+  $script:editingProvider = $p.id
+  # 换了行就换画料：chips 只显示这家存过的模型，别把上一家刚拉到的串过来
+  $script:modelChipAll = @()
+  $CfgName.Text = [string]$p.name
+  $CfgUrl.Text = [string]$p.baseURL
+  $CfgKey.Text = ''
+  $CfgModel.Text = [string]$p.model
+  if ($p.hasKey) {
+    $CfgKeyHint.Text = "已设置（$($p.apiKeyMasked)）；留空表示保持不变。"
+  } else {
+    $CfgKeyHint.Text = '这一家没填 Key。端点不校验鉴权的话可以留空（请求时不带 Key）。'
+  }
+  Draw-ModelChips ''
+  Draw-ProviderList
+}
+
+# 列表重绘：未保存的改动实时体现在列表上（名字/端点/当前标记），不用先点保存
+function Draw-ProviderList {
+  $CfgProviderList.Children.Clear()
+  if (@($script:providers).Count -eq 0) {
+    $empty = New-Object System.Windows.Controls.TextBlock
+    $empty.Text = '还没有供应商，点「＋ 新增」加一个。'
+    $empty.Foreground = (Brush '#5B626D')
+    $empty.FontSize = 10.5
+    $empty.Margin = '8,7'
+    $CfgProviderList.Children.Add($empty) | Out-Null
+    return
+  }
+  foreach ($p in $script:providers) {
+    $isCur = ($p.id -eq $script:activeProvider)
+    $isEdit = ($p.id -eq $script:editingProvider)
+    $row = New-Object System.Windows.Controls.Button
+    $row.Padding = '8,6'
+    $row.HorizontalContentAlignment = 'Left'
+    $row.Cursor = 'Hand'
+    $row.BorderThickness = '0'
+    $row.Margin = '0,1'
+    $row.Template = (New-FlatTemplate)
+    $row.Background = $(if ($isEdit) { $script:provSelBrush } elseif ($isCur) { $script:provCurBrush } else { [System.Windows.Media.Brushes]::Transparent })
+    $row.Tag = $p.id
+    $grid = New-Object System.Windows.Controls.DockPanel
+    # 右侧状态：当前那家标蓝点，其余显示一个「设为当前」的小字按钮
+    if ($isCur) {
+      $cur = New-Object System.Windows.Controls.TextBlock
+      $cur.Text = '● 当前'
+      $cur.Foreground = (Brush '#4ADE80')
+      $cur.FontSize = 10.5
+      $cur.VerticalAlignment = 'Center'
+      $cur.Margin = '8,0,4,0'
+      [System.Windows.Controls.DockPanel]::SetDock($cur, 'Right')
+      $grid.Children.Add($cur) | Out-Null
+    }
+    $name = New-Object System.Windows.Controls.TextBlock
+    $name.Text = $(if ($p.name) { [string]$p.name } else { [string]$p.baseURL })
+    $name.Foreground = (Brush '#E5E7EB')
+    $name.FontSize = 11.5
+    $name.TextTrimming = 'CharacterEllipsis'
+    $sub = New-Object System.Windows.Controls.TextBlock
+    $sub.Text = ([string]$p.baseURL + '  ·  ' + $(if ($p.model) { [string]$p.model } else { '未填模型' }) +
+      $(if (@(Get-ProviderModels $p).Count -gt 1) { '  ·  ' + @(Get-ProviderModels $p).Count + ' 个模型' } else { '' }))
+    $sub.Foreground = (Brush '#6B7280')
+    $sub.FontSize = 10
+    $sub.Margin = '0,2,0,0'
+    $sub.TextTrimming = 'CharacterEllipsis'
+    # 两行竖排：名字在上、端点·模型在下；Container 拖到右侧标「● 当前」
+    $stack = New-Object System.Windows.Controls.StackPanel
+    $stack.Children.Add($name) | Out-Null
+    $stack.Children.Add($sub) | Out-Null
+    $grid.Children.Add($stack) | Out-Null
+    $row.Content = $grid
+    $row.Add_Click({
+      param($s, $e)
+      $id = [string]$s.Tag
+      if ($e.ClickCount -ge 2) {
+        # 双击＝把这一家设为当前（改完 Key 后的常用动作，少点一次）
+        Apply-FormToProvider
+        $script:activeProvider = $id
+        Draw-ProviderList
+        return
+      }
+      Select-Provider $id
+    })
+    $CfgProviderList.Children.Add($row) | Out-Null
+  }
+}
+
+function Sync-SettingsForm {
+  $script:providers = @($script:cfgProviders)
+  $script:activeProvider = $script:cfgActiveProvider
+  # 选中的行：原来选的那家还在就保持，否则回落到当前生效那家、再否则第一家
+  $keep = Get-Provider $script:editingProvider
+  if (-not $keep) { $keep = Get-Provider $script:activeProvider }
+  $script:editingProvider = ''
+  if ($keep) {
+    $script:editingProvider = $keep.id
+    $CfgName.Text = [string]$keep.name
+    $CfgUrl.Text = [string]$keep.baseURL
+    $CfgKey.Text = ''
+    $CfgModel.Text = [string]$keep.model
+    if ($keep.hasKey -and $keep.apiKeyMasked) { $CfgKeyHint.Text = "已设置（$($keep.apiKeyMasked)）；留空表示保持不变。" }
+    else { $CfgKeyHint.Text = '这一家没填 Key。端点不校验鉴权的话可以留空（请求时不带 Key）。' }
+  } else {
+    $CfgName.Text = ''
+    $CfgUrl.Text = $(if ($script:cfgBaseURL) { $script:cfgBaseURL } else { '' })
+    $CfgKey.Text = ''
+    $CfgModel.Text = $script:modelName
+    # 判「有没有 Key」看掩码而不是 hasKey：没有 Key 时别显示「已设置（）」这种空门牌号
+    if ($script:cfgKeyMasked) { $CfgKeyHint.Text = "已设置（$($script:cfgKeyMasked)）；留空表示保持不变。" }
+    else { $CfgKeyHint.Text = '还没有设置 Key。端点不校验鉴权的话可以留空。' }
+  }
+  $CfgVerify.Text = $script:verifyCmd
+  $CfgLogsDir.Text = $script:logsDir
+  $CfgVision.IsChecked = [bool]$script:visionOn
+  # 换了一份列表（打开设置 / 后台刷了 config）就得重挑画料：chips 回到这家的已存模型
+  $script:modelChipAll = @()
+  if ($script:editingProvider) { Draw-ModelChips '' }
+  else {
+    $ModelChips.Children.Clear()
+    $ModelChips.Visibility = 'Collapsed'
+    $ModelHint.Foreground = (Brush '#7C838E')
+    $ModelHint.Text = '点「拉取」从端点列出可用模型；勾上的模型会保存到这家，所有对话都能选。'
+  }
+  $CfgError.Text = ''
+  Draw-ProviderList
+}
+
+function Open-Settings {
+  Sync-SettingsForm
+  $SettingsOverlay.Visibility = 'Visible'
+  # config.json 可能被用户或脚本手动修改。每次打开都让 host 从磁盘重读并立刻应用，
+  # 收到 config-loaded 后再用最新值刷新一次表单。
+  Send-Host @{ cmd = 'load-config' }
+  $CfgUrl.Focus() | Out-Null
+  $CfgUrl.CaretIndex = $CfgUrl.Text.Length
+}
+
+function Close-Settings {
+  $SettingsOverlay.Visibility = 'Collapsed'
+  $InputBox.Focus() | Out-Null
+}
+
+# 整份提交：列表 + 当前项 + 表单里正在编辑的那行（可能刚改还没回写）
+function Save-Settings {
+  Apply-FormToProvider
+  if (@($script:providers).Count -eq 0) {
+    $CfgError.Text = '至少配一个供应商：点「＋ 新增」填上端点地址和 Key。'
+    return
+  }
+  $edit = Get-Provider $script:editingProvider
+  if (-not $edit) { $edit = Get-Provider $script:activeProvider }
+  if ($edit) { $script:activeProvider = $edit.id }
+  foreach ($p in $script:providers) {
+    if (-not $p.baseURL) { $CfgError.Text = '每家供应商都要填端点地址（例：http://127.0.0.1:19790/v1）'; return }
+    if (-not ([string]$p.baseURL).StartsWith('http')) { $CfgError.Text = "「$($p.name)」的端点地址要以 http:// 或 https:// 开头"; return }
+    # Key 不强制：免鉴权的端点（本地 llama.cpp / 内部网关）就是没有 Key，留空照样能存、能用
+  }
+  $CfgError.Text = ''
+  # Key 只发新填的明文；没改过的那家不带 apiKey，host 会用列表里存的
+  $list = @()
+  foreach ($p in $script:providers) {
+    $item = @{ id = [string]$p.id; name = [string]$p.name; baseURL = [string]$p.baseURL; model = [string]$p.model }
+    if ($p.newKey) { $item.apiKey = [string]$p.newKey }
+    # 这家的模型列表整份带上：界面上勾了哪几个就存哪几个。
+    # 不带的话 host 会当成「没传」——保存一次就把刚拉到的列表抹掉了。
+    $models = @(Get-ProviderModels $p)
+    if ($item.model -and ($models -notcontains [string]$item.model)) { $models = @([string]$item.model) + $models }
+    if ($models.Count) { $item.models = $models }
+    $list += $item
+  }
+  $cur = Get-Provider $script:activeProvider
+  $payload = @{
+    cmd = 'config'
+    providers = $list
+    activeProvider = [string]$script:activeProvider
+    baseURL = [string]$cur.baseURL
+    model = [string]$cur.model
+    verify = $CfgVerify.Text.Trim()
+    vision = [bool]$CfgVision.IsChecked
+  }
+  Send-Host $payload
+}
+
+# 三档权限：名字（按设计稿的叫法）/ 图标 / 一句说明。
+# 图标用 GlyphTypeface 查过 segmdl2.ttf 确有该码位，并在 11px 下截图确认形状还认得出：
+#   0xE7B3 眼睛（只看）、0xE7EF 带框盾（范围受限）、0xE7BA 警示三角（全放开）
+# 说明文案照 policy.ts:gate 的真实行为写，别写成宽严颠倒：
+#   read-only：读一律放行，写/执行一律拒；
+#   guarded  ：写/执行只限工作区内且逐条询问，工作区外直接拒；
+#   full     ：不再逐条询问（危险命令仍会问一次）。
+$script:modeSpec = [ordered]@{
+  'read-only' = @{ label = '仅可查看'; icon = [string][char]0xE7B3; tip = '只能读，任何改动或命令都直接拒绝' }
+  'guarded'   = @{ label = '工作区内修改'; icon = [string][char]0xE7EF; tip = '写和命令只限当前工作目录，每次执行前都先问你' }
+  'full'      = @{ label = '完全权限'; icon = [string][char]0xE7BA; tip = '不再逐条询问，写和命令直接执行（危险命令仍会问一次）' }
+}
+
+function Update-ModePill([string]$m) {
+  $spec = $script:modeSpec[$m]
+  if (-not $spec) { $spec = $script:modeSpec['guarded'] }
+  $panel = New-Object System.Windows.Controls.StackPanel
+  $panel.Orientation = 'Horizontal'
+  $panel.VerticalAlignment = 'Center'
+
+  $ico = New-Object System.Windows.Controls.TextBlock
+  $ico.Text = [string]$spec.icon
+  $ico.FontFamily = 'Segoe MDL2 Assets'
+  $ico.FontSize = 11.5
+  # 完全权限用暖色：这是最放得开的一档，别让它跟另外两档看起来一样温和
+  $ico.Foreground = $(if ($m -eq 'full') { Brush '#F0B860' } elseif ($m -eq 'read-only') { Brush '#7C838E' } else { Brush '#8FA6FF' })
+  $ico.VerticalAlignment = 'Center'
+  $ico.Margin = '0,0,6,0'
+  $panel.Children.Add($ico) | Out-Null
+
+  $txt = New-Object System.Windows.Controls.TextBlock
+  $txt.Text = [string]$spec.label
+  $txt.VerticalAlignment = 'Center'
+  $txt.FontSize = 11
+  $panel.Children.Add($txt) | Out-Null
+
+  $arr = New-Object System.Windows.Controls.TextBlock
+  $arr.Text = [char]0xE70E   # ChevronUp：菜单向上弹
+  $arr.FontFamily = 'Segoe MDL2 Assets'
+  $arr.FontSize = 8
+  $arr.Foreground = (Brush '#7C838E')
+  $arr.VerticalAlignment = 'Center'
+  $arr.Margin = '6,0,0,0'
+  $panel.Children.Add($arr) | Out-Null
+
+  $ModePill.Content = $panel
+  $ModePill.Tag = $m
+  $ModePill.ToolTip = '当前权限：' + $spec.label + '（' + $spec.tip + '）——点一下切换'
+}
+
+function Show-ModeMenu() {
+  if ($script:modePopup) { $script:modePopup.IsOpen = $false; $script:modePopup = $null }
+  $box = New-Object System.Windows.Controls.Border
+  $box.Background = (Brush '#1B1F27')
+  $box.BorderBrush = (Brush '#33FFFFFF')
+  $box.BorderThickness = '1'
+  $box.CornerRadius = '10'
+  $box.Padding = '5'
+  $box.MinWidth = 232
+  $col = New-Object System.Windows.Controls.StackPanel
+
+  $cur = [string]$ModePill.Tag
+  foreach ($m in $script:modeSpec.Keys) {
+    $spec = $script:modeSpec[$m]
+    $row = New-Object System.Windows.Controls.Button
+    $row.Padding = '8,7'
+    $row.HorizontalContentAlignment = 'Left'
+    $row.Cursor = 'Hand'
+    $row.Background = [System.Windows.Media.Brushes]::Transparent
+    $row.BorderThickness = '0'
+    $row.Template = (New-FlatTemplate)
+    # 当前项底色稍亮一点，让"选中"在菜单打开的一瞬间就看得出来
+    if ($m -eq $cur) { $row.Background = (Brush '#232833') }
+
+    $line = New-Object System.Windows.Controls.DockPanel
+    $ico = New-Object System.Windows.Controls.TextBlock
+    $ico.Text = [string]$spec.icon
+    $ico.FontFamily = 'Segoe MDL2 Assets'
+    $ico.FontSize = 13
+    $ico.Width = 22
+    $ico.Foreground = $(if ($m -eq 'full') { Brush '#F0B860' } elseif ($m -eq 'read-only') { Brush '#9AA1AC' } else { Brush '#8FA6FF' })
+    $ico.VerticalAlignment = 'Center'
+    [System.Windows.Controls.DockPanel]::SetDock($ico, 'Left')
+    $line.Children.Add($ico) | Out-Null
+
+    # 打勾贴在右侧（跟设计稿一样在行尾）。现在每档的图标各不相同，勾不会跟档位图标看混
+    $mk = New-Object System.Windows.Controls.TextBlock
+    $mk.Text = $(if ($m -eq $cur) { [string][char]0xE73E } else { '' })
+    $mk.FontFamily = 'Segoe MDL2 Assets'
+    $mk.FontSize = 12
+    $mk.Width = 20
+    $mk.TextAlignment = 'Right'
+    $mk.Foreground = (Brush '#8FA6FF')
+    $mk.VerticalAlignment = 'Center'
+    [System.Windows.Controls.DockPanel]::SetDock($mk, 'Right')
+    $line.Children.Add($mk) | Out-Null
+
+    $txt = New-Object System.Windows.Controls.TextBlock
+    $txt.Text = [string]$spec.label
+    $txt.FontSize = 12.5
+    $txt.Foreground = (Brush '#E6E8EA')
+    $txt.VerticalAlignment = 'Center'
+    $line.Children.Add($txt) | Out-Null
+
+    # 名字下面再挂一行小字说明：只靠悬停 tooltip 时，用户得先把鼠标停上去才知道每档放行什么
+    $stack = New-Object System.Windows.Controls.StackPanel
+    $stack.VerticalAlignment = 'Center'
+    $stack.Children.Add($line) | Out-Null
+    $hint = New-Object System.Windows.Controls.TextBlock
+    $hint.Text = [string]$spec.tip
+    $hint.FontSize = 10.5
+    $hint.Foreground = (Brush '#6B7280')
+    $hint.TextTrimming = 'CharacterEllipsis'
+    $hint.MaxWidth = 268
+    $hint.Margin = '22,2,0,0'
+    $stack.Children.Add($hint) | Out-Null
+
+    $row.Content = $stack
+    $row.ToolTip = [string]$spec.tip
+    $row.Tag = $m
+    $row.Add_Click({
+      param($s, $e)
+      if ($script:modePopup) { $script:modePopup.IsOpen = $false; $script:modePopup = $null }
+      # -Notify：用户点的这一下必须真的告诉 host（点中当前档时内部自己跳过）
+      Set-ModeVisual ([string]$s.Tag) -Notify
+    })
+    $col.Children.Add($row) | Out-Null
+  }
+
+  $box.Child = $col
+  $pop = New-Object System.Windows.Controls.Primitives.Popup
+  $pop.PlacementTarget = $ModePill
+  $pop.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Top
+  # 胶囊贴着窗口右下角，Top 默认以胶囊左边为基准，菜单会伸出窗口右缘被裁掉。
+  # 用 HorizontalOffset 把它往左推，让右缘大致与胶囊右缘齐（胶囊宽约 118，菜单 260）。
+  $box.Measure((New-Object System.Windows.Size([double]::PositiveInfinity, [double]::PositiveInfinity)))
+  $pop.HorizontalOffset = $ModePill.ActualWidth - $box.DesiredSize.Width
+  $pop.VerticalOffset = -6
+  $pop.StaysOpen = $false
+  $pop.AllowsTransparency = $true
+  $pop.Child = $box
+  $script:modePopup = $pop
+  $pop.IsOpen = $true
+}
+
+# 设置档位并刷新胶囊（菜单选中、host 回报、启动初始化都走这一处）
+# -Notify：这是用户点菜单换的档，必须真的发给 host。
+# 曾经的做法是调用方先 Set-ModeVisual（里面已经改掉 $script:modeSent），之后再比较
+# 「和上次一样吗」——条件永远为假，mode 命令一次都没发出去：胶囊显示「完全权限」，
+# host 却一直停在启动时的 guarded，于是每个写/执行工具都要弹一次审批。
+function Set-ModeVisual([string]$m, [switch]$Notify) {
+  if (-not $script:modeSpec.Contains($m)) { $m = 'guarded' }
+  $changed = ([string]$script:modeSent -ne $m)
+  $script:modeSent = $m
+  Update-ModePill $m
+  if ($Notify -and $changed) { Send-Host @{ cmd = 'mode'; mode = $m } }
+}
+
+# ---------------------------------------------------------------- 读秒
+# 这一轮开始的时间戳；0 表示没在跑（读秒条收起）
+$script:thinkT0 = 0
+# 当前阶段文案（思考中 / 回答中 / 执行 xxx / 验证中），由 Handle-Event 更新
+$script:thinkVerb = ''
+
+function Format-Elapsed([double]$secs) {
+  # 一分钟内报秒，往上报到分；都取整，读秒时数字才不会乱跳
+  # 紧凑写法（和「用时 2分39秒」一致），省得读秒条随数字变宽而抖动
+  $s = [int][math]::Floor($secs)
+  if ($s -lt 60) { return "$s 秒" }
+  $m = [int][math]::Floor($s / 60)
+  $rest = $s % 60
+  if ($m -lt 60) { return "$($m)分$('{0:00}' -f $rest)秒" }
+  return "$([int][math]::Floor($m / 60))小时$('{0:00}' -f ($m % 60))分"
+}
+
+function Update-ThinkRow([string]$verb) {
+  if (-not $script:thinkT0) { return }
+  $secs = ((Get-Date) - $script:thinkT0).TotalSeconds
+  $ThinkText.Text = $(if ($verb) { $verb } else { '思考中' }) + ' · 用时 ' + (Format-Elapsed $secs) + '…'
+}
+
+# 切阶段（思考中 / 回答中 / 执行 xxx / 验证中）时立刻刷新一次，别等下一个 tick
+function Set-ThinkVerb([string]$verb) {
+  $script:thinkVerb = $verb
+  Update-ThinkRow $verb
+  # 时间线的状态行跟着换词（「执行 fs.read」「回答中」）
+  if ($script:turnProc -and -not $script:turnProc.Done) { Update-TurnProc $script:turnProc }
+}
+
+function Set-Busy([bool]$on) {
+  $script:busy = $on
+  # 跑着的时候不隐藏发送键：点它就是插话（插队），旁边另有「停止」
+  $SendBtn.IsEnabled = $true
+  $SendBtn.Visibility = 'Visible'
+  $SendBtn.ToolTip = $(if ($on) { '插话（跑着时插队，模型下一步就看到）' } else { '发送（Enter）' })
+  # 每轮结束（或重开）都把停止键还原：中断中点过它，文案已经改成「正在中断…」
+  if (-not $on -and $script:stopTimer) { $script:stopTimer.Stop() }
+  $StopBtn.Content = '停止'
+  $StopBtn.IsEnabled = $on
+  $StopBtn.Visibility = $(if ($on) { 'Visible' } else { 'Collapsed' })
+  if ($on) {
+    # 从发出这一刻开始算，别等第一个事件回来才跳（模型排队时那几秒最容易让人以为卡住）
+    $script:thinkT0 = (Get-Date)
+    $script:thinkVerb = '思考中'
+    $ThinkRow.Visibility = 'Visible'
+    Update-ThinkRow $script:thinkVerb
+  } else {
+    $script:thinkT0 = 0
+    $script:thinkVerb = ''
+    $ThinkText.Text = ''
+    $ThinkRow.Visibility = 'Collapsed'
+  }
+}
+
+function Start-Turn([string]$text) {
+  $files = @($script:attachFiles)
+  if (-not $text.Trim() -and $files.Count -eq 0) { return }
+  # 端到端计时的起点：按下发送（或回车）那一刻，到第一段看得见的输出为止
+  if ($script:perf) {
+    $script:perfTurnT0 = [System.Diagnostics.Stopwatch]::StartNew()
+    Perf 'action' 'send' @{ chars = $text.Length; files = $files.Count }
+  }
+  # 输入历史：连续重复的不重复记，指针归到末尾
+  $trimmed = $text.Trim()
+  if ($trimmed -and ($script:history.Count -eq 0 -or [string]$script:history[$script:history.Count - 1] -ne $trimmed)) {
+    [void]$script:history.Add($trimmed)
+  }
+  $script:historyIdx = $script:history.Count
+
+  # 插队：正在跑的时候不另起一轮，只把这句话（和附件）塞进当前会话，模型下一步就能看到。
+  # 附件同样先入库：图片进上下文当图片，文本类内联，其余给路径。
+  if ($script:busy) {
+    $payload = @{ cmd = 'insert'; text = $text }
+    if ($files.Count) { $payload.files = $files }
+    Send-Host $payload
+    Add-UserMessage $text $files
+    $InputBox.Text = ''
+    $script:attachFiles.Clear()
+    Update-AttachList
+    $Scroller.ScrollToEnd()
+    return
+  }
+
+  Add-UserMessage $text $files
+  $InputBox.Text = ''
+  $script:attachFiles.Clear()
+  Update-AttachList
+  $script:currentAssistant = $null
+  $script:pendingText.Clear() | Out-Null
+  Set-Busy $true
+  if ($files.Count) { Send-Host @{ cmd = 'task'; text = $text; files = $files } }
+  else { Send-Host @{ cmd = 'task'; text = $text } }
+  $Scroller.ScrollToEnd()
+}
+
+# ---------------------------------------------------------------- 事件处理
+function Handle-Event([string]$line) {
+  # 计时包壳：只量「这一条事件画了多久」，行为一点不改（原实现整体挪到 Handle-Event-Core）
+  if (-not $script:perf) { Handle-Event-Core $line; return }
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  try {
+    Handle-Event-Core $line
+  } finally {
+    $sw.Stop()
+    try {
+      $ms = $sw.Elapsed.TotalMilliseconds
+      $t = 'other'
+      if ($line -match '"type"\s*:\s*"([A-Za-z-]+)"') { $t = $matches[1] }
+      $script:perfEvtCount = ([int]$script:perfEvtCount) + 1
+      if ($ms -ge 8 -or $script:perfMode -eq 'full' -or ($script:perfKeyTypes -contains $t)) {
+        Perf 'event' $t $ms @{ size = $line.Length }
+      }
+      # 端到端：从按下发送到第一段看得见的输出（思考 / 正文 / 工具行）
+      if ($script:perfTurnT0 -and (@('reasoning', 'text', 'tool-start') -contains $t)) {
+        Perf 'span' 'e2e-first-output' $script:perfTurnT0.Elapsed.TotalMilliseconds @{ first = $t }
+        $script:perfTurnT0 = $null
+      }
+    } catch { }
+  }
+}
+
+function Handle-Event-Core([string]$line) {
+  try { $e = $line | ConvertFrom-Json } catch { return }
+  # 思考还在往外吐字时，后面的「工具开始 / 工具完成 / 下一步 / 结论」先压着别画：
+  # 否则界面上会出现「思考还在流、工具那一行已经 ✓ 完成」，时序一看就是假的。
+  # 等泵把这段思考吐完（Step-ReasonTyping 里），再按原顺序放出来。
+  if (-not $script:deferReplay -and $script:reasonQueue.Length -gt 0 -and $script:pumpTarget -and -not $script:pumpTarget.Done -and (@('step', 'text', 'assistant-end', 'tool-start', 'tool-end', 'turn-end') -contains [string]$e.type)) {
+    if (-not $script:deferredLines) { $script:deferredLines = New-Object System.Collections.ArrayList }
+    $script:deferredLines.Add($line) | Out-Null
+    return
+  }
+  # 事件都带 session：正在跑的那一轮可能属于别的会话（切走了它还在跑）。
+  # 那些事件不能画进当前聊天区（会串），但「它跑完了」要提示一下，别让人一直以为还在跑。
+  $evSession = [string]$e.session
+  # 只有轮次里产生的事件才有「属于哪个会话」之分。ready / sessions / config 这些是全局状态，
+  # 带上 session 只是交代当前会话是谁——切会话时它必然不等于切换前的那个，一丢界面就卡在旧状态
+  # （按钮还显示「插话」、左栏列表也不刷新，看着像那一轮被中断了）。
+  $turnTypes = @('turn-start', 'step', 'text', 'reasoning', 'assistant-end', 'tool-start', 'tool-end', 'approval', 'question', 'usage', 'turn-end', 'memory-saved', 'memory-undone')
+  if ($evSession -and $script:sessionId -and $evSession -ne $script:sessionId -and ($turnTypes -contains [string]$e.type)) {
+    if ($e.type -eq 'turn-end') {
+      $t = [string]$script:sessionTitles[$evSession]
+      if (-not $t) { $t = $evSession }
+      $what = $(if ($e.reason -eq 'done') { '跑完了' } elseif ($e.reason -eq 'error') { '出错了' } elseif ($e.reason -eq 'cancelled') { '已中断' } else { '结束了' })
+      $color = $(if ($e.reason -eq 'done') { '#4ADE80' } else { '#FBBF24' })
+      Add-SystemLine ("后台会话「$t」$what") $color
+      Send-Host @{ cmd = 'list-sessions' }
+    }
+    return
+  }
+  switch ($e.type) {
+    'ready' {
+      # 切会话不再中断正在跑的那一轮：它可能在别的会话里接着跑。
+      # 所以不能像以前那样无脑复位 busy——按「这个会话自己是不是在跑」来定。
+      $prevSession = $script:sessionId
+      $script:sessionId = [string]$e.session
+      $switched = ($script:sessionId -ne $prevSession)
+      $mine = ([string]$e.runningSession -ne '') -and ([string]$e.runningSession -eq $script:sessionId)
+      Set-Busy $mine
+      $script:historyCount = [int]$e.historyCount
+      $script:historyQuestions = @($e.questions)
+      $script:historyBefore = 0
+      $script:historyLoading = $false
+      $script:pendingJump = -1
+      Draw-QuestionIndex
+      $script:modelName = [string]$e.model
+      $script:cfgBaseURL = [string]$e.baseURL
+      $script:cfgKeyMasked = [string]$e.apiKeyMasked
+      if ($null -ne $e.providers) { $script:cfgProviders = @($e.providers); $script:cfgActiveProvider = [string]$e.activeProvider }
+      $script:verifyCmd = [string]$e.verify
+      $script:visionOn = [bool]$e.vision
+      $script:logsDir = [string]$e.logsDir
+      $script:hasKey = [bool]$e.hasKey
+      Update-CwdPill ([string]$e.cwd)
+      Update-ModelPill ([string]$e.model)
+      $TitleText.Text = $(if ($e.title -and $e.title -ne '(empty)') { [string]$e.title } else { '新对话' })
+      Set-ModeVisual ([string]$e.mode)
+      # 第一次用（一家供应商都没配）：直接把设置面板弹出来，别让用户对着输入框发呆。
+      # 配过端点但没填 Key 的不再弹：有的端点（本地推理服务、免鉴权网关）本来就不需要 Key。
+      if (-not $script:hasKey -and @($script:cfgProviders).Count -eq 0) { Open-Settings }
+
+      # 切了会话就必须重画（界面上还是上一个会话的内容）；同一个会话且不忙也重画
+      if ($switched -or -not $mine) {
+        Clear-Transcript
+        # 首屏只读最后几轮，往上滚动或点击右侧提问索引时再按需加载。
+        $script:replayEvents = @()
+        $script:replayAt = 0
+        $script:replayHasUser = $false
+        $script:replayEnd = $null
+        $script:moreRow = $null
+        Send-HistoryRequest 'tail'
+      }
+      # 提示行等历史画完再出（画的过程中 Transcript 还在往里加），先挂起来
+      $script:pendingNotice = New-Object System.Collections.ArrayList
+      if ($e.unfinished) {
+        [void]$script:pendingNotice.Add(@('上一轮没有跑完（进程退出或没来得及收尾）', '#FBBF24'))
+      }
+      $rs = [string]$e.runningSession
+      if ($mine -and [int]$e.runningStep -gt 0) {
+        [void]$script:pendingNotice.Add(@("这个会话的一轮还在运行（第 $([int]$e.runningStep) 步）", '#4ADE80'))
+      } elseif ($rs -and -not $mine) {
+        $t = [string]$script:sessionTitles[$rs]
+        if (-not $t) { $t = $rs }
+        [void]$script:pendingNotice.Add(@("会话「$t」还在后台运行，跑完会提示", '#4ADE80'))
+      }
+      # 切回来时还挂着的审批/提问：不重画出来就只能干看着「运行中」没法往下推
+      $script:pendingCards = New-Object System.Collections.ArrayList
+      if ($mine -and $e.pendingApproval) { [void]$script:pendingCards.Add(@('approval', $e.pendingApproval)) }
+      if ($mine -and $e.pendingQuestion) { [void]$script:pendingCards.Add(@('question', $e.pendingQuestion)) }
+      Send-Host @{ cmd = 'list-sessions' }
+    }
+    'history-slice' {
+      if ([string]$e.session -ne $script:sessionId -or [int]$e.requestId -ne $script:historyRequestId) { return }
+      Start-HistoryRender $e
+    }
+    'index' {
+      # 新提问：左侧白杠立刻补一根（只认当前会话的）
+      if ([string]$e.session -and $script:sessionId -and ([string]$e.session -ne $script:sessionId)) { return }
+      $script:historyCount = [int]$e.historyCount
+      $script:historyQuestions = @($e.questions)
+      Draw-QuestionIndex
+    }
+    'turn-start' {
+      # 新一轮开始：上一轮的过程卡收成一行，再给这一轮开一张
+      Close-TurnProc
+      Reset-ToolGroup
+      # 执行方案卡跟着轮走：上一轮那张已经定局了，这一轮再写清单要另起一张，
+      # 否则新进度会画进上一轮的卡里（位置还在上面，看着像没更新）
+      $script:todoCard = $null
+      New-TurnProc | Out-Null
+      $Scroller.ScrollToEnd()
+    }
+    'step' {
+      Settle-Reasoning
+      $tp = Get-TurnProc
+      # 每一步开一张卡：这一步的思考、工具调用、结论都拢在这一张里，卡头能整块收放
+      New-StepBlock | Out-Null
+      Update-TurnProc $tp
+    }
+    'reasoning' {
+      # 每个 delta 只做「入队 + 启泵」：一秒里要来几十上百条，早先每来一条都刷一遍
+      # 状态行（Update-ThinkRow）和轮卡，几十毫秒的 tick 里几百次属性写入，16ms 的
+      # 逐字泵根本抢不到渲染帧——要到最后 Complete-Reasoning 一次性 flush，
+      # 看着就是「啪」地出一整段。费事的动作只在「这一段思考刚开头」做一次。
+      # 上一段还在慢慢吐字、新的一段就来了：先把上一段定格（剩余字一次补上），
+      # 否则两段思考会挤在同一个队列里，字会串到新一段的正文上
+      if ($script:reasonNode -and $script:reasonNode.PendingEnd -and -not $script:reasonNode.Done) {
+        Finish-Reasoning $script:reasonNode
+      }
+      if (-not $script:reasonNode) {
+        Get-TurnProc | Out-Null
+        # 思考不再断开工具组：整轮共用一块，块的位置由 Add-ToolLine 挪回末尾
+        $rn = Add-ReasoningBlock
+        Set-ThinkVerb '思考中'
+        # 实时思考保持收起（只留一行会滚动的摘要）：摊开会把上面几条推走，
+        # 用户要的是「收缩着快速滚过去」，想看全文自己点开
+        if ($rn) { Update-ReasoningHeader $rn }
+      }
+      # 不直接把 delta 塞进文本框（那样一帧里几条一叠就是“啪”地出一大段），
+      # 先入队，由 16ms 的逐字泵按帧吐出来，看着才是流式的
+      $script:reasonQueue.Append([string]$e.delta) | Out-Null
+      Start-ReasonTyping
+    }
+    'text' {
+      # 同一件事：正文流也是一秒几十条 delta，开段的动作（收工具组、收思考、
+      # 新建正文块）只做一次，不然每条 delta 都把开段那套重跑一遍
+      if (-not $script:currentAssistant) {
+        Close-ToolGroup
+        Settle-Reasoning
+        $script:currentAssistant = Add-AssistantMessage
+      }
+      # 状态行只在这一段里已经不是「回答中」时才换词（比方说中间插了一次工具），
+      # 换完就不再每条 delta 重刷
+      if ($script:thinkVerb -ne '回答中') { Set-ThinkVerb '回答中' }
+      $script:pendingText.Append([string]$e.delta) | Out-Null
+      if ($script:assistantBox) { $script:assistantBox.text = $script:pendingText.ToString() }
+    }
+    'assistant-end' {
+      Settle-Reasoning
+      Get-TurnProc | Out-Null
+      # host 只在每步开始时发 step：一步里先调工具再出结论时，结论要落回这一步的卡里，
+      # 不能因为「上一步的 assistant-end」就新开一张卡，所以这里只沿用当前步骤卡
+      if (-not $script:stepNode) { New-StepBlock | Out-Null }
+      if ($e.text -and ([string]$e.text).Trim()) {
+        # 真的出了一段正文才断开工具组；只有工具调用、没有文字的一步保持同一块继续累加
+        Close-ToolGroup
+        if (-not $script:currentAssistant) { $script:currentAssistant = Add-AssistantMessage }
+        Render-Markdown $script:assistantBody ([string]$e.text)
+        # 这一步的结论：卡头换成它的第一行（收起态一眼看结论）
+        Set-StepConclusion $script:stepNode ([string]$e.text)
+      } elseif ($script:currentAssistant -and $script:assistantBody) {
+        # 只有工具调用、没有文字：把这个空块删掉（正文现在挂在当前步骤卡里，父级是结论区）
+        $container = $script:assistantBody.Parent
+        if ($container -and $container.Parent) { $container.Parent.Children.Remove($container) | Out-Null }
+      }
+      if ($script:assistantBox) { $script:assistantBox.text = [string]$e.text }
+      if ($e.text) {
+        Append-CopyLog ([string]$e.text)
+      }
+      $script:pendingText.Clear() | Out-Null
+      $script:currentAssistant = $null
+    }
+    'tool-start' {
+      Settle-Reasoning
+      Get-TurnProc | Out-Null
+      Set-ThinkVerb ('执行 ' + [string]$e.name)
+      $script:currentAssistant = $null
+      # 入参先存着：点开这一行才看得到（太长截一段，完整的在会话日志里）
+      $argsText = ''
+      if ($e.args) {
+        try { $argsText = ($e.args | ConvertTo-Json -Compress -Depth 4) } catch { $argsText = '' }
+        if ($argsText.Length -gt 2000) { $argsText = $argsText.Substring(0, 2000) + '…' }
+      }
+      $st = Add-ToolLine ([string]$e.name) ([string]$e.summary) $argsText
+      $script:toolRows[[string]$e.id] = $st
+      # 底部胶囊亮起来：「✦ 执行 shell · 用时 0 秒…」
+      Set-LiveCall ([string]$e.id) ([string]$e.name)
+      $Scroller.ScrollToEnd()
+    }
+    'tool-end' {
+      Settle-Reasoning
+      Set-ThinkVerb '思考中'
+      # 结果开头一段随事件过来，点开这一行就能看（完整内容在会话日志里）
+      $preview = [string]$e.preview
+      if ($e.ok) {
+        Set-ToolLineDone ([string]$e.id) "✓  $($e.ms)ms" $true ([int]$e.ms) $preview
+      } else {
+        $msg = ([string]$e.error).Split("`n")[0]
+        if ($msg.Length -gt 40) { $msg = $msg.Substring(0, 40) + '…' }
+        Set-ToolLineDone ([string]$e.id) "✕  $msg" $false ([int]$e.ms) $preview
+      }
+      # todo_write 的结果里带结构化清单：画成计划卡（同一条任务重复写就原地更新）
+      if ([string]$e.name -eq 'todo_write' -and $e.data -and $e.data.items) {
+        Update-TodoCard $e.data.items
+      }
+      # 截图 / 看图的结果带图片路径：缩略图直接画在行内（点开看大图）
+      if ($e.images) {
+        $shotRow = $script:toolRows[[string]$e.id]
+        if ($shotRow -and $shotRow.Thumbs) {
+          foreach ($im in @($e.images)) {
+            $p = [string]$im.path
+            if ($p -and (Test-Path -LiteralPath $p)) {
+              $th = New-ImageThumb $p 88
+              if ($th) { $shotRow.Thumbs.Children.Add($th) | Out-Null }
+            }
+          }
+          if ($shotRow.Thumbs.Children.Count -gt 0) { $shotRow.Thumbs.Visibility = 'Visible' }
+        }
+      }
+      # 这件回来了：底部的胶囊换成还在跑的那件，全完了就收起来
+      Clear-LiveCall ([string]$e.id)
+      $script:currentAssistant = $null
+      $Scroller.ScrollToEnd()
+    }
+    'verify-start' {
+      Close-ToolGroup
+      Set-ThinkVerb '验证中'
+      $script:currentAssistant = $null
+      $r = Add-VerifyRow ([string]$e.label) ([int]$e.round)
+      $script:verifyRows[[string]$e.round] = $r
+      $Scroller.ScrollToEnd()
+    }
+    'verify-end' {
+      $r = $script:verifyRows[[string]$e.round]
+      if ($r) {
+        $sec = [math]::Round([double]$e.ms / 1000, 1)
+        if ($e.ok) {
+          $r.Status.Text = "✓ 通过 · $sec s"
+          $r.Status.Foreground = (Brush '#4ADE80')
+          $r.Border.BorderBrush = (Brush '#2644C07A')
+        } else {
+          $r.Status.Text = "✗ 失败 · exit $($e.exitCode) · $sec s"
+          $r.Status.Foreground = (Brush '#F87171')
+          $r.Border.BorderBrush = (Brush '#33F87171')
+          # 失败时给最后几行，够看出哪条挂了；整段留在会话日志里
+          $lines = ([string]$e.output) -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 4
+          foreach ($l in $lines) {
+            $t = $l.Trim()
+            if ($t.Length -gt 150) { $t = $t.Substring(0, 150) + '…' }
+            Add-SystemLine ("    " + $t) '#A88A8A'
+          }
+        }
+      }
+      $script:currentAssistant = $null
+      $Scroller.ScrollToEnd()
+    }
+    'approval' { Close-ToolGroup; Add-ApprovalCard $e }
+    'question' { Close-ToolGroup; Add-QuestionCard $e }
+    'notice' { Close-ToolGroup; Add-SystemLine ([string]$e.text) '#9BA3B4' }
+    'error' {
+      Add-SystemLine ("错误：" + $e.message) '#F87171'
+      # 拉模型失败也要在设置面板里现形，别一直停在「拉取中…」
+      if ($script:fetching) {
+        $script:fetching = $false
+        $ModelHint.Foreground = (Brush '#F87171')
+        $ModelHint.Text = [string]$e.message
+      }
+      if ($e.needsSetup) { Open-Settings }
+      if ($e.fatal) { Set-Busy $false }
+    }
+    'config' {
+      $script:cfgBaseURL = [string]$e.baseURL
+      $script:cfgKeyMasked = [string]$e.apiKeyMasked
+      if ($null -ne $e.verify) { $script:verifyCmd = [string]$e.verify }
+      if ($null -ne $e.vision) { $script:visionOn = [bool]$e.vision }
+      if ($e.logsDir) { $script:logsDir = [string]$e.logsDir }
+      $script:modelName = [string]$e.model
+      # 没 Key 也能保存（免鉴权的端点），所以不能无脑置 true：按掩码判断到底有没有 Key
+      $script:hasKey = [bool]$e.apiKeyMasked
+      if ($null -ne $e.providers) { $script:cfgProviders = @($e.providers); $script:cfgActiveProvider = [string]$e.activeProvider }
+      if ($e.baseURL) { $script:cfgBaseURL = [string]$e.baseURL }
+      Update-ModelPill ([string]$e.model)
+      Close-Settings
+      Add-SystemLine ("已切换模型：" + $e.model + " @ " + $e.baseURL) '#4ADE80'
+    }
+    'config-loaded' {
+      $script:cfgBaseURL = [string]$e.baseURL
+      $script:cfgKeyMasked = [string]$e.apiKeyMasked
+      $script:verifyCmd = [string]$e.verify
+      $script:visionOn = [bool]$e.vision
+      if ($e.logsDir) { $script:logsDir = [string]$e.logsDir }
+      $script:modelName = [string]$e.model
+      $script:hasKey = [bool]$e.hasKey
+      if ($null -ne $e.providers) { $script:cfgProviders = @($e.providers); $script:cfgActiveProvider = [string]$e.activeProvider }
+      Update-ModelPill ([string]$e.model)
+      if ($SettingsOverlay.Visibility -eq 'Visible') {
+        Sync-SettingsForm
+        $CfgUrl.Focus() | Out-Null
+        $CfgUrl.CaretIndex = $CfgUrl.Text.Length
+      }
+    }
+    'models' {
+      $script:fetching = $false
+      $items = @($e.items)
+      # 底部模型菜单用同一份列表
+      $script:modelChoices = @($items)
+      # list-models all 的回包带着整份供应商列表：刷进来，菜单分组才和刚拉到的对上
+      if ($null -ne $e.providers) {
+        $script:cfgProviders = @($e.providers)
+        if ($e.activeProvider) { $script:cfgActiveProvider = [string]$e.activeProvider }
+      }
+      # 每家的模型列表：JSON 转出来的对象没这个属性时直接赋值会报错，统一 Add-Member -Force
+      if ($null -ne $e.byProvider) {
+        foreach ($bp in @($e.byProvider)) {
+          $hit = @($script:cfgProviders | Where-Object { [string]$_.id -eq [string]$bp.id })
+          if ($hit.Count -gt 0) {
+            $hit[0] | Add-Member -NotePropertyName models -NotePropertyValue @($bp.items) -Force
+          }
+        }
+      }
+      # 菜单开着就重画：用户可能正盯着它等模型出来
+      if ($script:modelPopup -and $script:modelPopup.IsOpen) { Update-ModelRows '' }
+      if ($items.Count -eq 0) {
+        if ($null -eq $e.byProvider) {
+          $ModelChips.Children.Clear()
+          $ModelChips.Visibility = 'Collapsed'
+          $ModelHint.Foreground = (Brush '#F87171')
+          $ModelHint.Text = '端点没返回任何模型（检查地址要不要带 /v1）'
+        }
+      } elseif ($null -eq $e.byProvider) {
+        # 单家拉取（设置面板里点的「拉取」）：拿到的只是候选，勾选状态仍以这家 models 为准，
+        # 点「保存」时才写进 config.json —— 不能拉一下就把整份列表存了，那样用户取消都没用
+        $script:modelChipAll = @($items)
+        Draw-ModelChips ''
+      }
+      # list-models all（底部菜单补全空列表）的回包是各家合集，不能灌进当前这家的候选里
+    }
+    'usage' {
+      $p = [int]$e.prompt; $c = [int]$e.completion; $cr = [int]$e.cacheRead
+      $pct = if ($p -gt 0) { [math]::Round($cr * 100 / $p) } else { 0 }
+      $UsageText.Text = "$($e.calls) 次 · 缓存 $pct%"
+    }
+    'turn-end' {
+      Close-ToolGroup
+      Complete-Reasoning
+      # 这一轮结束了：底部胶囊收起来（停止键中断时也一样）
+      Reset-LiveCalls
+      # host 报的整轮耗时比界面上卡自己的墙钟更准
+      if ($script:turnProc -and [int]$e.ms -gt 0) { $script:turnProc.Ms = [int]$e.ms }
+      Close-TurnProc
+      if ($script:pendingText.Length -gt 0 -and $script:currentAssistant) {
+        $script:currentAssistant.Text += $script:pendingText.ToString()
+        $script:pendingText.Clear() | Out-Null
+      }
+      Set-Busy $false
+      $script:currentAssistant = $null
+      # 执行方案卡在这一轮定局：把最终进度写在卡尾，别让它停在最后一次写入的样子
+      if ($script:todoCard -and $script:todoCard.card.Parent -and [int]$script:todoCard.total -gt 0) {
+        $tdone = [int]$script:todoCard.done
+        $tleft = [int]$script:todoCard.total - $tdone
+        if ($tleft -le 0) {
+          Set-TodoCardTail '本轮结束 · 全部完成' '#4ADE80'
+        } elseif ($e.reason -eq 'cancelled') {
+          Set-TodoCardTail "已中断 · 还剩 $tleft 项未完成" '#FBBF24'
+        } elseif ($e.reason -eq 'error') {
+          Set-TodoCardTail "本轮出错 · 还剩 $tleft 项未完成" '#F87171'
+        } else {
+          Set-TodoCardTail "本轮结束 · 还剩 $tleft 项未完成" '#FBBF24'
+        }
+      }
+      # 到步数上限时 core 已经发过一条「转入收尾」的 notice，这里不再重复第二句
+      if ($e.reason -eq 'cancelled') { Add-SystemLine '已中断' '#FBBF24' }
+      if ($e.reason -eq 'error') { Add-SystemLine '本轮出错' '#F87171' }
+      Send-Host @{ cmd = 'list-sessions' }
+      $Scroller.ScrollToEnd()
+    }
+    'memory-saved' { Add-MemoryCard $e.items }
+    'memory-undone' { Set-MemoryUndone @($e.ids) }
+    'sessions' { Set-Sessions $e.items }
+    'mode' { Set-ModeVisual ([string]$e.mode) }
+    'model' {
+      $script:modelName = [string]$e.model
+      # use-model 是从「某一家的某个模型」切过来的：当前供应商要跟着换，
+      # 否则设置面板里那行「● 当前」和模型菜单打勾会停在旧的那家
+      if ($e.providerId) {
+        $script:cfgActiveProvider = [string]$e.providerId
+        foreach ($p in @($script:cfgProviders)) {
+          if ([string]$p.id -eq [string]$e.providerId) {
+            $p | Add-Member -NotePropertyName model -NotePropertyValue $script:modelName -Force
+            $ms = @()
+            foreach ($m in @($p.models)) { if ($m) { $ms += [string]$m } }
+            if ($script:modelName -and ($ms -notcontains $script:modelName)) { $ms = @($script:modelName) + $ms }
+            $p | Add-Member -NotePropertyName models -NotePropertyValue $ms -Force
+          }
+        }
+        $script:cfgBaseURL = ''
+        foreach ($p in @($script:cfgProviders)) { if ([string]$p.id -eq [string]$e.providerId) { $script:cfgBaseURL = [string]$p.baseURL } }
+      }
+      Update-ModelPill ([string]$e.model)
+      # 设置面板开着时只刷新「● 当前」标记与当前那家的模型名，不重画整个表单：
+      # Sync-SettingsForm 会用 host 的值覆盖输入框，把用户没保存的编辑冲掉
+      if ($SettingsOverlay.Visibility -eq 'Visible') {
+        if ($script:editingProvider -and $script:editingProvider -eq [string]$e.providerId) {
+          $CfgModel.Text = $script:modelName
+          Draw-ModelChips ''
+        }
+        Draw-ProviderList
+      }
+    }
+    'cwd' {
+      Update-CwdPill ([string]$e.cwd)
+      # 记住上次用的目录：下次双击启动直接从这里开始，不用每次都换
+      try {
+        $stateDir = Join-Path $env:LOCALAPPDATA 'PackLeader'
+        New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $stateDir 'last-cwd.txt'), [string]$e.cwd, (New-Object System.Text.UTF8Encoding $false))
+      } catch { }
+    }
+    'stderr' { Log ("host stderr: " + $e.message) }
+  }
+}
+
+# ---------------------------------------------------------------- 交互
+$SendBtn.Add_Click({ Start-Turn $InputBox.Text })
+$StopBtn.Add_Click({
+  if (-not $script:busy) { return }
+  Perf-Action 'stop'
+  # 点过一次就灰掉：连点只会多几行「已中断当前轮」，不会更快
+  $StopBtn.IsEnabled = $false
+  $StopBtn.Content = '正在中断…'
+  # 界面兜底：宿主 25 秒还没回 turn-end（有工具不响应中断）就本地解锁，
+  # 不能让「点了停止」永远挂着「执行中」
+  if ($script:stopTimer) { $script:stopTimer.Stop() }
+  $script:stopTimer = New-Object System.Windows.Threading.DispatcherTimer
+  $script:stopTimer.Interval = [TimeSpan]::FromSeconds(25)
+  $script:stopTimer.Add_Tick({
+    $script:stopTimer.Stop()
+    if (-not $script:busy) { return }
+    Set-Busy $false
+    Add-SystemLine '宿主 25 秒没有确认结束，界面先解锁；后台若还在跑，切一下会话就能看到最新状态' '#FBBF24'
+  })
+  $script:stopTimer.Start()
+  Send-Host @{ cmd = 'abort'; session = $script:sessionId }
+})
+
+# 设置面板
+$SettingsBtn.Add_Click({ Perf-Action 'open-settings'; Open-Settings })
+
+# ---------------------------------------------------------------- 标题栏按钮
+# WindowChrome 之后 - □ × 要自己实现；点击顺序和系统一致：最小化 → 最大化/还原 → 关闭
+$MinBtn.Add_Click({ $window.WindowState = 'Minimized' })
+$MaxBtn.Add_Click({
+  if ($window.WindowState -eq 'Maximized') { $window.WindowState = 'Normal' }
+  else { $window.WindowState = 'Maximized' }
+})
+# ---------------------------------------------------------------- 托盘常驻
+# 关掉窗口不是退出：程序收进托盘继续在后台跑（host 和正在执行的轮次都不受影响），
+# 托盘菜单里「打开主窗口」可以再把它叫回来，真退出在「退出 PackLeader」。
+# 为什么用 WinForms 的 NotifyIcon：WPF 自己没有托盘，而这个类就在系统自带的
+# System.Windows.Forms 里（脚本开头已经 Add-Type 过），零依赖这条底线不破。
+# 右键菜单自绘成深色：默认的 ContextMenuStrip 是系统浅色，和这套界面不像一家人。
+$script:tray = $null
+$script:trayMenu = $null
+$script:trayReady = $false
+$script:trayExiting = $false
+$script:trayBalloonShown = $false
+
+function New-TrayMenuType {
+  if ('PL.TrayMenu' -as [type]) { return }
+  # 坑：Add-Type 编译时不会自动带上 WinForms/Drawing，只写 using 的话报
+  # 「命名空间 System.Windows 中不存在 Forms」——必须显式 -ReferencedAssemblies
+  Add-Type -ReferencedAssemblies 'System.Windows.Forms', 'System.Drawing', 'System' -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Windows.Forms;
+
+namespace PL {
+  /// <summary>托盘菜单的深色调色板（和主界面同一套颜色：#16191F 底 / #E6E8EE 字）</summary>
+  sealed class TrayColorTable : ProfessionalColorTable {
+    static readonly Color Bg = Color.FromArgb(22, 25, 31);
+    static readonly Color Sel = Color.FromArgb(38, 43, 54);
+    static readonly Color Sep = Color.FromArgb(40, 45, 54);
+    public override Color ToolStripDropDownBackground { get { return Bg; } }
+    public override Color MenuItemSelected { get { return Sel; } }
+    public override Color MenuItemSelectedGradientBegin { get { return Sel; } }
+    public override Color MenuItemSelectedGradientEnd { get { return Sel; } }
+    public override Color MenuItemBorder { get { return Color.FromArgb(43, 92, 255); } }
+    public override Color MenuBorder { get { return Color.FromArgb(52, 57, 66); } }
+    public override Color ImageMarginGradientBegin { get { return Bg; } }
+    public override Color ImageMarginGradientMiddle { get { return Bg; } }
+    public override Color ImageMarginGradientEnd { get { return Bg; } }
+    public override Color SeparatorDark { get { return Sep; } }
+    public override Color SeparatorLight { get { return Sep; } }
+  }
+
+  public sealed class TrayMenu : ContextMenuStrip {
+    public TrayMenu() {
+      Renderer = new ToolStripProfessionalRenderer(new TrayColorTable());
+      BackColor = Color.FromArgb(22, 25, 31);
+      ForeColor = Color.FromArgb(230, 232, 238);
+      ShowImageMargin = false;
+      ShowCheckMargin = false;
+      Font = new Font("Microsoft YaHei UI", 9f);
+      Padding = new Padding(0, 5, 0, 5);
+    }
+  }
+}
+'@
+}
+
+# 托盘图标：优先用 ico 里那帧 32px（任务栏托盘要的是 16，系统会自己缩）；
+# 走绘制兜底时临时造一个句柄，并留着引用——句柄被回收图标就成白块了。
+function Get-TrayIcon {
+  try {
+    if ($script:iconObjects -and @($script:iconObjects).Count -gt 1) { return $script:iconObjects[1] }
+  } catch { }
+  try {
+    $h = New-HiconFromBitmap (New-LogoBitmap 32)
+    $script:trayIconHandle = $h
+    return [System.Drawing.Icon]::FromHandle($h)
+  } catch { }
+  return [System.Drawing.SystemIcons]::Application
+}
+
+function Init-Tray {
+  if ($script:tray) { return $true }
+  try {
+    New-TrayMenuType
+    $menu = New-Object PL.TrayMenu
+
+    $miOpen = New-Object System.Windows.Forms.ToolStripMenuItem '打开主窗口'
+    $miOpen.Add_Click({ Show-MainWindow })
+    [void]$menu.Items.Add($miOpen)
+
+    [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
+    $miExit = New-Object System.Windows.Forms.ToolStripMenuItem '退出 PackLeader'
+    $miExit.Add_Click({ Exit-App })
+    [void]$menu.Items.Add($miExit)
+
+    # 变量名不能用 $tray：脚本参数 [switch]$Tray 也叫这个名字（PowerShell 变量名不分大小写），
+    # 会把这行赋值当成写 switch 参数而报「无法转换为 SwitchParameter」。所以叫 $ni。
+    $ni = New-Object System.Windows.Forms.NotifyIcon
+    $ni.Icon = (Get-TrayIcon)
+    $ni.Text = 'PackLeader'
+    $ni.ContextMenuStrip = $menu
+    $ni.Visible = $true
+    # 双击托盘 = 打开窗口（和 Windows 上大多数常驻程序一致）
+    $ni.Add_MouseDoubleClick({ Show-MainWindow })
+
+    $script:tray = $ni
+    $script:trayMenu = $menu
+    $script:trayReady = $true
+    Log '托盘图标就绪'
+    return $true
+  } catch {
+    Log ('托盘图标创建失败: ' + ($_ | Out-String))
+    $script:trayReady = $false
+    return $false
+  }
+}
+
+function Show-MainWindow {
+  if (-not $window) { return }
+  try {
+    $window.ShowInTaskbar = $true
+    # 藏过的窗口先让 IsVisible 复位，再走系统那一路显式还原（Show() 对 Hide 过的窗口偶尔不恢复 Z 序）
+    if (-not $window.IsVisible) { $window.Show() }
+    if ($window.WindowState -eq 'Minimized') { $window.WindowState = 'Normal' }
+    $h = (New-Object System.Windows.Interop.WindowInteropHelper $window).Handle
+    if ($h -ne [IntPtr]::Zero) { [void][PL.IconNative]::ShowWindow($h, 5) }
+    $window.Activate() | Out-Null
+    # Activate 有时抢不过前台程序，再走一次 SetForegroundWindow 兜底
+    if ($h -ne [IntPtr]::Zero) { [void][PL.IconNative]::SetForegroundWindow($h) }
+    $InputBox.Focus() | Out-Null
+    Log '窗口已从托盘打开'
+  } catch { Log ('打开主窗口失败: ' + ($_ | Out-String)) }
+}
+
+function Hide-MainWindow([switch]$Quiet) {
+  if (-not $window) { return }
+  if ($script:trayExiting) { return }
+  if (-not $script:trayReady) {
+    # 托盘没建起来就别藏：藏了就再也找不回来，这时关窗只能按真退出处理
+    Log '托盘不可用，关窗按退出处理'
+    Exit-App
+    return
+  }
+  try {
+    $window.ShowInTaskbar = $false
+    $window.Hide()
+    Log '窗口已收进托盘'
+    # 只提示一次：第一次关窗时告诉用户「没退出」，以后别再烦他
+    if (-not $Quiet -and -not $script:trayBalloonShown) {
+      $script:trayBalloonShown = $true
+      try {
+        $script:tray.ShowBalloonTip(3000, 'PackLeader 还在后台运行', '点托盘图标可以重新打开，右键可以退出。', [System.Windows.Forms.ToolTipIcon]::None)
+      } catch { }
+    }
+  } catch { Log ('收进托盘失败: ' + ($_ | Out-String)) }
+}
+
+function Exit-App {
+  if ($script:trayExiting) { return }
+  $script:trayExiting = $true
+  Log '退出程序'
+  try { if ($script:tray) { $script:tray.Visible = $false; $script:tray.Dispose(); $script:tray = $null } } catch { }
+  try { $window.Close() } catch { }
+  # ShutdownMode 是 OnExplicitShutdown：窗口关掉不会自动结束 Application.Run，
+  # 这里必须显式关一次，否则脚本会挂在 Run 里不退出。
+  try { if ($script:app) { $script:app.Shutdown() } } catch { }
+}
+
+# × 按钮：收进托盘（真退出在托盘菜单里）
+$CloseBtn.Add_Click({ Hide-MainWindow })
+# 最大化后按钮要换成「还原」（E923），否则图标和实际行为对不上；
+# 用户从任务栏还原、双击标题栏、Aero Snap 拖回来也都会走这个事件。
+function Update-MaxBtnVisual {
+  if ($window.WindowState -eq 'Maximized') {
+    $MaxBtn.Content = [string][char]0xE923
+    $MaxBtn.ToolTip = '还原（双击标题栏也行）'
+  } else {
+    $MaxBtn.Content = [string][char]0xE922
+    $MaxBtn.ToolTip = '最大化（双击标题栏也行）'
+  }
+}
+$window.Add_StateChanged({ Update-MaxBtnVisual })
+Update-MaxBtnVisual
+# 标题栏左边那枚 logo 直接复用窗口图标（New-LogoBitmap 画的 256px 那张）
+if ($window.Icon) { $TitleLogo.Source = $window.Icon }
+
+# 供应商：新增一行空白（端点留空，保存时会拦住并提示），删掉当前选中的那一家
+$CfgProviderAdd.Add_Click({
+  Apply-FormToProvider
+  $p = [pscustomobject]@{
+    id = (New-ProviderId); name = ''; baseURL = ''; model = ''
+    hasKey = $false; apiKeyMasked = ''; apiKey = ''; newKey = ''
+  }
+  $script:providers = @($script:providers) + $p
+  # 新增的这家直接选中（以及设为当前）：用户点「新增」的意图就是要用它
+  $script:activeProvider = $p.id
+  Select-Provider $p.id
+  $CfgName.Focus() | Out-Null
+})
+$CfgProviderDel.Add_Click({
+  $del = Get-Provider $script:editingProvider
+  if (-not $del) { $CfgError.Text = '先在列表里点选要删的那一家'; return }
+  if (@($script:providers).Count -le 1) { $CfgError.Text = '至少留一个供应商'; return }
+  $rest = @()
+  foreach ($p in $script:providers) { if ($p.id -ne $del.id) { $rest += $p } }
+  $script:providers = $rest
+  if ($script:activeProvider -eq $del.id) { $script:activeProvider = $rest[0].id }
+  $script:editingProvider = ''
+  Select-Provider $script:activeProvider
+})
+
+# 打开日志目录：资源管理器直接定位过去，方便复杂任务卡住时按日志复盘
+$CfgOpenLogs.Add_Click({
+  $dir = $script:logsDir
+  if (-not $dir) { return }
+  try { Start-Process explorer.exe -ArgumentList ('"' + $dir + '"') } catch { }
+})
+
+# 拉取模型：用对话框里当前填的地址和 Key（Key 留空就让 host 用已保存的那个）
+$CfgFetch.Add_Click({
+  & $script:boot '拉取模型: 点击'
+  # 保留已存的 chips（拉取只是多给候选），只把提示换成"拉取中"
+  $ModelHint.Foreground = (Brush '#7C838E')
+  $ModelHint.Text = '拉取中…'
+  $script:fetching = $true
+  $msg = @{ cmd = 'list-models'; baseURL = $CfgUrl.Text.Trim(); apiKey = $CfgKey.Text.Trim() }
+  # 带上 providerId：host 才知道这份结果属于哪一家（表单里改过端点也认得出来）
+  if ($script:editingProvider) { $msg.providerId = [string]$script:editingProvider }
+  Send-Host $msg
+})
+$CfgCancel.Add_Click({ Close-Settings })
+$CfgSave.Add_Click({ Save-Settings })
+foreach ($box in @($CfgUrl, $CfgKey, $CfgModel, $CfgVerify)) {
+  $box.Add_PreviewKeyDown({
+    param($s, $e)
+    if ($e.Key -eq [System.Windows.Input.Key]::Return) { $e.Handled = $true; Save-Settings }
+    elseif ($e.Key -eq [System.Windows.Input.Key]::Escape) { $e.Handled = $true; Close-Settings }
+  })
+}
+$window.Add_PreviewKeyDown({
+  param($s, $e)
+  if ($e.Key -eq [System.Windows.Input.Key]::Escape -and $SettingsOverlay.Visibility -eq 'Visible') {
+    $e.Handled = $true
+    Close-Settings
+  }
+})
+
+# 必须用 PreviewKeyDown（隧道）：TextBox 会自己吃掉方向键和回车并在冒泡阶段标记
+# Handled，挂在 KeyDown 上的处理器根本不会被调用。
+$InputBox.Add_PreviewKeyDown({
+  param($s, $e)
+  $mods = $e.KeyboardDevice.Modifiers
+  if ($e.Key -eq [System.Windows.Input.Key]::Return -and -not ($mods -band [System.Windows.Input.ModifierKeys]::Shift)) {
+    $e.Handled = $true
+    Start-Turn $InputBox.Text
+    return
+  }
+  # 输入历史：单行内容时 ↑↓ 翻历史（多行时不抢键，留给光标移动）
+  if ($mods -ne [System.Windows.Input.ModifierKeys]::None) { return }
+  $multi = $InputBox.Text.Contains("`n")
+  if ($e.Key -eq [System.Windows.Input.Key]::Up -and -not $multi) {
+    if ($script:history.Count -eq 0) { return }
+    $e.Handled = $true
+    if ($script:historyIdx -gt 0) { $script:historyIdx-- }
+    $InputBox.Text = [string]$script:history[$script:historyIdx]
+    $InputBox.CaretIndex = $InputBox.Text.Length
+  }
+  elseif ($e.Key -eq [System.Windows.Input.Key]::Down -and -not $multi) {
+    if ($script:history.Count -eq 0) { return }
+    $e.Handled = $true
+    if ($script:historyIdx -lt $script:history.Count) { $script:historyIdx++ }
+    $InputBox.Text = $(if ($script:historyIdx -lt $script:history.Count) { [string]$script:history[$script:historyIdx] } else { '' })
+    $InputBox.CaretIndex = $InputBox.Text.Length
+  }
+})
+
+# 底部模型按钮：点开就是可选模型列表，选一个直接切
+$ModelPill.Add_Click({
+  param($s, $e)
+  # 菜单自己会在「有哪家还没拉到模型」时去拉一次（list-models all），这里只管弹菜单
+  Show-ModelMenu $s
+})
+
+# 图片预览：× / 点背景 / Esc 都能关
+$PreviewClose.Add_Click({ Hide-ImagePreview })
+$ImagePreview.Add_MouseLeftButtonUp({ Hide-ImagePreview })
+$PreviewImage.Add_MouseLeftButtonUp({ param($s, $e) $e.Handled = $true })
+$window.Add_PreviewKeyDown({
+  param($s, $e)
+  if ($e.Key -eq [System.Windows.Input.Key]::Escape -and $ImagePreview.Visibility -eq 'Visible') {
+    $e.Handled = $true
+    Hide-ImagePreview
+  }
+  elseif ($e.Key -eq [System.Windows.Input.Key]::Escape -and $FolderOverlay.Visibility -eq 'Visible') {
+    $e.Handled = $true
+    Hide-FolderPicker
+  }
+})
+
+$NewChatBtn.Add_Click({
+  Perf-Action 'new-chat'
+  Send-Host @{ cmd = 'new-session' }
+  Clear-Transcript
+  Add-EmptyState
+  $TitleText.Text = '新对话'
+})
+
+# 权限胶囊：点一下向上弹出三档菜单
+$ModePill.Add_Click({
+  param($s, $e)
+  Perf-Action 'mode-pill'
+  if ($script:modePopup -and $script:modePopup.IsOpen) { $script:modePopup.IsOpen = $false; $script:modePopup = $null }
+  else { Show-ModeMenu }
+})
+
+$PickFolderBtn.Add_Click({
+  Perf-Action 'pick-folder'
+  # 自绘的深色目录浮层，不用系统 FolderBrowserDialog（白底 + 英文标题，跟界面不像一家人）
+  Show-FolderPicker
+})
+
+# ---------------------------------------------------------------- 定时器：抽事件 + 流式渲染
+$timer = New-Object System.Windows.Threading.DispatcherTimer
+$timer.Interval = [TimeSpan]::FromMilliseconds(50)
+$script:tickCount = 0
+$timer.Add_Tick({
+  try {
+    if (-not $script:tickSeen) { $script:tickSeen = $true; Log 'Tick 首次触发' }
+    # 主线程心跳：量这一次心跳和上一次隔了多久，断档了就记一笔
+    Step-PerfWatch
+    # 启动器（PackLeader.exe）没了就自己退出：覆盖安装时它会被安装器关掉，
+    # 不跟着退就会留下孤儿窗口，看起来像"装了两个"。
+    $script:tickCount++
+    if (($script:tickCount % 40) -eq 0 -and $env:PL_GUI_PARENT_PID) {
+      $alive = $false
+      try { $alive = -not (Get-Process -Id ([int]$env:PL_GUI_PARENT_PID) -ErrorAction Stop).HasExited } catch { $alive = $false }
+      if (-not $alive) { Log '启动器已退出，关闭窗口'; $window.Close(); return }
+    }
+    if ($pumpOut) {
+      for ($i = 0; $i -lt 300; $i++) {
+        $l = $pumpOut.Take()
+        if ($null -eq $l) { break }
+        if ($l.Trim()) { Handle-Event $l }
+      }
+    }
+    if ($pumpErr) {
+      for ($i = 0; $i -lt 50; $i++) {
+        $l = $pumpErr.Take()
+        if ($null -eq $l) { break }
+        if ($l.Trim()) { Log ("stderr: " + $l) }
+      }
+    }
+    # 输出泵队列：剩得越多说明界面越消化不掉（host 吐得快或渲染被占住）
+    if ($pumpOut) {
+      $qd = 0
+      try { $qd = $pumpOut.Count } catch { }
+      if ($qd -ge 5 -and $script:perfMode -eq 'full') { Perf 'queue' 'out' $qd }
+      elseif ($qd -ge 20) { Perf 'queue' 'out' $qd @{ mode = [string]$script:perfMode } }
+    }
+    # 演示模式：每 200ms 喂一条，顺序和真跑一轮一样；开演前先把空态清掉
+    if ($script:demoLines.Count -gt 0 -and $script:demoIdx -lt $script:demoLines.Count) {
+      if (-not $script:demoWiped) {
+        $script:demoWiped = $true
+        Clear-Transcript
+        $TitleText.Text = '演示：三轮排查与修复'
+      }
+      if ($script:demoHold -gt 0) {
+        $script:demoHold--
+      } elseif (($script:tickCount % 3) -eq 0) {
+        $line = [string]$script:demoLines[$script:demoIdx]
+        $script:demoIdx++
+        Handle-Event $line
+        # 工具刚开始跑就多停一会儿（降 600ms），底部的胶囊和组头的「运行中...」才看得清楚
+        if ($line -match '"type":"tool-start"') { $script:demoHold = 12 }
+        elseif ($line -match '"type":"reasoning"') { $script:demoHold = 3 }
+      }
+    }
+    Continue-ReplayRender
+    if ($script:pendingText.Length -gt 0 -and $script:currentAssistant) {
+      $script:currentAssistant.Text += $script:pendingText.ToString()
+      $script:pendingText.Clear() | Out-Null
+      $Scroller.ScrollToEnd()
+    }
+    # 时间线：工具行上的小圈每 100ms 转一格，状态行计时与底栏每 250ms 刷一次
+    if ($script:busy -and $script:thinkT0) {
+      $script:tickCount2 = ([int]$script:tickCount2) + 1
+      if (($script:tickCount2 % 2) -eq 0) { Step-ToolRows }
+      if (($script:tickCount2 % 5) -eq 0) {
+        Update-ThinkRow $script:thinkVerb
+        Update-ReasoningTime $script:reasonNode
+        # 底部胶囊的「用时」也走这一拍（只改一行字，不重排整段）
+        Update-BottomPill
+        $tp = $script:turnProc
+        if ($tp -and -not $tp.Done) {
+          $tp.Clock.Text = (Format-Clock ((Get-Date) - $tp.T0).TotalSeconds)
+        }
+      }
+    }
+    if ($pumpOut -and $pumpOut.Finished -and -not $script:hostGone) {
+      $script:hostGone = $true
+      Add-SystemLine 'host 进程已退出' '#F87171'
+      Set-Busy $false
+    }
+  } catch {
+    Log ("Tick 异常: " + ($_ | Out-String))
+  }
+})
+
+# ---------------- 左侧栏宽度：可拖动，记住上次的宽度 ----------------
+# 存在数据目录（和 config.json 同一个地方），不塞进配置里免得污染模型设置
+$script:layoutFile = Join-Path $DataDir 'ui-layout.json'
+$script:sideDefault = 252
+$script:sideMin = 180
+# 最近一次 Set-Sessions 收到的标题；以及据此量出的「标题全放得下」所需宽度（0 = 还没量过）
+# 缓存起来是为了让窗口缩放时的 SizeChanged 不做重复测量
+$script:sideTitles = @()
+$script:sideFitWidth = 0
+# 行内除标题之外的固定开销：左栏 ScrollViewer Padding 8+8、行 Border Padding 8+8、
+# 删除按钮 22、列表滚动条 10，再留 8 的余量，免得「刚好装下」时标题贴着删除按钮
+$script:sideChrome = 64
+
+# 用 TextBlock.Measure 量文字宽度：中英文混排比按字符数估算准得多，
+# 而且走的是和实际显示完全相同的排版流程
+function Measure-TextWidth([string]$text, [double]$size = 12) {
+  if (-not $text) { return 0 }
+  $tb = New-Object System.Windows.Controls.TextBlock
+  $tb.Text = $text
+  $tb.FontSize = $size
+  $tb.FontFamily = (New-Font 'Segoe UI')
+  $tb.Measure([System.Windows.Size]::new([double]::PositiveInfinity, [double]::PositiveInfinity))
+  return $tb.DesiredSize.Width
+}
+
+function Get-SideFitWidth {
+  # 最长标题的像素宽度 + 行内固定开销 = 标题能完整显示所需的最小左栏宽度
+  $text = 0
+  foreach ($t in @($script:sideTitles)) {
+    $w = Measure-TextWidth ([string]$t) 12
+    if ($w -gt $text) { $text = $w }
+  }
+  if ($text -le 0) { return 0 }
+  return [math]::Ceiling($text + $script:sideChrome)
+}
+
+function Get-SideMax {
+  # 左栏硬上限 = min(窗口给得出多少, 标题全显示所需)；不小于 MinWidth
+  $w = $window.ActualWidth
+  if ($w -le 0) { $w = $window.Width }
+  # 右边给对话区留 420（它的 MinWidth）+ 6（分隔条）
+  $cap = [math]::Max($script:sideMin + 1, $w - 426)
+  if ($script:sideFitWidth -gt 0) { $cap = [math]::Min($cap, $script:sideFitWidth) }
+  return [math]::Max($script:sideMin, $cap)
+}
+
+function Set-SideWidth([double]$w) {
+  if ($w -lt $script:sideMin) { $w = $script:sideMin }
+  $max = Get-SideMax
+  if ($w -gt $max) { $w = $max }
+  $SideCol.Width = (New-Object System.Windows.GridLength $w)
+}
+
+# 把上限落到列上：MaxWidth 管「拖动时不能越过」，另外把已经超出的宽度收回来
+function Sync-SideCap {
+  if ($script:sideFitWidth -le 0) { $script:sideFitWidth = Get-SideFitWidth }
+  if ($script:sideFitWidth -le 0) { return }
+  $cap = Get-SideMax
+  $SideCol.MaxWidth = $cap
+  if ($SideCol.ActualWidth -gt $cap + 0.5) { Set-SideWidth $cap }
+}
+
+# 标题变了（Set-Sessions）才重量；没变化就直接返回，免得每次刷新会话列表都动布局
+function Update-SideFit {
+  $fit = Get-SideFitWidth
+  if ($fit -le 0) { return }
+  if ([math]::Abs($fit - $script:sideFitWidth) -lt 1) { return }
+  $script:sideFitWidth = $fit
+  Sync-SideCap
+}
+
+# 拖动结束后把列还原成按比例（"*"）：GridSplitter 拖完会把列写成固定像素，
+# 之后窗口变宽左栏不再让位。改成 "*" 后窗口变宽它会自己长，长到 MaxWidth 就停。
+function Recall-SideWidth {
+  Sync-SideCap
+  $cur = $SideCol.ActualWidth
+  if ($cur -le 0) { return }
+  $SideCol.Width = (New-Object System.Windows.GridLength 1, ([System.Windows.GridUnitType]::Star))
+}
+
+function Sync-SideCap {
+  # 把「内容上限」落到列上：MaxWidth 管拖动时 GridSplitter 不会越过，
+  # 同时兜一下当前位置（标题变短/窗口变窄后已经超了的话就收回来）
+  $fit = Get-SideFitWidth
+  if ($fit -le 0) { return }
+  $script:sideFitWidth = $fit
+  $cap = Get-SideMax
+  $SideCol.MaxWidth = $cap
+  if ($SideCol.ActualWidth -gt $cap + 0.5) { Set-SideWidth $cap }
+  elseif ($SideCol.ActualWidth -lt $script:sideMin - 0.5) { Set-SideWidth $script:sideMin }
+}
+
+function Update-SideFit {
+  # 标题变了（Set-Sessions）就重新量；量出来没变化就什么都不做，免得每次刷新会话列表都动布局
+  $fit = Get-SideFitWidth
+  if ($fit -le 0) { return }
+  if ([math]::Abs($fit - $script:sideFitWidth) -lt 1) { return }
+  Sync-SideCap
+}
+
+function Recall-SideWidth {
+  # 拖动结束后把列还原成「按比例」而不是固定像素：
+  # GridSplitter 拖完会把列写成固定 GridLength，窗口再变宽左栏不会跟着让位。
+  # "*" 列在窗口变宽时会自动长，正好让上限继续生效（长到 MaxWidth 就停）。
+  if ($script:sideFitWidth -le 0) { return }
+  $cap = Get-SideMax
+  $SideCol.MaxWidth = $cap
+  $cur = $SideCol.ActualWidth
+  if ($cur -le 0) { return }
+  if ($cur -gt $cap) { Set-SideWidth $cap; return }
+  $SideCol.Width = (New-Object System.Windows.GridLength 1, ([System.Windows.GridUnitType]::Star))
+}
+
+function Get-SideMax {
+  $w = $window.ActualWidth
+  if ($w -le 0) { $w = $window.Width }
+  # 右边给对话区留 420（它的 MinWidth）+ 6（分隔条）
+  $cap = [math]::Max($script:sideMin + 1, $w - 426)
+  # 内容硬上限：标题全都显示得下之后就不该再往外拉
+  if ($script:sideFitWidth -gt 0) {
+    $cap = [math]::Max($script:sideMin, [math]::Min($cap, $script:sideFitWidth))
+  }
+  return $cap
+}
+
+function Set-SideWidth([double]$w) {
+  if ($w -lt $script:sideMin) { $w = $script:sideMin }
+  $max = Get-SideMax
+  if ($w -gt $max) { $w = $max }
+  $SideCol.Width = (New-Object System.Windows.GridLength $w)
+}
+
+# 窗口或内容变化后重新算一遍：列宽夹到 [MinWidth, 内容上限]
+function Sync-SideMax {
+  Sync-SideCap
+}
+
+function Save-SideWidth {
+  try {
+    $w = [math]::Round($SideCol.ActualWidth)
+    if ($w -lt $script:sideMin) { return }
+    # 合并写：以后这个文件里放别的东西（比如高度）也不会互相覆盖
+    $obj = @{}
+    if (Test-Path -LiteralPath $script:layoutFile) {
+      try {
+        $old = Get-Content -Raw -LiteralPath $script:layoutFile | ConvertFrom-Json
+        foreach ($p in $old.PSObject.Properties) { $obj[$p.Name] = $p.Value }
+      } catch { }
+    }
+    $obj['sideWidth'] = [int]$w
+    [System.IO.File]::WriteAllText($script:layoutFile, ($obj | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding $false))
+  } catch { Log ('保存左侧栏宽度失败: ' + ($_ | Out-String)) }
+}
+
+function Restore-SideWidth {
+  $w = 0
+  try {
+    if (Test-Path -LiteralPath $script:layoutFile) {
+      $o = Get-Content -Raw -LiteralPath $script:layoutFile | ConvertFrom-Json
+      if ($o -and $null -ne $o.sideWidth) { $w = [double]$o.sideWidth }
+    }
+  } catch { Log ('读左侧栏宽度失败: ' + ($_ | Out-String)) }
+  if ($w -ge $script:sideMin) { Set-SideWidth $w } else { Set-SideWidth $script:sideDefault }
+}
+
+$window.Add_Loaded({
+  Log '窗口 Loaded'
+  Perf 'span' 'first-frame' $script:perfShowT0.ElapsedMilliseconds
+  $script:perfMark.Restart()
+  # host 放到窗口画完之后再起：省掉首帧前那 ~300ms，界面先出来
+  Start-Host
+  # 标题栏：和界面同色（细节见 Set-TitleBarLook 的注释）
+  try {
+    $h = (New-Object System.Windows.Interop.WindowInteropHelper $window).Handle
+    Set-TitleBarLook $h
+  } catch { Log ("标题栏配色失败: " + ($_ | Out-String)) }
+  Update-CwdPill $Cwd
+  Update-ModelPill ([string]$Model)
+  Set-ModeVisual $Mode
+  Clear-Transcript
+  Restore-SideWidth
+  # 列表建好、布局落定后再量一次：标题宽度决定左栏能拉到多宽
+  try { $window.Dispatcher.Invoke([action]{ Update-SideFit }, [System.Windows.Threading.DispatcherPriority]::Background) } catch { }
+  # 性能监测从这里开始：帧率 / 心跳 / 卡顿（窗口已可见，之前的不算数）
+  Start-PerfWatch
+  # 第二个实例（双击图标）会广播这个自定义消息：收到就把窗口叫出来。
+  # 必须在 Loaded 之后挂，那时才有真句柄；窗口 Hidden 时也能靠它复活。
+  try {
+    $script:activateMsg = [PL.IconNative]::RegisterWindowMessage([PL.IconNative]::ActivateMessage)
+    # 注意两条：HwndSourceHook 带 ref bool，在 PowerShell 里要写 $handled.Value；
+    # 钩子委托必须存进脚本作用域，否则脚本块被回收后消息就没人接了。
+    $script:activateHook = [System.Windows.Interop.HwndSourceHook] {
+      param($hwnd, $msg, $wParam, $lParam, [ref]$handled)
+      if ($script:activateMsg -and $msg -eq $script:activateMsg) {
+        Log '收到激活消息：把窗口叫出来'
+        Show-MainWindow
+        $handled.Value = $true
+      }
+      return [IntPtr]::Zero
+    }
+    $src = [System.Windows.Interop.HwndSource]::FromHwnd($h)
+    if ($src) {
+      $src.AddHook($script:activateHook)
+      Log '已挂激活消息钩子'
+    } else { Log '挂激活钩子失败：拿不到 HwndSource' }
+  } catch { Log ('挂激活钩子失败: ' + ($_ | Out-String)) }
+  Perf 'point' 'ui-ready'
+  $timer.Start()
+  if ($TrayStart) {
+    # 只进托盘：窗口全程不露头，也别抢焦点（开机自启时用户正在干别的）
+    Log 'Loaded：按 --tray 收进托盘'
+    Hide-MainWindow -Quiet
+  } else {
+    $InputBox.Focus() | Out-Null
+  }
+  # 自测入口：设置 PL_GUI_TASK 会自动发第一条任务（也方便截图验证）
+  if ($env:PL_GUI_TASK) { Start-Turn $env:PL_GUI_TASK }
+})
+
+# 分隔条：拖动结束后把上限落到列上并记住宽度；双击复位到默认
+$SideSplitter.Add_DragCompleted({
+  Sync-SideCap
+  Recall-SideWidth
+  Save-SideWidth
+})
+$SideSplitter.Add_MouseDoubleClick({
+  Set-SideWidth $script:sideDefault
+  Save-SideWidth
+})
+
+# 窗口变宽/变窄：右栏 MinWidth 与内容上限都可能变，重新夹一次
+$window.Add_SizeChanged({
+  try { Sync-SideCap } catch { }
+})
+
+$window.Add_Closing({
+  # 坑：WPF 给事件回调传的是 (sender, args)，PowerShell 脚本块里必须显式 param 接住，
+  # 不然 $e 是 $null，写 $e.Cancel 直接抛「找不到属性 Cancel」，窗口照样关掉。
+  param($s, $e)
+  # 关窗 ≠ 退出：没有真正要退出时（点 ×、Alt+F4、任务栏右键关闭都算），
+  # 拦下来收进托盘，host 和正在跑的轮次继续。真退出只走托盘菜单的「退出」。
+  if (-not $script:trayExiting -and $script:trayReady) {
+    $e.Cancel = $true
+    Hide-MainWindow
+    return
+  }
+  Log '窗口 Closing'
+  Perf 'point' 'closing' @{ stalls = [int]$script:perfStalls; events = [int]$script:perfEvtCount }
+  try { Save-SideWidth } catch { }
+  try { if ($script:tray) { $script:tray.Visible = $false; $script:tray.Dispose(); $script:tray = $null } } catch { }
+
+  $timer.Stop()
+  try { $proc.StandardInput.Close() } catch { }
+  Start-Sleep -Milliseconds 150
+  try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
+})
+
+Perf 'point' 'show-dialog'
+$script:perfShowT0 = [System.Diagnostics.Stopwatch]::StartNew()
+# 托盘先建好：这样即使以 --tray 启动（窗口不露头），关窗那条路径也立刻可用
+Init-Tray | Out-Null
+if ($TrayStart) {
+  Log '以 --tray 启动：只进托盘'
+  $window.ShowInTaskbar = $false
+  $window.WindowState = 'Minimized'
+}
+Log '准备 Run'
+# 这里不能用 ShowDialog()：模态循环以「窗口不再可见」为结束条件，而收进托盘正是
+# Hide() —— ShowDialog 会立刻返回、脚本跑到结尾，整个程序跟着退出（托盘里一闪就没了）。
+# 换成 Application.Run(window)：消息循环只在窗口真正关闭（= 托盘菜单「退出」）时结束。
+$script:app = New-Object System.Windows.Application
+$script:app.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
+$script:app.Run($window) | Out-Null
+Log '窗口已关闭'
+# 退出汇总：一辈子一条，pl perf 报表直接读它最省事
+Perf 'summary' 'exit' @{ uptime_ms = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $script:perfT0); dropped = $(if ($script:perf) { $script:perf.Dropped } else { 0 }) }
+if ($script:perf) { try { $script:perf.Stop() } catch { } }

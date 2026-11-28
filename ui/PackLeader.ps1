@@ -7905,7 +7905,7 @@ $window.Add_Loaded({
     # 注意两条：HwndSourceHook 带 ref bool，在 PowerShell 里要写 $handled.Value；
     # 钩子委托必须存进脚本作用域，否则脚本块被回收后消息就没人接了。
     $script:activateHook = [System.Windows.Interop.HwndSourceHook] {
-      param($hwnd, $msg, $wParam, $lParam, $handled)
+      param($hwnd, $msg, $wParam, $lParam, [ref]$handled)
       if ($script:activateMsg -and $msg -eq $script:activateMsg) {
         Log '收到激活消息：把窗口叫出来'
         Show-MainWindow

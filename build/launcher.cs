@@ -261,16 +261,30 @@ static class Program
     {
         try
         {
-            IntPtr h = FindWindowEx(IntPtr.Zero, IntPtr.Zero, null, WindowTitle);
-            if (h == IntPtr.Zero) h = FindByClassPrefix(WPF_CLASS_PREFIX);
-            if (h != IntPtr.Zero)
+            IntPtr h = FindByClassPrefix(WPF_CLASS_PREFIX);
+            if (h == IntPtr.Zero) h = FindWindowEx(IntPtr.Zero, IntPtr.Zero, null, WindowTitle);
+            uint message = RegisterWindowMessage(ActivateMessage);
+            if (h != IntPtr.Zero && IsWindowVisible(h))
             {
                 if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
-                else ShowWindow(h, SW_SHOW);
                 SetForegroundWindow(h);
             }
-            // 不管找没找到都广播一次：窗口被 Hidden 时照样能被界面自己叫出来
-            PostMessage(HWND_BROADCAST, WM_PL_ACTIVATE, IntPtr.Zero, IntPtr.Zero);
+            // A hidden WPF window must be restored through its dispatcher, not by showing
+            // its HWND directly; doing so can leave an unpainted black surface on screen.
+            if (h != IntPtr.Zero) PostMessage(h, message, IntPtr.Zero, IntPtr.Zero);
+            PostMessage(HWND_BROADCAST, message, IntPtr.Zero, IntPtr.Zero);
+
+            // The first instance may still be attaching its WPF hook while startup is racing.
+            for (int i = 0; i < 15; i++)
+            {
+                Thread.Sleep(100);
+                if (h != IntPtr.Zero && IsWindowVisible(h))
+                {
+                    SetForegroundWindow(h);
+                    break;
+                }
+                PostMessage(h != IntPtr.Zero ? h : HWND_BROADCAST, message, IntPtr.Zero, IntPtr.Zero);
+            }
         }
         catch { }
     }
@@ -294,7 +308,7 @@ static class Program
     const string WPF_CLASS_PREFIX = "HwndWrapper[PackLeader";
     const int SW_SHOW = 5;
     const int SW_RESTORE = 9;
-    const uint WM_PL_ACTIVATE = 0x8000 + 0x51;   // 自定义消息，界面里 RegisterWindowMessage 同名
+    const string ActivateMessage = "PackLeaderActivate";
     static readonly IntPtr HWND_BROADCAST = new IntPtr(0xffff);
 
     delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -302,9 +316,11 @@ static class Program
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int max);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
     [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hWnd);
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hWnd, int cmd);
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern uint RegisterWindowMessage(string name);
 
     // ---------------- 性能日志 ----------------
     // 启动链每一段记一条（exe → splash → node → PS → 主窗口），落
